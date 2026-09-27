@@ -1690,12 +1690,19 @@ test("Bare connect followed immediately by resume starts the destination through
       extension(destination.pi);
       await destination.handlers.get("session_start")?.({ type: "session_start", reason: "resume" }, next);
       await connect;
-      await waitForAsyncCondition(async () => {
-        await store.refresh!();
-        return methods.includes("getUpdates") &&
-          store.getWorkspaceBinding(cwd, "a", "destination")?.target.threadId === (remembered ? 42 : 43) &&
-          store.list().some((entry) => entry.target.threadId === (remembered ? 42 : 43) && entry.status === "active");
-      }, 10_000);
+      try {
+        await waitForAsyncCondition(async () => {
+          await store.refresh!();
+          return methods.includes("getUpdates") &&
+            store.getWorkspaceBinding(cwd, "a", "destination")?.target.threadId === (remembered ? 42 : 43) &&
+            store.list().some((entry) => entry.target.threadId === (remembered ? 42 : 43) && entry.status === "active");
+        }, 10_000);
+      } catch (error) {
+        throw new Error(
+          `Resume startup (remembered=${remembered}): ${String(error)}; notices=${JSON.stringify(notices)}\n` +
+          await getRuntimeIntegrationDiagnostics(methods.map((method) => ({ method }))),
+        );
+      }
       const binding = store.getWorkspaceBinding(cwd, "a", "destination")!;
       assert.equal(binding.target.threadId, remembered ? 42 : 43);
       assert.equal(binding.slot, "B");
