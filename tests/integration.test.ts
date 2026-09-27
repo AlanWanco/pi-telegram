@@ -1692,9 +1692,10 @@ test("Bare connect followed immediately by resume starts the destination through
       await connect;
       try {
         await waitForAsyncCondition(async () => {
+          // Binding publication precedes polling; avoid competing Windows file reads during startup.
+          if (!methods.includes("getUpdates")) return false;
           await store.refresh!();
-          return methods.includes("getUpdates") &&
-            store.getWorkspaceBinding(cwd, "a", "destination")?.target.threadId === (remembered ? 42 : 43) &&
+          return store.getWorkspaceBinding(cwd, "a", "destination")?.target.threadId === (remembered ? 42 : 43) &&
             store.list().some((entry) => entry.target.threadId === (remembered ? 42 : 43) && entry.status === "active");
         }, 10_000);
       } catch (error) {
