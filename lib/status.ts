@@ -1,8 +1,37 @@
 /**
  * Telegram status rendering helpers
  * Zones: telegram ui, pi agent diagnostics, tui
- * Builds usage, cost, and context summaries for the interactive Telegram status view
+ * Owns status summaries, redacted runtime diagnostics, and compact connection-failure copy
  */
+
+/** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
+export function formatTelegramConnectionFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+  const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+  if (status === 401) return "Telegram token rejected. Run /telegram-setup.";
+  if (status === 403) return "Telegram access denied. Check /telegram-status --debug.";
+  if ((typeof code === "string" && ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "ECONNRESET"].includes(code)) ||
+      /network unavailable|fetch failed/i.test(message)) {
+    return "Telegram network unavailable. Retry /telegram-connect.";
+  }
+  if (/Workspace slots?.*(?:unavailable|exhausted)|no free.*slot/i.test(message)) {
+    return "No Telegram slot available. Check /telegram-status --debug.";
+  }
+  if (code === "incompatible-protocol" || /protocol.*(?:incompatible|mismatch)|incompatible.*protocol/i.test(message)) {
+    return "Telegram instances are incompatible. Update them together.";
+  }
+  if (/unsupported.*(?:journal|version)|(?:journal|version).*unsupported/i.test(message)) {
+    return "Telegram state version unsupported. Use a compatible runtime.";
+  }
+  if (/follower registration failed|active in another Pi instance/i.test(message)) {
+    return "Telegram leader is active but unavailable. Check /telegram-status --debug.";
+  }
+  if (/unfinished Thread creation does not match/i.test(message)) {
+    return "Telegram Thread creation is unresolved. Check /telegram-status --debug.";
+  }
+  return "Telegram connection failed. Check /telegram-status --debug.";
+}
 
 const TELEGRAM_STATUS_DEFAULT_PROFILE_NAME = "default";
 

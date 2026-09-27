@@ -323,7 +323,7 @@ export function createTelegramActivityBindingRuntime(deps) {
         },
     };
 }
-export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, }) {
+export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
     GenerativeApps.registerTelegramBindTool(pi, {
         agentDir,
         getActiveProfileName: configStore.getActiveProfileName,
@@ -452,33 +452,35 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         reloadConfig: configStore.load,
         hasBotToken: configStore.hasBotToken,
         getBotTokenDiagnostic: configStore.getBotTokenDiagnostic,
-        startPolling: async (ctx, options) => {
-            try {
-                return await lockedPollingRuntime.start(ctx, options);
-            }
-            catch (error) {
-                recordRuntimeEvent("recovery", error, { phase: "polling-start" });
-                throw error;
-            }
-        },
+        startPolling: lockedPollingRuntime.start,
+        recordConnectionEvent: (error, phase) => recordRuntimeEvent("connection", error, { phase }),
         stopPolling: stopPolling ?? lockedPollingRuntime.stop,
         recoverPollingStart,
         getDisconnectThreadName,
         queueAgentConnectionContext,
         updateStatus,
+        isContextCurrent,
+        getSessionGeneration,
+        connectionIntent,
         getProfileNames: () => Config.getTelegramProfileNames(configStore.getStoredConfig()),
-        activateDefaultProfileConfig: async () => {
+        activateDefaultProfileConfig: async (_ctx, isCurrent) => {
             const previousProfileName = configStore.getActiveProfileName();
             await configStore.load();
+            if (!isCurrent())
+                return;
             if (previousProfileName) {
                 await (stopPolling ?? lockedPollingRuntime.stop)();
+                if (!isCurrent())
+                    return;
             }
             configStore.activateProfile(undefined);
             await onTransportChanged?.();
         },
-        activateProfileConfig: async (_ctx, profileName) => {
+        activateProfileConfig: async (_ctx, profileName, isCurrent) => {
             const previousProfileName = configStore.getActiveProfileName();
             await configStore.load();
+            if (!isCurrent())
+                return false;
             if (!Config.isValidTelegramProfileName(profileName))
                 return false;
             const storedConfig = configStore.getStoredConfig();
@@ -486,6 +488,8 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
                 return false;
             if (previousProfileName !== profileName) {
                 await (stopPolling ?? lockedPollingRuntime.stop)();
+                if (!isCurrent())
+                    return false;
             }
             if (!configStore.activateProfile(profileName))
                 return false;

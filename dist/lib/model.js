@@ -294,10 +294,8 @@ function truncateTelegramModelSwitchStatusSummary(text, maxWords = 4, maxLength 
 }
 export function buildTelegramModelSwitchContinuationText(telegramPrefix, model, thinkingLevel) {
     const modelLabel = `${model.provider}/${model.id}`;
-    const thinkingSuffix = thinkingLevel
-        ? ` Keep the selected thinking level (${thinkingLevel}) if it still applies.`
-        : "";
-    return `${telegramPrefix} Continue the interrupted previous request using the newly selected model (${modelLabel}). Resume from the last unfinished step instead of restarting from scratch unless necessary.${thinkingSuffix}`;
+    const thinkingSuffix = thinkingLevel ? `; thinking: ${thinkingLevel}` : "";
+    return `${telegramPrefix} Continue from the last unfinished step. Model: ${modelLabel}${thinkingSuffix}.`;
 }
 export function buildTelegramModelSwitchContinuationTurn(options) {
     const modelLabel = `${options.selection.model.provider}/${options.selection.model.id}`;

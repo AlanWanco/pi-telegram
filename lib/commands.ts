@@ -14,7 +14,7 @@ import {
 import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import { escapeHtml } from "./rendering.ts";
-import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import { formatTelegramConnectionFailure, type TelegramBridgeStatusLineOptions } from "./status.ts";
 import type { TelegramSessionReplacementIntent } from "./threads.ts";
 import {
   createTelegramControlItemBuilder,
@@ -399,14 +399,24 @@ export interface TelegramBridgeCommandRegistrationDeps {
   recoverPollingStart?: (
     error: unknown,
   ) => Promise<TelegramPollingStartRecoveryResult>;
+  recordConnectionEvent?: (error: unknown, phase: string) => void;
   getDisconnectThreadName?: () => string | undefined;
   queueAgentConnectionContext?: (connected: boolean) => void;
   updateStatus: (ctx: ExtensionCommandContext) => void;
+  isContextCurrent?: (ctx: ExtensionCommandContext) => boolean;
+  getSessionGeneration?: () => number;
+  connectionIntent?: {
+    begin(cwd: string, profileName?: string): string;
+    finish(id: string): void;
+    isActive(id: string): boolean;
+    cancel(): void;
+  };
   getProfileNames?: () => string[];
-  activateDefaultProfileConfig?: (ctx: ExtensionCommandContext) => Promise<void>;
+  activateDefaultProfileConfig?: (ctx: ExtensionCommandContext, isCurrent: () => boolean) => Promise<void>;
   activateProfileConfig?: (
     ctx: ExtensionCommandContext,
     profileName: string,
+    isCurrent: () => boolean,
   ) => Promise<boolean>;
 }
 
@@ -504,6 +514,14 @@ export function registerTelegramBridgeCommands(
   pi.registerCommand("telegram-connect", {
     description: "<profile> — Start Telegram bridge",
     handler: async (args, ctx) => {
+      const sessionGeneration = deps.getSessionGeneration?.();
+      let intentId: string | undefined;
+      // Pi context getters throw after replacement; check plain intent/generation first.
+      const isCurrent = () =>
+        (!intentId || deps.connectionIntent?.isActive(intentId) !== false) &&
+        (sessionGeneration === undefined || deps.getSessionGeneration?.() === sessionGeneration) &&
+        deps.isContextCurrent?.(ctx) !== false;
+      if (!isCurrent()) return;
       if (args.trim().split(/\s+/).some((word) => /^as=/i.test(word))) {
         ctx.ui.notify(
           "Thread names are configured from Telegram, not from Pi commands.",
@@ -513,121 +531,141 @@ export function registerTelegramBridgeCommands(
         return;
       }
       const profileName = parseTelegramProfileArg(args);
-      if (profileName && deps.activateProfileConfig) {
-        const ok = await deps.activateProfileConfig(ctx, profileName);
-        if (!ok) {
-          ctx.ui.notify(`Profile "${profileName}" not found.`, "error");
-          deps.updateStatus(ctx);
-          return;
-        }
-        ctx.ui.notify(`Activated profile "${profileName}".`, "info");
-      } else {
-        await (deps.activateDefaultProfileConfig?.(ctx) ?? deps.reloadConfig());
-      }
-      if (!deps.hasBotToken()) {
-        const botTokenDiagnostic = deps.getBotTokenDiagnostic?.();
-        if (botTokenDiagnostic) ctx.ui.notify(botTokenDiagnostic, "error");
-        const profileNames = deps.getProfileNames?.() ?? [];
-        if (!profileName && profileNames.length > 0) {
-          ctx.ui.notify(
-            `No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`,
-            "info",
-          );
-          deps.updateStatus(ctx);
-          return;
-        }
-        await deps.promptForConfig(ctx, profileName);
-        return;
-      }
-      let recoveryUsed = false;
-      const startWithRecovery = async (
-        options: TelegramBridgeCommandStartPollingOptions,
-      ): Promise<void | TelegramBridgeCommandStartPollingResult> => {
-        try {
-          return await deps.startPolling(ctx, options);
-        } catch (error) {
-          if (!deps.recoverPollingStart || recoveryUsed) throw error;
-          const recovery = await deps.recoverPollingStart(error);
-          if (recovery.kind === "unhandled") throw error;
-          if (recovery.kind === "blocked") {
-            return { ok: false, message: recovery.message };
+      intentId = deps.connectionIntent?.begin(ctx.cwd, profileName);
+      try {
+        if (profileName && deps.activateProfileConfig) {
+          const ok = await deps.activateProfileConfig(ctx, profileName, isCurrent);
+          if (!isCurrent()) return;
+          if (!ok) {
+            ctx.ui.notify(`Profile "${profileName}" not found.`, "error");
+            deps.updateStatus(ctx);
+            return;
           }
-          recoveryUsed = true;
+          ctx.ui.notify(`Activated profile "${profileName}".`, "info");
+        } else {
+          await (deps.activateDefaultProfileConfig?.(ctx, isCurrent) ?? deps.reloadConfig());
+          if (!isCurrent()) return;
+        }
+        if (!deps.hasBotToken()) {
+          const botTokenDiagnostic = deps.getBotTokenDiagnostic?.();
+          if (botTokenDiagnostic) ctx.ui.notify(botTokenDiagnostic, "error");
+          const profileNames = deps.getProfileNames?.() ?? [];
+          if (!profileName && profileNames.length > 0) {
+            ctx.ui.notify(
+              `No default Telegram profile configured. Available profiles: ${profileNames.join(", ")}. Use /telegram-connect <profileName> or /telegram-setup to create a default profile.`,
+              "info",
+            );
+            deps.updateStatus(ctx);
+            return;
+          }
+          await deps.promptForConfig(ctx, profileName);
+          return;
+        }
+        let recoveryUsed = false;
+        const startWithRecovery = async (
+          options: TelegramBridgeCommandStartPollingOptions,
+        ): Promise<void | (TelegramBridgeCommandStartPollingResult & { notice?: string })> => {
           try {
-            const retry = await deps.startPolling(ctx, options);
-            if (!retry) {
-              return { ok: true, message: recovery.message };
+            return await deps.startPolling(ctx, options);
+          } catch (error) {
+            if (!isCurrent()) return;
+            if (!deps.recoverPollingStart || recoveryUsed) throw error;
+            deps.recordConnectionEvent?.(error, "polling-start");
+            const recovery = await deps.recoverPollingStart(error);
+            if (!isCurrent()) return;
+            if (recovery.kind === "unhandled") throw error;
+            if (recovery.kind === "blocked") {
+              return { ok: false, message: recovery.message,
+                notice: "Telegram recovery blocked. Check /telegram-status --debug." };
             }
-            return {
-              ...retry,
-              message: retry.ok
-                ? `${recovery.message} ${retry.message ?? "Telegram bridge connected."}`
-                : retry.message,
-            };
-          } catch {
-            return {
-              ok: false,
-              message:
-                "Telegram temporary state was recovered, but the bridge could not restart. Restart this Pi instance and run /telegram-connect again.",
-            };
+            recoveryUsed = true;
+            deps.recordConnectionEvent?.(recovery.message, "recovery");
+            try {
+              const retry = await deps.startPolling(ctx, options);
+              if (!isCurrent()) return;
+              if (!retry) return { ok: true, message: "Telegram bridge connected; temporary state recovered." };
+              return {
+                ...retry,
+                message: retry.ok
+                  ? "Telegram bridge connected; temporary state recovered."
+                  : retry.message,
+              };
+            } catch (error) {
+              if (!isCurrent()) return;
+              deps.recordConnectionEvent?.(error, "recovery-retry");
+              return {
+                ok: false,
+                notice: "Telegram recovery failed. Restart this Pi instance.",
+              };
+            }
           }
+        };
+        let result = await startWithRecovery({ forceFreshLeaderThread: true });
+        if (!isCurrent()) return;
+        if (result && !result.ok && result.canTakeover) {
+          const confirmed = await ctx.ui.confirm(
+            formatTelegramTakeoverTitle(ctx),
+            formatTelegramTakeoverPrompt(ctx, result.owner),
+          );
+          if (!isCurrent()) return;
+          if (!confirmed) {
+            ctx.ui.notify("Telegram bridge takeover cancelled.", "info");
+            deps.updateStatus(ctx);
+            return;
+          }
+          result = await startWithRecovery({ force: true, forceFreshLeaderThread: true });
+          if (!isCurrent()) return;
         }
-      };
-      let result = await startWithRecovery({
-        forceFreshLeaderThread: true,
-      });
-      if (result && !result.ok && result.canTakeover) {
-        const confirmed = await ctx.ui.confirm(
-          formatTelegramTakeoverTitle(ctx),
-          formatTelegramTakeoverPrompt(ctx, result.owner),
-        );
-        if (!confirmed) {
-          ctx.ui.notify("Telegram bridge takeover cancelled.", "info");
-          deps.updateStatus(ctx);
-          return;
+        if (result && !result.ok) {
+          if (result.message) deps.recordConnectionEvent?.(result.message, "connect-refused");
+          ctx.ui.notify(result.notice ?? formatTelegramConnectionFailure(result.message), "warning");
+        } else if (result?.message) {
+          ctx.ui.notify(result.message, "info");
         }
-        result = await startWithRecovery({
-          force: true,
-          forceFreshLeaderThread: true,
-        });
+        if (!result || result.ok) deps.queueAgentConnectionContext?.(true);
+        deps.updateStatus(ctx);
+      } catch (error) {
+        if (!isCurrent()) return;
+        deps.recordConnectionEvent?.(error, "connect");
+        ctx.ui.notify(formatTelegramConnectionFailure(error), "warning");
+        deps.updateStatus(ctx);
+      } finally {
+        if (intentId) deps.connectionIntent?.finish(intentId);
       }
-      if (result?.message) {
-        ctx.ui.notify(result.message, result.ok ? "info" : "warning");
-      }
-      if (!result || result.ok) {
-        deps.queueAgentConnectionContext?.(true);
-      }
-      deps.updateStatus(ctx);
     },
   });
   pi.registerCommand("telegram-disconnect", {
     description: "Stop Telegram and delete current thread in Threaded Mode",
     handler: async (_args, ctx) => {
-      const threadName = deps.getDisconnectThreadName?.();
-      if (threadName) {
-        const confirmed = await ctx.ui.confirm(
-          ctx.ui.theme.fg("accent", "pi-telegram"),
-          `Delete Telegram thread ${ctx.ui.theme.fg("warning", threadName)} and disconnect this Pi session?`,
-        );
-        if (!confirmed) {
-          ctx.ui.notify("Telegram disconnect cancelled.", "info");
-          deps.updateStatus(ctx);
-          return;
-        }
-      }
+      const generation = deps.getSessionGeneration?.();
+      const isCurrent = () =>
+        (generation === undefined || deps.getSessionGeneration?.() === generation) &&
+        deps.isContextCurrent?.(ctx) !== false;
+      if (!isCurrent()) return;
+      deps.connectionIntent?.cancel();
       try {
+        const threadName = deps.getDisconnectThreadName?.();
+        if (threadName) {
+          const confirmed = await ctx.ui.confirm(
+            ctx.ui.theme.fg("accent", "pi-telegram"),
+            `Delete Telegram thread ${ctx.ui.theme.fg("warning", threadName)} and disconnect this Pi session?`,
+          );
+          if (!isCurrent()) return;
+          if (!confirmed) {
+            ctx.ui.notify("Telegram disconnect cancelled.", "info");
+            return;
+          }
+        }
         const message = await deps.stopPolling();
+        if (!isCurrent()) return;
         if (message) ctx.ui.notify(message, "info");
         deps.queueAgentConnectionContext?.(false);
       } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(
-          `Telegram disconnect did not complete: ${detail} Keep this Pi session open, restore leader connectivity, inspect /telegram-status --debug, and retry /telegram-disconnect.`,
-          "warning",
-        );
-        throw error;
+        deps.recordConnectionEvent?.(error, "disconnect");
+        if (!isCurrent()) return;
+        ctx.ui.notify("Telegram disconnect incomplete; keep Pi open. Check /telegram-status --debug.", "warning");
       } finally {
-        deps.updateStatus(ctx);
+        if (isCurrent()) deps.updateStatus(ctx);
       }
     },
   });

@@ -218,6 +218,10 @@ Examples:
 - Main menu → Settings: first row is `⬆️ Main menu`.
 - Settings → Voice reply mode: first row is `⬆️ Back`.
 
+## Pi Connection Notices
+
+Pi TUI connection notices use plain text: a short known cause and one recovery action. Unknown failures use a generic connection-failed notice with `/telegram-status --debug`; never interpolate raw exceptions, credentials, stack traces or Pi lifecycle guidance. Technical evidence belongs in the redacted runtime recorder. Failed disconnect must retain the instruction to keep Pi open; do not also rethrow the same error as a second Pi banner. These TUI notices are distinct from Telegram bot message cards below.
+
 ## Message Cards
 
 Message cards and standalone informational notices sent by the bot should start with a strong heading.

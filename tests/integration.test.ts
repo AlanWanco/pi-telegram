@@ -41,6 +41,8 @@ import * as Threads from "../lib/threads.ts";
 import * as Turns from "../lib/turns.ts";
 import * as Journal from "../lib/journal.ts";
 import * as Locks from "../lib/locks.ts";
+import * as Lifecycle from "../lib/lifecycle.ts";
+import type { ExtensionContext } from "../lib/pi.ts";
 import * as Ownership from "../lib/ownership.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Polling from "../lib/polling.ts";
@@ -336,6 +338,89 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
   await ensureRuntimeAgentDir();
   runtimeTelegramExtension = (await import("../index.ts")).default;
   return runtimeTelegramExtension;
+}
+
+for (const role of ["leader", "follower"] as const) {
+  for (const remembered of [false, true]) {
+    test(`Resume ${role} selects ${remembered ? "remembered" : "fresh"} destination binding without consuming source`, async () => {
+      const resume = { reason: "resume", cwd: "/repo", sessionFile: "/sessions/destination.jsonl" };
+      const shutdown = { reason: "resume", cwd: "/repo", targetSessionFile: resume.sessionFile, connected: false };
+      const dir = await mkdtemp(join(tmpdir(), "pi-connection-resume-"));
+      try {
+        const store = Threads.createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+        const sourceBinding = { ...Threads.createTelegramWorkspaceBindingIdentity("/repo", 0, "source")!,
+          slot: "A", threadName: "Atlas", target: { chatId: 7, threadId: 41 }, updatedAtMs: 1 };
+        store.upsertWorkspaceBinding(sourceBinding);
+        const destinationBinding = { ...Threads.createTelegramWorkspaceBindingIdentity("/repo", 0, "destination")!,
+          slot: "B", threadName: "Birch", target: { chatId: 7, threadId: 42 }, updatedAtMs: 1 };
+        if (remembered) store.upsertWorkspaceBinding(destinationBinding);
+        store.upsert({ profileKey: role === "leader" ? "cwd:/repo" : "manual:old",
+          owner: role === "leader" ? { kind: "leader", cwd: "/repo", instanceId: "77:1" }
+            : { kind: "manual-follower", instanceId: "77:1" },
+          instanceId: "77:1", target: sourceBinding.target, slot: "A", threadName: "Atlas",
+          status: "active", createdAtMs: 1, updatedAtMs: 1 });
+        await store.persist();
+        const methods: string[] = [];
+        const callApi = async <T>(method: string): Promise<T> => {
+          methods.push(method);
+          assert.ok(!["deleteForumTopic", "closeForumTopic"].includes(method));
+          return { message_thread_id: 43 } as T;
+        };
+        const handoffs: Lifecycle.TelegramConnectionHandoffStore = {};
+        const source = Lifecycle.createTelegramConnectionIntentRuntime({ store: handoffs });
+        source.begin("/repo");
+        source.suspend(shutdown);
+        let starts = 0;
+        let finished!: () => void;
+        const completed = new Promise<void>((resolve) => { finished = resolve; });
+        const failures: unknown[] = [];
+        const intent = Lifecycle.createTelegramConnectionIntentRuntime({ store: handoffs });
+        const ctx = { cwd: "/repo", sessionManager: {
+          getSessionFile: () => resume.sessionFile, getSessionId: () => "destination",
+        }, ui: { notify: (text: string) => failures.push(text) } } as unknown as ExtensionContext;
+        const lifecycle = Lifecycle.createTelegramConnectionLifecycle({ intent,
+          getGeneration: () => 1, isCurrent: () => true,
+          getProfileName: () => undefined, isConnected: () => false,
+          activateProfile: async () => true,
+          async start(current) {
+            starts += 1;
+            assert.equal(current, ctx);
+            try {
+              const ports = { getAllowedUserId: () => 7, topicTargetStore: store, callApi,
+                recordEvent() {}, recordRuntimeEvent() {}, getNowMs: () => 1000 };
+              const result = role === "leader"
+                ? await Sync.ensureTelegramLeaderThreadBinding({ ...ports, instanceId: "77:2",
+                    cwd: current.cwd, sessionId: current.sessionManager.getSessionId(),
+                    probeWorkspaceBinding: async () => {} })
+                : await BusLeader.createTelegramBusFollowerTargetProvisioner({ ...ports,
+                    getSyncState: () => ({}), setSyncState() {} })({ instanceId: "77:2",
+                    profileKey: "manual:new", cwd: current.cwd,
+                    sessionId: current.sessionManager.getSessionId(), connectedAtMs: 1000 });
+              assert.ok(result);
+              const target = "target" in result ? result.target : result;
+              assert.equal(target.chatId, 7);
+              assert.equal(target.threadId, remembered ? 42 : 43);
+              assert.equal(store.getWorkspaceBinding("/repo", "a", "destination")?.slot, "B");
+              const retainedSource = store.getWorkspaceBinding("/repo", "a", "source")!;
+              assert.equal(retainedSource.bindingKey, sourceBinding.bindingKey);
+              assert.equal(retainedSource.slot, "A");
+              assert.deepEqual(retainedSource.target, sourceBinding.target);
+              assert.equal(methods.filter((m) => m === "createForumTopic").length, remembered ? 0 : 1);
+              return { ok: true };
+            } catch (error) { failures.push(error); throw error; }
+            finally { finished(); }
+          }, recordError(error) { failures.push(error); },
+        });
+        const launch = lifecycle.prepare({ type: "session_start", reason: "resume" }, ctx);
+        assert.ok(launch);
+        launch();
+        await completed;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(starts, 1);
+        assert.deepEqual(failures, []);
+      } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+  }
 }
 
 test("Storage reference preparation rejects historical aliases without redirecting accepted work or leases", async () => {
@@ -1516,6 +1601,123 @@ test("Graceful preserved leader quit publishes inactivity and restores its intac
     await config.restore();
   }
 }, 20_000);
+
+test("Native connect failure emits one compact notice and retains redacted debug evidence", async () => {
+  const config = await createRuntimeTelegramConfigFixture();
+  const { handlers, commands, pi } = createRuntimePiHarness();
+  const notices: string[] = [];
+  const ctx = createRuntimeExtensionContext({ cwd: "/repo/connect-error" });
+  ctx.ui.notify = (text?: string) => { notices.push(text ?? ""); };
+  const restoreFetch = setRuntimeTestFetch(async (input) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+    if (method === "createForumTopic") return createRuntimeTelegramApiErrorResponse(401, "Unauthorized token 123:abc");
+    if (method === "deleteWebhook") return createRuntimeTelegramApiResponse(true);
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77 });
+    await writeRuntimeTelegramLocks({});
+    await stageRuntimeV02712Artifacts();
+    (await getRuntimeTelegramExtension())(pi);
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await commands.get("telegram-connect")!.handler("", ctx);
+    assert.deepEqual(notices, ["Telegram token rejected. Run /telegram-setup."]);
+    await commands.get("telegram-status")!.handler("--debug", ctx);
+    assert.match(notices.at(-1)!, /Unauthorized token/);
+    assert.match(notices.at(-1)!, /redacted-token/);
+    assert.ok(!notices.at(-1)!.includes("123:abc"));
+  } finally {
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+    restoreFetch();
+    await config.restore();
+  }
+}, 20_000);
+
+test("Bare connect followed immediately by resume starts the destination through the native runtime", async () => {
+  for (const remembered of [false, true]) {
+    const config = await createRuntimeTelegramConfigFixture();
+    const source = createRuntimePiHarness();
+    const destination = createRuntimePiHarness();
+    const methods: string[] = [];
+    const notices: string[] = [];
+    const cwd = "/repo/connect-resume";
+    const sessionFile = "/sessions/destination.jsonl";
+    const ctx = createRuntimeExtensionContext({ cwd });
+    const next = createRuntimeExtensionContext({ cwd,
+      sessionManager: { getSessionId: () => "destination", getSessionFile: () => sessionFile } });
+    let sourceClosed = false;
+    const sourceManager = ctx.sessionManager;
+    Object.defineProperty(ctx, "sessionManager", { get() {
+      if (sourceClosed) throw new Error("This extension ctx is stale after session replacement");
+      return sourceManager;
+    } });
+    ctx.ui.notify = (text?: string) => { notices.push(text ?? ""); };
+    next.ui.notify = (text?: string) => { notices.push(text ?? ""); };
+    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input);
+      methods.push(method);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+      if (method === "createForumTopic") return createRuntimeTelegramApiResponse({ message_thread_id: 43 });
+      if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) reject(new DOMException("stop", "AbortError"));
+        else init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError")), { once: true });
+      });
+      if (["deleteWebhook", "setMyCommands", "sendMessage", "editForumTopic"].includes(method)) {
+        return createRuntimeTelegramApiResponse(true);
+      }
+      throw new Error(`Unexpected Telegram API method: ${method}`);
+    });
+    try {
+      await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77,
+        threads: { automaticCleanup: false } });
+      await writeRuntimeTelegramLocks({});
+      await stageRuntimeV02712Artifacts();
+      const path = join(await ensureRuntimeAgentDir(), "tmp", "telegram", "state.json");
+      const store = Threads.createTelegramTopicTargetStore({ path });
+      await store.load();
+      store.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity(cwd, 0, sourceManager.getSessionId())!,
+        slot: "A", threadName: "Atlas", target: { chatId: 77, threadId: 41 }, updatedAtMs: 1 });
+      if (remembered) store.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity(cwd, 0, "destination")!,
+        slot: "B", threadName: "Birch", target: { chatId: 77, threadId: 42 }, updatedAtMs: 1 });
+      await store.persist();
+      const extension = await getRuntimeTelegramExtension();
+      extension(source.pi);
+      await source.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+      const connect = source.commands.get("telegram-connect")!.handler("", ctx);
+      await source.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "resume", targetSessionFile: sessionFile }, ctx);
+      sourceClosed = true;
+      extension(destination.pi);
+      await destination.handlers.get("session_start")?.({ type: "session_start", reason: "resume" }, next);
+      await connect;
+      try {
+        await waitForAsyncCondition(async () => {
+          // Binding publication precedes polling; avoid competing Windows file reads during startup.
+          if (!methods.includes("getUpdates")) return false;
+          await store.refresh!();
+          return store.getWorkspaceBinding(cwd, "a", "destination")?.target.threadId === (remembered ? 42 : 43) &&
+            store.list().some((entry) => entry.target.threadId === (remembered ? 42 : 43) && entry.status === "active");
+        }, 10_000);
+      } catch (error) {
+        throw new Error(
+          `Resume startup (remembered=${remembered}): ${String(error)}; notices=${JSON.stringify(notices)}\n` +
+          await getRuntimeIntegrationDiagnostics(methods.map((method) => ({ method }))),
+        );
+      }
+      const binding = store.getWorkspaceBinding(cwd, "a", "destination")!;
+      assert.equal(binding.target.threadId, remembered ? 42 : 43);
+      assert.equal(binding.slot, "B");
+      assert.equal(store.getWorkspaceBinding(cwd, "a", sourceManager.getSessionId())?.target.threadId, 41);
+      assert.equal(methods.filter((method) => method === "createForumTopic").length, remembered ? 0 : 1);
+      assert.equal(notices.some((text) => /stale|failed/i.test(text)), false, notices.join("\n"));
+    } finally {
+      await destination.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, next);
+      if (!sourceClosed) await source.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+      restoreFetch();
+      await config.restore();
+    }
+  }
+}, 30_000);
 
 test("Graceful follower disconnect persists intent and deletes through its live leader", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-follower-cleanup-integration-"));
@@ -7620,14 +7822,14 @@ test("Extension runtime switches a local run in flight and continues in the mode
     await waitForCondition(() =>
       runtimeEvents.some((event) =>
         event.includes(
-          "Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
+          "Continue from the last unfinished step. Model: anthropic/claude-b",
         ),
       ),
     );
     assert.equal(
       runtimeEvents.some((event) =>
         event.includes(
-          "dispatch:[telegram] Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
+          "dispatch:[telegram] Continue from the last unfinished step. Model: anthropic/claude-b",
         ),
       ),
       true,
@@ -8010,7 +8212,7 @@ test("Extension runtime delays model-switch abort until the active tool finishes
     await waitForCondition(() =>
       runtimeEvents.some((event) =>
         event.includes(
-          "dispatch:[telegram] Continue the interrupted previous request using the newly selected model (anthropic/claude-b)",
+          "dispatch:[telegram] Continue from the last unfinished step. Model: anthropic/claude-b",
         ),
       ),
     );

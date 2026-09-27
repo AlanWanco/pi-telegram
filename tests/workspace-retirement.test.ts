@@ -976,6 +976,80 @@ test("Slot rotation recovers a committed binding removal before fence completion
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("Slot rotation retires an exact stale active target after confirmed deletion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-stale-active-"));
+  try {
+    const path = join(dir, "state.json");
+    const admissionPath = join(dir, "admission.json");
+    const admission = createRetirementAdmission(admissionPath);
+    const store = createTelegramTopicTargetStore({ path, getExternalReservedSlots: admission.listReservedSlots });
+    for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+    await store.persist();
+    let deletions = 0;
+    const first = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => admission,
+      runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+      getLeaderEpoch: () => 1, getExternalProtection: clearExternalProtection, recordEvent() {},
+      async deleteThread(authorize) {
+        const target = authorize();
+        deletions++;
+        store.upsert({ profileKey: "stale:retired", instanceId: "stale-runtime", target,
+          status: "active", slot: "A", createdAtMs: 1, updatedAtMs: 2 });
+      },
+    });
+    assert.equal(await first(async () => {
+      const claim = store.claimWorkspaceIdentity("/fresh", "new");
+      if (!claim) throw new TelegramWorkspaceSlotUnavailableError();
+      return claim.slot;
+    }), "A");
+    assert.equal(deletions, 1, "confirmed deletion must not replay");
+    assert.equal(store.list().some((record) => record.target.threadId === 40), false);
+    assert.equal(store.listWorkspaceBindings().some((binding) => binding.slot === "A"), false);
+    assert.deepEqual(store.listWorkspaceRetirementIntents(), []);
+    assert.equal(admission.read().fence, undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Slot rotation recovers a retained commit-ready target projection under successor authority", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-stale-recovery-"));
+  try {
+    const path = join(dir, "state.json");
+    const admissionPath = join(dir, "admission.json");
+    const originalAdmission = createRetirementAdmission(admissionPath);
+    const store = createTelegramTopicTargetStore({ path,
+      getExternalReservedSlots: originalAdmission.listReservedSlots });
+    for (let index = 0; index < 26; index++) addBinding(store, index, index + 1);
+    const binding = store.listWorkspaceBindings().find((candidate) => candidate.slot === "A")!;
+    const intent = { id: "retire:stale-active", reason: "pressure" as const,
+      profileKey: "default", binding, leaderEpoch: 1, requestedAtMs: 3 };
+    store.upsertWorkspaceRetirementIntent(intent);
+    await store.persist();
+    const acquired = originalAdmission.acquireRetirementFence({ operationId: "retire-stale-active",
+      retirementIntentId: intent.id, bindingKey: binding.bindingKey, slot: binding.slot!,
+      target: binding.target, leaderEpoch: 1, retirementRequestedAtMs: intent.requestedAtMs });
+    assert.equal(acquired.kind, "acquired");
+    if (acquired.kind !== "acquired") return;
+    const issued = originalAdmission.issueDeletionPermit(acquired.fence);
+    assert.equal(issued.kind, "issued");
+    if (issued.kind !== "issued") return;
+    originalAdmission.confirmRetirementAbsence(issued.fence);
+    store.upsert({ profileKey: "stale:retired", instanceId: "stale-runtime", target: binding.target,
+      status: "active", slot: "A", createdAtMs: 1, updatedAtMs: 2 });
+
+    const successorAdmission = createRetirementAdmission(admissionPath, "successor");
+    const successor = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => successorAdmission,
+      runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+      getLeaderEpoch: () => 2, getExternalProtection: clearExternalProtection, recordEvent() {},
+      async deleteThread() { throw new Error("confirmed deletion must not replay"); },
+    });
+    assert.equal(await successor(async () => store.claimWorkspaceIdentity("/fresh", "new")?.slot), "A");
+    assert.equal(store.list().some((record) => record.target.threadId === binding.target.threadId), false);
+    assert.deepEqual(store.listWorkspaceRetirementIntents(), []);
+    assert.equal(successorAdmission.read().fence, undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("Slot rotation validates leader authority again at deletion issuance", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-rotation-epoch-"));
   try {

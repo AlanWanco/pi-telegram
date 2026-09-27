@@ -884,6 +884,7 @@ export async function executeTelegramWorkspaceRetirement(input: {
     | "listWorkspaceRetirementIntents"
     | "commitWorkspaceRetirement"
     | "removeWorkspaceRetirementIntent"
+    | "markStaleByTarget"
     | "persist"
   >;
   admission: Pick<
@@ -971,6 +972,12 @@ export async function executeTelegramWorkspaceRetirement(input: {
       }
       return { kind: "retained", reason: "stale-intent" };
     }
+    if (fence?.phase === "commit-ready") {
+      // Exact confirmed absence retires any same-target routing record that
+      // survived the deletion attempt. The fence prevents replacement target
+      // publication while this stale local projection is removed.
+      input.store.markStaleByTarget(binding.target, "deleted");
+    }
     const eligible = () => input.store.captureWorkspaceSlotOccupancy(
       input.getExternalProtection,
       { expectedRetirement: input.intent },
@@ -1040,6 +1047,9 @@ export async function executeTelegramWorkspaceRetirement(input: {
       fence = input.admission.confirmRetirementAbsence(fence);
     }
     if (!isCurrent()) return { kind: "retained", reason: "authority-changed" };
+    if (fence.phase === "commit-ready") {
+      input.store.markStaleByTarget(binding.target, "deleted");
+    }
     if (!eligible()) return { kind: "retained", reason: "protection-changed" };
     if (!await input.store.commitWorkspaceRetirement(input.intent, isCurrent)) {
       return { kind: "retained", reason: "commit-rejected" };
@@ -1212,7 +1222,7 @@ export type TelegramWorkspaceRetirementLifecycleResult =
 export async function runTelegramWorkspaceRetirementLifecycle(input: {
   store: TelegramWorkspaceRetirementPreparationDeps["store"] & Pick<
     TelegramTopicTargetStore,
-    "replaceWorkspaceRetirementIntent" | "commitWorkspaceRetirement"
+    "replaceWorkspaceRetirementIntent" | "commitWorkspaceRetirement" | "markStaleByTarget"
   >;
   getExternalProtection: (
     binding: TelegramWorkspaceThreadBinding,
@@ -1257,19 +1267,42 @@ export async function runTelegramWorkspaceRetirementLifecycle(input: {
     });
   }
   if (intent) {
-    const adoption = await adoptTelegramWorkspaceRetirementIntent({
-      store: input.store,
-      intent,
-      getExternalProtection: input.getExternalProtection,
-      getLeaderEpoch: input.getLeaderEpoch,
-      getProfileKey: input.getProfileKey,
-      isCurrent: input.isCurrent,
-      runExclusive: input.runExclusive,
-    });
-    if (adoption.kind !== "adopted") {
-      return { kind: "blocked", stage: "adoption", reason: adoption.reason };
+    if (retainedFence && isTelegramWorkspaceRetirementFence(retainedFence) &&
+        retainedFence.phase === "commit-ready" &&
+        matchesTelegramWorkspaceRetirementFence(retainedFence, intent)) {
+      const resumed = await input.runExclusive(async () => {
+        const epoch = input.getLeaderEpoch();
+        const profileKey = input.getProfileKey();
+        const isCurrent = () => epoch !== undefined && input.getLeaderEpoch() === epoch &&
+          input.getProfileKey() === profileKey && input.isCurrent?.() !== false;
+        if (!isCurrent() || intent!.profileKey !== profileKey) return undefined;
+        const intents = input.store.listWorkspaceRetirementIntents();
+        const binding = input.store.listWorkspaceBindings().find(candidate =>
+          candidate.bindingKey === intent!.binding.bindingKey);
+        if (intents.length !== 1 || !isDeepStrictEqual(intents[0], intent) ||
+            !binding || !isDeepStrictEqual(binding, intent.binding)) return undefined;
+        if (intent!.leaderEpoch === epoch) return intent;
+        const replacement = { ...intent!, leaderEpoch: epoch! };
+        return await input.store.replaceWorkspaceRetirementIntent(intent!, replacement, isCurrent)
+          ? replacement : undefined;
+      });
+      if (!resumed) return { kind: "blocked", stage: "adoption", reason: "commit-rejected" };
+      intent = resumed;
+    } else {
+      const adoption = await adoptTelegramWorkspaceRetirementIntent({
+        store: input.store,
+        intent,
+        getExternalProtection: input.getExternalProtection,
+        getLeaderEpoch: input.getLeaderEpoch,
+        getProfileKey: input.getProfileKey,
+        isCurrent: input.isCurrent,
+        runExclusive: input.runExclusive,
+      });
+      if (adoption.kind !== "adopted") {
+        return { kind: "blocked", stage: "adoption", reason: adoption.reason };
+      }
+      intent = adoption.intent;
     }
-    intent = adoption.intent;
   } else {
     const preparation = await prepareTelegramWorkspaceRetirement(
       {

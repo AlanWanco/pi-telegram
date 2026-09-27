@@ -1633,6 +1633,27 @@ export default function (pi: Pi.ExtensionAPI) {
     resolveAutomaticThreadCleanupEnabled: configControls.resolveAutomaticThreadCleanupEnabled,
     runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
   });
+  const connectionIntent = Lifecycle.createTelegramConnectionIntentRuntime();
+  const connectionLifecycle = Lifecycle.createTelegramConnectionLifecycle({
+    intent: connectionIntent,
+    getGeneration: telegramSessionContextStore.getGeneration,
+    isCurrent: telegramSessionContextStore.isCurrent,
+    getProfileName: configStore.getActiveProfileName,
+    isConnected() {
+      return lockRuntime.owns() || telegramBusFollowerRegistrationState.isRegistered();
+    },
+    async activateProfile(profileName, isCurrent) {
+      await configStore.load();
+      if (!isCurrent()) return false;
+      return configStore.activateProfile(profileName) && configStore.hasBotToken();
+    },
+    start(ctx) {
+      return lockedPollingRuntime.start(ctx);
+    },
+    recordError(error) {
+      recordRuntimeEvent("connection", error, { phase: "resume-connect" });
+    },
+  });
   const telegramBridgeSessionLifecycleDeps =
     Lifecycle.createTelegramBridgeSessionLifecycleDeps({
       contextStore: telegramSessionContextStore,
@@ -1681,6 +1702,7 @@ export default function (pi: Pi.ExtensionAPI) {
         },
         delivery: deliveryLifecycleRuntime,
         polling: lockedPollingRuntime,
+        connection: connectionLifecycle,
         inboundWorker: {
           onSessionShutdown: updateAdmissionRuntimeBinding.onSessionShutdown,
         },
@@ -1827,6 +1849,9 @@ export default function (pi: Pi.ExtensionAPI) {
       modelContextAvailabilityRuntime.reconcile();
     },
     getStatusLines,
+    isContextCurrent: telegramSessionContextStore.isCurrent,
+    getSessionGeneration: telegramSessionContextStore.getGeneration,
+    connectionIntent,
     buttonActionStore,
     sendMarkdownReply,
     async sendChannelMarkdownMessage(channel, markdown, options) {

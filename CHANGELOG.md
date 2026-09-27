@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## 0.51.6: Connection resume and Workspace recovery hotfix
+
+- `Workspace slot recovery`: Confirmed pressure-retirement deletion invalidates the exact stale active-target record before binding removal. Same-process and successor retries finish a retained `commit-ready` fence without repeating Telegram deletion, preventing exhausted A–Z slots from deadlocking on `protection-changed`. Includes [#305](https://github.com/llblab/pi-telegram/pull/305).
+- `Connect lifecycle`: `/telegram-connect` checks plain session generation before reading Pi context getters after awaited work. Replaced commands cannot publish stale connection notices or retry startup against the old session; config, startup, recovery and takeover confirmation discard obsolete results.
+- `Resume connection`: In-flight `/telegram-connect` or an already connected bridge carries bounded same-process intent into the resumed session, retaining the selected profile but not the source Thread. Startup restores the destination's exact binding or provisions its own slot; cancellation, expiry and late completion cannot revive obsolete work.
+- `Thread binding isolation`: Session-aware startup no longer reuses another session's active target or legacy instance binding. Pending Thread creation records its Workspace binding key; unproven or foreign-session recovery is blocked without consuming evidence or repeating creation.
+- `Connection feedback`: Manual/resumed connection failures use compact cause-and-action notices rather than raw exception guidance. Detailed errors remain in redacted diagnostics; recovery success produces one short notice, and failed disconnect keeps Pi open without a duplicate exception banner. Delayed disconnect completion cannot touch a replaced Pi context.
+- `Model continuation`: In-flight model switching injects one compact line with the resume instruction, selected model and optional thinking level, preserving the control lane and exact reply target.
+- `Lifecycle ownership`: Connect intent and resume scheduling belong to the existing session lifecycle domain; compact failure formatting belongs to status. Transport authority, durable bindings and queue custody keep their existing owners, without introducing a separate connection domain.
+
 ## 0.51.5: Follower Thread new-session hotfix
 
 - `Follower Thread /new`: Telegram `/new` now starts a new session in a follower's Pi process and preserves its Thread binding. The leader publishes and later claims the durable replacement intent through capability-gated, generation-fenced bus requests, validating its own live registration and Workspace binding before accepting the follower's request. Incompatible or stale leaders fail closed rather than silently switching sessions.

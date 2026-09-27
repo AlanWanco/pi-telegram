@@ -3608,7 +3608,8 @@ test("Post-create recovery preserves the acknowledged title with or without a st
       await restored.load();
       assert.deepEqual(restored.listPendingProvisions(), [{
         id: "provision:inst-a:A:2000", owner: "manual-follower", instanceId: "inst-a",
-        profileKey: "manual:inst-a", threadName: "Atlas", displayTitle: "extensions",
+        profileKey: "manual:inst-a", workspaceBindingKey: identity.bindingKey,
+        threadName: "Atlas", displayTitle: "extensions",
         slot: "A", target: { chatId: -1001, threadId: 88 }, startedAtMs: 2000,
       }]);
       const recover = createTelegramTopicTargetProvisioner({
@@ -3616,6 +3617,10 @@ test("Post-create recovery preserves the acknowledged title with or without a st
         resolveInitialWorkspaceDisplayTitle() { throw new Error("must not reproject an acknowledged title"); },
         async callApi() { throw new Error("must not recreate the acknowledged target"); },
       });
+      await assert.rejects(recover({ ...request, instanceId: "successor",
+        workspaceBindingKey: createTelegramWorkspaceBindingIdentity(identity.cwd, 0, "other-session")!.bindingKey,
+      }), /unfinished Thread creation does not match this session/);
+      assert.equal(restored.listPendingProvisions().length, 1, "Foreign resume never consumes creation evidence");
       const recovered = await recover(request);
       assert.equal(recovered.reused, true);
       assert.equal(recovered.displayTitle, "extensions", failStatus);
