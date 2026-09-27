@@ -218,7 +218,7 @@ export type TelegramWorkspaceRetirementExecution = {
 };
 export type TelegramWorkspaceRetirementAbsence = "absent" | "present" | "unknown";
 export declare function executeTelegramWorkspaceRetirement(input: {
-    store: Pick<TelegramTopicTargetStore, "captureWorkspaceSlotOccupancy" | "listWorkspaceBindings" | "listWorkspaceRetirementIntents" | "commitWorkspaceRetirement" | "removeWorkspaceRetirementIntent" | "persist">;
+    store: Pick<TelegramTopicTargetStore, "captureWorkspaceSlotOccupancy" | "listWorkspaceBindings" | "listWorkspaceRetirementIntents" | "commitWorkspaceRetirement" | "removeWorkspaceRetirementIntent" | "markStaleByTarget" | "persist">;
     admission: Pick<TelegramWorkspaceAdmissionLedger, "getOwner" | "read" | "acquireRetirementFence" | "adoptRetirementFence" | "issueDeletionPermit" | "confirmRetirementAbsence" | "confirmRetirementRejection" | "completeRejectedRetirementFence" | "releaseUnissuedRetirementFence" | "completeRetirementFence">;
     intent: TelegramWorkspaceRetirementIntent;
     getExternalProtection: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence;
@@ -263,7 +263,7 @@ export type TelegramWorkspaceRetirementLifecycleResult = TelegramWorkspaceRetire
     reason: string;
 };
 export declare function runTelegramWorkspaceRetirementLifecycle(input: {
-    store: TelegramWorkspaceRetirementPreparationDeps["store"] & Pick<TelegramTopicTargetStore, "replaceWorkspaceRetirementIntent" | "commitWorkspaceRetirement">;
+    store: TelegramWorkspaceRetirementPreparationDeps["store"] & Pick<TelegramTopicTargetStore, "replaceWorkspaceRetirementIntent" | "commitWorkspaceRetirement" | "markStaleByTarget">;
     getExternalProtection: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence;
     getLeaderEpoch: () => number | string | undefined;
     getProfileKey: () => string;
