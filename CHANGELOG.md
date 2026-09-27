@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Workspace slot recovery`: Confirmed pressure-retirement deletion now invalidates an exact stale active-target projection before committing binding removal. Same-process and successor retries resume a retained `commit-ready` fence without replaying Telegram deletion, preventing exhausted A–Z slots from deadlocking on `protection-changed`.
+
 ## 0.51.5: Follower Thread new-session hotfix
 
 - `Follower Thread /new`: Telegram `/new` now starts a new session in a follower's Pi process and preserves its Thread binding. The leader publishes and later claims the durable replacement intent through capability-gated, generation-fenced bus requests, validating its own live registration and Workspace binding before accepting the follower's request. Incompatible or stale leaders fail closed rather than silently switching sessions.
