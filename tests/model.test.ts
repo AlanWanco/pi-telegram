@@ -500,7 +500,7 @@ test("Model-switch continuation turn stays control-lane and resume-oriented", ()
   assert.match(String(turn.content[0]?.type), /text/);
   assert.match(
     String((turn.content[0] as { text?: string } | undefined)?.text ?? ""),
-    /Continue the interrupted previous request/,
+    /Continue from the last unfinished step\./,
   );
 });
 
@@ -555,14 +555,13 @@ test("Model-switch continuation queue creates and appends continuation turns", (
   assert.deepEqual(appended[0]?.ctx, { id: "ctx" });
 });
 
-test("Continuation prompt stays Telegram-scoped and resume-oriented", () => {
-  const text = buildTelegramModelSwitchContinuationText(
-    "[telegram]",
-    createModelTestModel(),
-    "high",
-  );
-  assert.match(text, /^\[telegram\]/);
-  assert.match(text, /Continue the interrupted previous request/);
-  assert.match(text, /openai\/gpt-5/);
-  assert.match(text, /thinking level \(high\)/);
+test("Continuation prompt keeps scope, model, resume instruction and optional thinking in one compact line", () => {
+  for (const thinking of [undefined, "off", "high"] as const) {
+    const text = buildTelegramModelSwitchContinuationText(
+      "[telegram]", createModelTestModel(), thinking,
+    );
+    assert.equal(text, `[telegram] Continue from the last unfinished step. Model: openai/gpt-5${
+      thinking ? `; thinking: ${thinking}` : ""
+    }.`);
+  }
 });

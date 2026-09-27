@@ -3711,7 +3711,8 @@ test("Bus follower session replacement preserves a same-process handoff", async 
       },
     },
   ]);
-  setTelegramFollowerSessionHandoff(undefined);
+  await suspend(false);
+  assert.equal(getTelegramFollowerSessionHandoff(), undefined, "Resume never hands off source target");
 });
 
 test("Bus session replacement preserves the promoted leader binding", async () => {
@@ -3761,6 +3762,8 @@ test("Bus session replacement preserves the promoted leader binding", async () =
         },
       },
     ]);
+    await suspend(false);
+    assert.equal(getTelegramLeaderSessionHandoff(), undefined, "Resume never hands off source target");
   } finally {
     setTelegramLeaderSessionHandoff(undefined);
   }

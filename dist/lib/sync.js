@@ -459,6 +459,7 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
             ? deps.topicTargetStore.getWorkspaceBinding(workspaceIdentity.cwd, workspaceIdentity.instanceSlot, workspaceIdentity.sessionId)
             : undefined;
         const legacyWorkspaceBinding = workspaceIdentity?.instanceSlot === "a" &&
+            deps.sessionId === undefined &&
             !persistedWorkspaceBinding &&
             typeof legacyLeaderRecord?.target.threadId === "number"
             ? {
@@ -553,10 +554,9 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
             return (record.instanceId === deps.instanceId &&
                 (record.status === "active" || record.status === "starting"));
         });
-        // Short-circuit: when the instance already has an active thread and we are not
-        // force-freshing, reuse it without re-provisioning. A thread belongs to the
-        // live instance binding, not to one transient Pi session lifecycle.
-        if (!deps.forceFreshUnnamed && priorTargets.length > 0) {
+        // Legacy callers without session identity may reuse the active instance target.
+        // Session-aware callers must resolve their exact Workspace binding instead.
+        if (deps.sessionId === undefined && !deps.forceFreshUnnamed && priorTargets.length > 0) {
             const record = priorTargets[0];
             deps.recordEvent("telegram", "Leader thread preserved after session lifecycle change", {
                 phase: "leader-thread-reused",

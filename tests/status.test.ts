@@ -18,11 +18,32 @@ import {
   createTelegramStatusHtmlBuilder,
   createTelegramStatusSnapshot,
   createTelegramStatusRuntime,
+  formatTelegramConnectionFailure,
   getTelegramStatusBarProcessingStatus,
   recordStructuredTelegramRuntimeEvent,
   registerTelegramStatusLineProvider,
   type TelegramRuntimeEvent,
 } from "../lib/status.ts";
+
+test("Connection notices name known causes and one recovery action without raw detail", () => {
+  const cases: Array<[unknown, string]> = [
+    [Object.assign(new Error("raw token secret"), { status: 401 }), "Telegram token rejected. Run /telegram-setup."],
+    [Object.assign(new Error("raw denied"), { status: 403 }), "Telegram access denied. Check /telegram-status --debug."],
+    [Object.assign(new Error("raw host"), { code: "ENOTFOUND" }), "Telegram network unavailable. Retry /telegram-connect."],
+    ["Telegram Workspace slot reservation is unavailable.", "No Telegram slot available. Check /telegram-status --debug."],
+    [{ code: "incompatible-protocol" }, "Telegram instances are incompatible. Update them together."],
+    ["Unsupported journal version 42", "Telegram state version unsupported. Use a compatible runtime."],
+    ["Telegram bridge is active in another Pi instance (private path); follower registration failed: secret", "Telegram leader is active but unavailable. Check /telegram-status --debug."],
+    ["Telegram unfinished Thread creation does not match this session binding.", "Telegram Thread creation is unresolved. Check /telegram-status --debug."],
+    [new Error("stale ctx: use withSession; raw token secret"), "Telegram connection failed. Check /telegram-status --debug."],
+    [null, "Telegram connection failed. Check /telegram-status --debug."],
+  ];
+  for (const [error, expected] of cases) {
+    assert.equal(formatTelegramConnectionFailure(error), expected);
+    assert.ok(expected.length < 100);
+    assert.ok(!expected.includes("secret"));
+  }
+});
 
 test("Status helpers build runtime log scope and persisted snapshot projections", () => {
   const state = {

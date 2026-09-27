@@ -1,8 +1,10 @@
 /**
  * Telegram status rendering helpers
  * Zones: telegram ui, pi agent diagnostics, tui
- * Builds usage, cost, and context summaries for the interactive Telegram status view
+ * Owns status summaries, redacted runtime diagnostics, and compact connection-failure copy
  */
+/** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
+export declare function formatTelegramConnectionFailure(error: unknown): string;
 export type TelegramStatusQueueLane = "control" | "priority" | "default";
 export interface TelegramUsageStats {
     totalInput: number;

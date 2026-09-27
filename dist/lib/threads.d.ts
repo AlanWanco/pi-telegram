@@ -68,6 +68,7 @@ export interface TelegramThreadPendingProvision {
     owner: "leader" | "manual-follower";
     instanceId: string;
     profileKey?: string;
+    workspaceBindingKey?: string;
     status?: "in-flight" | "ambiguous";
     threadName?: string;
     displayTitle?: string;

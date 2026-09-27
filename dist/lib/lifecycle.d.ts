@@ -1,7 +1,8 @@
 /**
- * Telegram lifecycle hook registration helpers
+ * Telegram session lifecycle coordination and hook registration
  * Zones: pi agent lifecycle, telegram session
- * Binds prepared Telegram lifecycle runtimes to pi extension lifecycle events
+ * Owns context generations, bounded connect intent across resume, and session sequencing.
+ * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
 import * as Queue from "./queue.ts";
@@ -50,6 +51,58 @@ export interface TelegramSessionLifecycleHooks {
     onSessionStart: (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>;
     onSessionShutdown: (event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void>;
 }
+export interface TelegramConnectionIntent {
+    id: string;
+    cwd: string;
+    profileName?: string;
+}
+interface TelegramConnectionHandoff extends TelegramConnectionIntent {
+    pid: number;
+    targetSessionFile: string;
+    expiresAtMs: number;
+}
+export interface TelegramConnectionHandoffStore {
+    pending?: TelegramConnectionHandoff;
+}
+export interface TelegramConnectionLifecycle {
+    prepare(event: SessionStartEvent, ctx: ExtensionContext): (() => void) | undefined;
+    onSessionShutdown(event: SessionShutdownEvent, ctx: ExtensionContext): void;
+}
+export declare function createTelegramConnectionLifecycle(deps: {
+    intent: ReturnType<typeof createTelegramConnectionIntentRuntime>;
+    getGeneration(): number;
+    isCurrent(ctx: ExtensionContext): boolean;
+    getProfileName(): string | undefined;
+    isConnected(): boolean;
+    activateProfile(profileName: string | undefined, isCurrent: () => boolean): Promise<boolean>;
+    start(ctx: ExtensionContext): Promise<{
+        ok: boolean;
+        message?: string;
+    }>;
+    recordError(error: unknown): void;
+}): TelegramConnectionLifecycle;
+export declare function createTelegramConnectionIntentRuntime(options?: {
+    store?: TelegramConnectionHandoffStore;
+    now?: () => number;
+    pid?: number;
+}): {
+    begin(cwd: string, profileName?: string): string;
+    isActive(id: string): boolean;
+    finish(id: string): void;
+    cancel(): void;
+    suspend(input: {
+        reason: string;
+        cwd: string;
+        targetSessionFile?: string;
+        connected: boolean;
+        profileName?: string;
+    }): void;
+    resume(input: {
+        reason: string;
+        cwd: string;
+        sessionFile?: string;
+    }): TelegramConnectionIntent | undefined;
+};
 export interface TelegramSessionContextStore<TContext> {
     get: () => TContext | undefined;
     getGeneration: () => number;
@@ -62,6 +115,7 @@ export declare function createTelegramSessionContextStore<TContext>(options?: {
 }): TelegramSessionContextStore<TContext>;
 export declare function createTelegramSessionGenerationFence(store: TelegramSessionContextStore<ExtensionContext>, hooks: TelegramSessionLifecycleHooks): TelegramSessionLifecycleHooks;
 export interface TelegramBridgeSessionServiceRuntime {
+    connection?: TelegramConnectionLifecycle;
     resumeGroupedInput(ctx: ExtensionContext): void;
     suspendGroupedInput(): void;
     delivery: {
@@ -108,6 +162,7 @@ export interface TelegramBridgeSessionLifecyclePorts<TQueueItem, TModel = unknow
         };
         delivery: TelegramBridgeSessionServiceRuntime["delivery"];
         polling: TelegramBridgeSessionServiceRuntime["polling"];
+        connection?: TelegramBridgeSessionServiceRuntime["connection"];
         inboundWorker: TelegramBridgeSessionServiceRuntime["inboundWorker"];
         capabilityMonitor: TelegramBridgeSessionServiceRuntime["capabilityMonitor"];
         queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];

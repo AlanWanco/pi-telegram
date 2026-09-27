@@ -194,9 +194,12 @@ interface TelegramCommandsAndToolsBindingDeps {
     canSendDirect: () => boolean;
     setGenerativeAppLiveSurfaceRuntime?: (runtime: GenerativeApps.GenerativeAppLiveSurfaceRuntime<GenerativeApps.TelegramBindLiveHandle> | undefined) => void;
     updateStatus: TelegramBridgeStatusUpdater;
+    isContextCurrent: (ctx: Pi.ExtensionContext) => boolean;
+    getSessionGeneration: () => number;
+    connectionIntent: NonNullable<Commands.TelegramBridgeCommandRegistrationDeps["connectionIntent"]>;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
-export declare function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, }: TelegramCommandsAndToolsBindingDeps): void;
+export declare function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }: TelegramCommandsAndToolsBindingDeps): void;
 interface TelegramLifecycleBindingDeps {
     pi: Pi.ExtensionAPI;
     publicationRuntime: TelegramBridgePublicationRuntime;

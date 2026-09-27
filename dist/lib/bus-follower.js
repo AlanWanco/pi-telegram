@@ -519,7 +519,13 @@ function isTelegramStaleContextError(error) {
 export function createTelegramBusFollowerSessionReplacementSuspender(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;
     const getPid = deps.getPid ?? (() => process.pid);
-    return async () => {
+    return async (preserveTarget = true) => {
+        if (!preserveTarget) {
+            setTelegramFollowerSessionHandoff(undefined);
+            Threads.setTelegramLeaderSessionHandoff(undefined);
+            await deps.suspendPolling();
+            return;
+        }
         const target = deps.registrationState.getTarget();
         if (deps.registrationState.isRegistered() && target) {
             setTelegramFollowerSessionHandoff({

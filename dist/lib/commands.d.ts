@@ -6,7 +6,7 @@
 import { type TelegramConfigStore } from "./config.ts";
 import type * as Pi from "./pi.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
-import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import { type TelegramBridgeStatusLineOptions } from "./status.ts";
 import type { TelegramSessionReplacementIntent } from "./threads.ts";
 import { type PendingTelegramControlItem, type TelegramQueueAdmissionReceipt } from "./queue.ts";
 export interface ParsedTelegramCommand {
@@ -112,12 +112,21 @@ export interface TelegramBridgeCommandRegistrationDeps {
     startPolling: (ctx: ExtensionCommandContext, options?: TelegramBridgeCommandStartPollingOptions) => void | Promise<void | TelegramBridgeCommandStartPollingResult> | TelegramBridgeCommandStartPollingResult;
     stopPolling: () => Promise<void | string>;
     recoverPollingStart?: (error: unknown) => Promise<TelegramPollingStartRecoveryResult>;
+    recordConnectionEvent?: (error: unknown, phase: string) => void;
     getDisconnectThreadName?: () => string | undefined;
     queueAgentConnectionContext?: (connected: boolean) => void;
     updateStatus: (ctx: ExtensionCommandContext) => void;
+    isContextCurrent?: (ctx: ExtensionCommandContext) => boolean;
+    getSessionGeneration?: () => number;
+    connectionIntent?: {
+        begin(cwd: string, profileName?: string): string;
+        finish(id: string): void;
+        isActive(id: string): boolean;
+        cancel(): void;
+    };
     getProfileNames?: () => string[];
-    activateDefaultProfileConfig?: (ctx: ExtensionCommandContext) => Promise<void>;
-    activateProfileConfig?: (ctx: ExtensionCommandContext, profileName: string) => Promise<boolean>;
+    activateDefaultProfileConfig?: (ctx: ExtensionCommandContext, isCurrent: () => boolean) => Promise<void>;
+    activateProfileConfig?: (ctx: ExtensionCommandContext, profileName: string, isCurrent: () => boolean) => Promise<boolean>;
 }
 export type TelegramThreadDisplayNameRenamePort = (target: {
     chatId: number;

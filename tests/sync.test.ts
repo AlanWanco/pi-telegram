@@ -657,7 +657,7 @@ test("Leader thread sync reuses same-process legacy leader topic across reload",
   }
 });
 
-test("Leader Workspace recovery publishes the canonical retained slot after target deduplication", async () => {
+test("Leader Workspace recovery publishes the canonical retained slot for the exact session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-canonical-slot-"));
   const store = createTelegramTopicTargetStore({
     path: join(dir, "telegram-targets.json"),
@@ -689,10 +689,11 @@ test("Leader Workspace recovery publishes the canonical retained slot after targ
       getAllowedUserId: () => 7,
       instanceId: "42:2",
       cwd: "/repo",
-      sessionId: "new-session",
+      sessionId: "old-session",
       topicTargetStore: store,
+      async probeWorkspaceBinding() {},
       async callApi<TResponse>() {
-        assert.fail("same-process recovery must not call Telegram");
+        assert.fail("same-session recovery must not call Telegram");
         return {} as TResponse;
       },
       recordEvent() {},

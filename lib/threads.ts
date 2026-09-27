@@ -229,6 +229,7 @@ export interface TelegramThreadPendingProvision {
   owner: "leader" | "manual-follower";
   instanceId: string;
   profileKey?: string;
+  workspaceBindingKey?: string;
   status?: "in-flight" | "ambiguous";
   threadName?: string;
   displayTitle?: string;
@@ -1527,6 +1528,9 @@ function normalizePendingProvision(
       : {}),
     ...(record.status === "in-flight" || record.status === "ambiguous"
       ? { status: record.status }
+      : {}),
+    ...(typeof record.workspaceBindingKey === "string"
+      ? { workspaceBindingKey: record.workspaceBindingKey }
       : {}),
     ...(typeof record.threadName === "string"
       ? { threadName: record.threadName }
@@ -4919,6 +4923,13 @@ export function createTelegramTopicTargetProvisioner(
         pending.profileKey === request.profileKey ||
         pending.instanceId === request.instanceId,
       );
+    const pendingTarget = pendingForRequest?.target;
+    if (pendingForRequest && request.workspaceBindingKey &&
+        pendingForRequest.workspaceBindingKey !== request.workspaceBindingKey &&
+        !(pendingTarget && deps.store.listWorkspaceBindings().some((binding) =>
+          binding.bindingKey === request.workspaceBindingKey && targetMatches(binding.target, pendingTarget)))) {
+      throw new Error("Telegram unfinished Thread creation does not match this session binding.");
+    }
     if (pendingForRequest?.target) {
       const target = pendingForRequest.target;
       const observation = deps.store.listSyncObservations().find((entry) =>
@@ -4933,8 +4944,13 @@ export function createTelegramTopicTargetProvisioner(
         pendingForRequest = undefined;
       }
     }
+    const matchesWorkspace = (target: TelegramTarget): boolean =>
+      !request.workspaceBindingKey ||
+      deps.store.listWorkspaceBindings().some((binding) =>
+        binding.bindingKey === request.workspaceBindingKey && targetMatches(binding.target, target)) ||
+      (!!pendingForRequest?.target && targetMatches(pendingForRequest.target, target));
     const existing = deps.store.getByProfileKey(request.profileKey);
-    if (existing && isCurrentThreadRecord(existing)) {
+    if (existing && isCurrentThreadRecord(existing) && matchesWorkspace(existing.target)) {
       const slot = existing.slot ?? deps.store.allocateSlot(request.profileKey);
       if (!slot) {
         throw new TelegramWorkspaceSlotUnavailableError();
@@ -5017,7 +5033,7 @@ export function createTelegramTopicTargetProvisioner(
     const activeForInstance = deps.store.getActiveByInstanceId(
       request.instanceId,
     );
-    if (activeForInstance) {
+    if (activeForInstance && matchesWorkspace(activeForInstance.target)) {
       if (!activeForInstance.slot) {
         throw new Error("Telegram Workspace slot reservation is unavailable.");
       }
@@ -5055,7 +5071,7 @@ export function createTelegramTopicTargetProvisioner(
       getNextTelegramThreadNamePaletteSlot(deps.store.list(), undefined) ??
       request.preferredSlot;
     const slot =
-      existing?.slot ??
+      (existing && matchesWorkspace(existing.target) ? existing.slot : undefined) ??
       deps.store.allocateSlot(
         request.profileKey,
         isManualFollowerRequest
@@ -5064,6 +5080,7 @@ export function createTelegramTopicTargetProvisioner(
             (candidateThreadName ? undefined : identity?.slot) ??
             preferredNameSlot),
         request.workspaceBindingKey,
+        { excludeCurrentRecord: !!existing && !matchesWorkspace(existing.target) },
       );
     if (!slot) {
       throw new TelegramWorkspaceSlotUnavailableError();
@@ -5107,6 +5124,7 @@ export function createTelegramTopicTargetProvisioner(
       owner: pendingOwner,
       instanceId: request.instanceId,
       profileKey: request.profileKey,
+      ...(request.workspaceBindingKey ? { workspaceBindingKey: request.workspaceBindingKey } : {}),
       threadName: requestThreadName,
       ...(displayTitle ? { displayTitle } : {}),
       slot,

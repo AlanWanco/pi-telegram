@@ -1130,10 +1130,16 @@ function isTelegramStaleContextError(error: unknown): boolean {
 
 export function createTelegramBusFollowerSessionReplacementSuspender(
   deps: TelegramBusFollowerSessionReplacementSuspenderDeps,
-): () => Promise<void> {
+): (preserveTarget?: boolean) => Promise<void> {
   const getNowMs = deps.getNowMs ?? Date.now;
   const getPid = deps.getPid ?? (() => process.pid);
-  return async () => {
+  return async (preserveTarget = true) => {
+    if (!preserveTarget) {
+      setTelegramFollowerSessionHandoff(undefined);
+      Threads.setTelegramLeaderSessionHandoff(undefined);
+      await deps.suspendPolling();
+      return;
+    }
     const target = deps.registrationState.getTarget();
     if (deps.registrationState.isRegistered() && target) {
       setTelegramFollowerSessionHandoff({

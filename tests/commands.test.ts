@@ -472,6 +472,71 @@ test("Bare and explicit default setup/connect commands select the same profile",
   ]);
 });
 
+test("Connect fences invalidated Pi getters and preserves pending intent before inspecting the command context", async () => {
+  const { createTelegramConnectionIntentRuntime } = await import("../lib/lifecycle.ts");
+  const cases = (["config", "polling", "polling-error"] as const)
+    .flatMap((phase) => [false, true].map((withIntent) => ({ phase, withIntent })));
+  for (const { phase, withIntent } of cases) {
+    const store = {};
+    const connectionIntent = withIntent ? createTelegramConnectionIntentRuntime({ store }) : undefined;
+    const harness = createCommandRegistrationApiHarness();
+    const notifications: string[] = [];
+    const events: string[] = [];
+    let current = true;
+    let generation = 1;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    registerTelegramBridgeCommands(harness.api, {
+      promptForConfig: async () => { events.push("setup"); },
+      getStatusLines: () => [],
+      reloadConfig: async () => {
+        events.push("config");
+        if (phase === "config") await pending;
+      },
+      hasBotToken: () => true,
+      startPolling: async () => {
+        events.push("polling");
+        if (phase !== "config") await pending;
+        if (phase === "polling-error") {
+          throw new Error("This extension ctx is stale after session replacement");
+        }
+        return { ok: true, message: "Telegram bridge connected." };
+      },
+      stopPolling: async () => {},
+      recoverPollingStart: async () => { events.push("recovery"); return { kind: "retry", message: "Recovered." }; },
+      queueAgentConnectionContext: () => { events.push("context"); },
+      updateStatus: () => { events.push("status"); },
+      isContextCurrent: (ctx) => !!ctx.sessionManager,
+      getSessionGeneration: () => generation,
+      connectionIntent,
+    });
+    const ctx = createBridgeCommandContext((message) => {
+      if (!current) throw new Error("This extension ctx is stale after session replacement");
+      notifications.push(message);
+    });
+    Object.defineProperty(ctx, "sessionManager", {
+      get() {
+        if (!current) throw new Error("This extension ctx is stale after session replacement");
+        return {};
+      },
+    });
+    const command = getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    connectionIntent?.suspend({ reason: "resume", cwd: "/repo",
+      targetSessionFile: "/destination.jsonl", connected: false });
+    current = false;
+    generation += 1;
+    release();
+    await command;
+    assert.deepEqual(events, phase === "config" ? ["config"] : ["config", "polling"]);
+    assert.deepEqual(notifications, []);
+    if (withIntent) {
+      assert.ok(createTelegramConnectionIntentRuntime({ store }).resume({ reason: "resume",
+        cwd: "/repo", sessionFile: "/destination.jsonl" }));
+    }
+  }
+});
+
 test("Command helpers register pi connect and disconnect commands", async () => {
   const harness = createCommandRegistrationApiHarness();
   const events: string[] = [];
@@ -570,8 +635,10 @@ test("Command helpers confirm destructive Threaded Mode disconnects", async () =
 test("Command helpers keep failed disconnects actionable and retryable", async () => {
   const harness = createCommandRegistrationApiHarness();
   const notifications: string[] = [];
+  const diagnostics: unknown[] = [];
   let statusUpdates = 0;
   registerTelegramBridgeCommands(harness.api, {
+    recordConnectionEvent: (error) => { diagnostics.push(error); },
     promptForConfig: async () => undefined,
     getStatusLines: () => [],
     reloadConfig: async () => undefined,
@@ -592,14 +659,13 @@ test("Command helpers keep failed disconnects actionable and retryable", async (
     notifications.push(message);
   });
 
-  await assert.rejects(
-    async () => command.handler("", ctx),
-    /deletion was not confirmed/,
-  );
+  await command.handler("", ctx);
   assert.equal(statusUpdates, 1);
-  assert.match(notifications[0] ?? "", /Keep this Pi session open/);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0] ?? "", /keep Pi open/);
   assert.match(notifications[0] ?? "", /telegram-status --debug/);
-  assert.match(notifications[0] ?? "", /retry \/telegram-disconnect/);
+  assert.match(String(diagnostics[0]), /deletion was not confirmed/);
+  assert.ok(!notifications[0]!.includes("deletion was not confirmed"));
 });
 
 test("Connect recovers disposable runtime corruption and retries exactly once", async () => {
@@ -639,7 +705,7 @@ test("Connect recovers disposable runtime corruption and retries exactly once", 
   assert.equal(starts, 2);
   assert.equal(recoveries, 1);
   assert.deepEqual(notifications, [
-    "Telegram temporary state was reset. Telegram bridge connected.",
+    "Telegram bridge connected; temporary state recovered.",
   ]);
 });
 
@@ -697,8 +763,7 @@ test("Connect performs filesystem recovery before its one reconnect attempt", as
       JSON.stringify({ botToken: "preserved" }),
     );
     assert.equal(notifications.length, 1);
-    assert.match(notifications[0] ?? "", /unclean shutdown/);
-    assert.match(notifications[0] ?? "", /bridge connected/);
+    assert.equal(notifications[0], "Telegram bridge connected; temporary state recovered.");
 
     await getRequiredCommand(harness.commands, "telegram-connect").handler(
       "",
@@ -748,8 +813,56 @@ test("Connect converts a failed post-recovery retry into one restart instruction
   assert.match(notifications[0] ?? "", /Restart this Pi instance/);
 });
 
-test("Connect preserves unrelated startup errors outside the recovery classifier", async () => {
+test("Connection failures keep opaque details in redacted diagnostics, never the TUI", async () => {
+  const { createTelegramRuntimeEventRecorder } = await import("../lib/status.ts");
+  for (const phase of ["config", "polling", "result"] as const) {
+    const harness = createCommandRegistrationApiHarness();
+    const notices: string[] = [];
+    const recorder = createTelegramRuntimeEventRecorder({ getBotToken: () => "123:secret" });
+    const detail = "This extension ctx is stale after session replacement. token 123:secret; use captured withSession internals";
+    registerTelegramBridgeCommands(harness.api, {
+      promptForConfig: async () => {}, getStatusLines: () => [], hasBotToken: () => true,
+      reloadConfig: async () => { if (phase === "config") throw new Error(detail); },
+      startPolling: async () => {
+        if (phase === "polling") throw new Error(detail);
+        return { ok: false, message: detail };
+      }, stopPolling: async () => {}, updateStatus() {},
+      recordConnectionEvent: (error, eventPhase) => recorder.record("connection", error, { phase: eventPhase }),
+    });
+    await getRequiredCommand(harness.commands, "telegram-connect").handler("",
+      createBridgeCommandContext((text) => { notices.push(text); }));
+    assert.deepEqual(notices, ["Telegram connection failed. Check /telegram-status --debug."]);
+    const diagnostics = JSON.stringify(recorder.getEvents());
+    assert.match(diagnostics, /withSession/);
+    assert.match(diagnostics, /redacted-token/);
+    assert.ok(!diagnostics.includes("123:secret"));
+  }
+});
+
+test("Delayed disconnect errors never touch replaced Pi context getters", async () => {
   const harness = createCommandRegistrationApiHarness();
+  let generation = 1;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {}, getStatusLines: () => [], reloadConfig: async () => {},
+    hasBotToken: () => true, startPolling: async () => {},
+    stopPolling: async () => { await pending; throw new Error("disconnect failed"); },
+    updateStatus() { assert.fail("No stale status publication"); },
+    getSessionGeneration: () => generation,
+    isContextCurrent: () => { assert.equal(generation, 1, "Generation checked before context"); return true; },
+  });
+  const command = getRequiredCommand(harness.commands, "telegram-disconnect").handler("",
+    createBridgeCommandContext(() => { assert.fail("No stale notice"); }));
+  generation++;
+  release();
+  await command;
+});
+
+test("Connect diagnoses unrelated startup errors without a raw Pi error banner", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  const diagnostics: unknown[] = [];
   registerTelegramBridgeCommands(harness.api, {
     promptForConfig: async () => undefined,
     getStatusLines: () => [],
@@ -760,17 +873,15 @@ test("Connect preserves unrelated startup errors outside the recovery classifier
     },
     stopPolling: async () => undefined,
     recoverPollingStart: async () => ({ kind: "unhandled" }),
+    recordConnectionEvent: (error) => { diagnostics.push(error); },
     updateStatus: () => undefined,
   });
 
-  await assert.rejects(
-    async () =>
-      getRequiredCommand(harness.commands, "telegram-connect").handler(
-        "",
-        createBridgeCommandContext(),
-      ),
-    /network unavailable/,
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "", createBridgeCommandContext((text) => { notifications.push(text); }),
   );
+  assert.deepEqual(notifications, ["Telegram network unavailable. Retry /telegram-connect."]);
+  assert.ok(diagnostics.some((error) => String(error).includes("network unavailable")));
 });
 
 test("Connect reports live-owner recovery blockers without retrying", async () => {
@@ -803,7 +914,7 @@ test("Connect reports live-owner recovery blockers without retrying", async () =
   );
 
   assert.equal(starts, 1);
-  assert.deepEqual(notifications, ["Restart owner process 42."]);
+  assert.deepEqual(notifications, ["Telegram recovery blocked. Check /telegram-status --debug."]);
 });
 
 test("Command helpers move pi polling ownership after confirmation", async () => {

@@ -371,7 +371,7 @@ export declare function createTelegramBusAgentMessageClient(deps: TelegramBusFol
     routeMessage: (message: TelegramBusAgentMessage) => Promise<void>;
 };
 export declare function createTelegramBusFollowerApiCaller(deps: TelegramBusFollowerApiCallerDeps): (method: string, args: unknown[]) => Promise<unknown>;
-export declare function createTelegramBusFollowerSessionReplacementSuspender(deps: TelegramBusFollowerSessionReplacementSuspenderDeps): () => Promise<void>;
+export declare function createTelegramBusFollowerSessionReplacementSuspender(deps: TelegramBusFollowerSessionReplacementSuspenderDeps): (preserveTarget?: boolean) => Promise<void>;
 export declare function createTelegramBusFollowerSessionRefreshHook<TContext>(deps: TelegramBusFollowerSessionRefreshHookDeps<TContext>): (_event: unknown, ctx: TContext) => Promise<void>;
 export declare function createTelegramBusFollowerControlState(): TelegramBusFollowerControlState;
 export declare function createTelegramBusFollowerRegistrationState(options?: {
