@@ -27,8 +27,8 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test --test-concurrency=4 --test-reporter=dot tests/*.test.ts",
-    "test:verbose": "node --experimental-strip-types --test --test-reporter=spec tests/*.test.ts",
+    "test": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-concurrency=4 --test-reporter=dot tests/*.test.ts",
+    "test:verbose": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-reporter=spec tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build-dist.mjs",
     "build:check": "node scripts/build-dist.mjs --check",

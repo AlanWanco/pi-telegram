@@ -513,7 +513,8 @@ test("Bus transport error classifier marks transient IPC failures retryable", ()
   );
 });
 
-test("Consolidated IPC uses short collision-resistant profile/recipient names and never redirects outside runtime", () => {
+// Uses POSIX absolute agent paths for both layouts, which a Windows host cannot resolve as exact absolute paths.
+test("Consolidated IPC uses short collision-resistant profile/recipient names and never redirects outside runtime", { skip: process.platform === "win32" }, () => {
   const agentDir = "/agent";
   const profiles = [undefined, "work", "WORK", "work/name", "work_name", "x".repeat(300)];
   for (const platform of ["linux", "win32"] as const) {

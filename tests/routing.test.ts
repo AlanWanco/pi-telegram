@@ -10,7 +10,12 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { withTelegramFileTransaction } from "../lib/locks.ts";
-import test from "node:test";
+import test, { after } from "node:test";
+
+// Production cleanup/expiry timers are unref'd so they never hold Pi open. A live Pi process keeps the loop alive;
+// mirror that here so Node 22's runner does not abort tests that await those timers.
+const eventLoopKeepAlive = setInterval(() => {}, 60_000);
+after(() => { clearInterval(eventLoopKeepAlive); });
 
 import * as Commands from "../lib/commands.ts";
 import * as Bus from "../lib/bus.ts";

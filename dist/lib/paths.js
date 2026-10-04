@@ -3,11 +3,13 @@
  * Zones: telemetry paths, filesystem, runtime identity
  * Owns agent-dir detection and extension-local path derivation
  *
- * This domain is pure/path-only: it resolves directories and file paths
- * from environment and runtime identity. It does not read config, manage
- * state, or import broader Telegram domains.
+ * This domain is path-only: it resolves directories and file paths from
+ * environment and runtime identity. Its only filesystem read canonicalizes the
+ * existing agent-dir prefix; it does not read config, manage state, or import
+ * broader Telegram domains.
  */
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 export const TELEGRAM_DEFAULT_PROFILE_NAME = "default";
@@ -50,9 +52,30 @@ export function requireTelegramStoragePathReference(path, expectedPath) {
 export function resolveTelegramConfigPath() {
     return join(resolveAgentDir(), "telegram.json");
 }
+/**
+ * Resolve symlinks in the longest existing prefix of `path` and keep the missing suffix. Strict journal reads require
+ * canonical anchors, so a symlinked agent directory (for example macOS `/var` → `/private/var`) must not leak in.
+ * Relative input is returned unchanged so callers' exact-absolute-path guards still reject it.
+ */
+function canonicalizeExistingPrefix(path) {
+    if (!isAbsolute(path))
+        return path;
+    const absolute = resolve(path);
+    const missing = [];
+    for (let current = absolute;; current = dirname(current)) {
+        try {
+            return join(realpathSync(current), ...missing.reverse());
+        }
+        catch (error) {
+            if (error.code !== "ENOENT" || dirname(current) === current)
+                return absolute;
+            missing.push(basename(current));
+        }
+    }
+}
 /** Telegram bridge temporary directory (<agentDir>/tmp/pi-telegram); releases before 0.52.0 used `tmp/telegram`. */
 export function resolveTelegramTempDir(agentDir = resolveAgentDir()) {
-    return join(agentDir, "tmp", "pi-telegram");
+    return join(canonicalizeExistingPrefix(agentDir), "tmp", "pi-telegram");
 }
 /** Consolidated-root service artifacts (transaction guards, staging and IPC), never session custody. */
 export function resolveTelegramRuntimeDir(agentDir = resolveAgentDir()) {

@@ -182,7 +182,7 @@ for (const damaged of ["{", "null", '{"version":3,"profiles":{}}', '{"version":2
       assert.deepEqual(events, ["state-reset"]);
       const state = readTelegramRuntimeState(path);
       assert.deepEqual(Object.keys(state.profiles), [TELEGRAM_LOCK_KEY], "only the new owner is published");
-      assert.equal(statSync(path).mode & 0o777, 0o600);
+      if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
       assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "state.json"]);
       await runtime.stop();
       assert.equal(resetDamagedTelegramRuntimeState(path, validator), false, "healthy state is never reset");

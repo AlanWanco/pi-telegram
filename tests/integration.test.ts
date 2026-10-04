@@ -34,6 +34,7 @@ import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
+import * as BusTransport from "../lib/bus-transport.ts";
 import * as Media from "../lib/media.ts";
 import * as Config from "../lib/config.ts";
 import * as Commands from "../lib/commands.ts";
@@ -842,7 +843,8 @@ for (const [scenario, keepRouter, recoverCopy] of [["cold-router", false, false]
 }, 15_000);
 
 for (const source of ["fresh", "adopted"] as const) {
-  test(`Generic follower delivery acknowledges repeated pending or completed input without re-execution (${source})`, async () => {
+  void testRoot(`Generic follower delivery acknowledges repeated pending or completed input without re-execution (${source})`,
+    { concurrency: false, timeout: 5_000, skip: source === "adopted" && (!fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK) }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-completed-delivery-"));
     const recipientBindingKey = "manual:recipient", sessionId = "session-b", updateId = 44;
     const config = Config.createTelegramConfigStore({ agentDir: dir });
@@ -2991,7 +2993,9 @@ for (const drift of ["none", "context", "generation", "epoch", "owner", "profile
 
 for (const profile of [undefined, "work"] as const) for (const boundary of ["review-reopen", "authority-race", "session-context", "session-generation"] as const) {
   const interrupted = boundary !== "review-reopen";
-  test(`Fresh production root uses shared files and ignores released storage (${profile ?? "default"}, ${boundary})`, async () => {
+  // The channel-post journal requires POSIX no-follow ownership evidence; this composed witness is POSIX-only.
+  void testRoot(`Fresh production root uses shared files and ignores released storage (${profile ?? "default"}, ${boundary})`,
+    { concurrency: false, timeout: 15_000, skip: !fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK || process.getuid === undefined }, async () => {
     const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-fresh-"))), directory = Paths.resolveTelegramTempDir(agentDir);
     const oldDir = join(agentDir, "tmp", "telegram"), oldFiles = {
@@ -3078,7 +3082,10 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
       const workspace = Threads.parseTelegramWorkspaceStateSection(sections.workspace, profile ?? "default")!;
       assert.ok(workspace.threads.some(record => record.target.threadId === 42));
       const logical = Bus.getTelegramBusSocketPath(agentDir, process.platform, profile, "consolidated"), endpoint = Bus.resolveTelegramBusSocketPath(logical);
-      if (process.platform !== "win32") {
+      // Over-long Unix endpoints (for example deep macOS temp roots) use the bounded private fallback instead.
+      if (process.platform !== "win32" && Buffer.byteLength(logical) > BusTransport.TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES) {
+        assert.notEqual(dirname(endpoint), Paths.resolveTelegramRuntimeDir(agentDir));
+      } else if (process.platform !== "win32") {
         assert.equal(dirname(endpoint), Paths.resolveTelegramRuntimeDir(agentDir));
         const target = await readlink(endpoint);
         assert.equal(dirname(target), ".", "Native publication has a colocated relative private listener");
@@ -3304,7 +3311,7 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
-  }, 15000);
+  });
 }
 
 for (const damage of ["malformed-json", "invalid-workspace"] as const) {

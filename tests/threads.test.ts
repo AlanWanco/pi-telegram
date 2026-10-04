@@ -3224,7 +3224,7 @@ test("Status projection writes follow transport ownership and a corrupt projecti
     await assert.rejects(readFile(join(dir, "status.json"), "utf8"), /ENOENT/, "a store without transport ownership writes no projection");
     owns = true;
     await store.persistStatus();
-    assert.equal((await stat(join(dir, "status.json"))).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(join(dir, "status.json"))).mode & 0o777, 0o600);
     await writeFile(join(dir, "status.json"), "{ not json");
     const reloaded = createTelegramTopicTargetStore({ path });
     await reloaded.load();

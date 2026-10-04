@@ -6656,7 +6656,7 @@ for (const scenario of ["immediate", "mixed", "late", "lost-ack", "no-result", "
 }
 
 for (const scenario of ["exact", "foreign-binding", "read-only", "completed-after", "corrupt-after"] as const) {
-  test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, async () => {
+  test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-queued-native-binding-"));
     const path = join(dir, "inbox.json"), config = createTelegramConfigStore({ agentDir: dir });
     let writesAllowed = true;
@@ -6822,7 +6822,7 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
 }
 
 for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lost", "mixed-batch-lost", "mixed-ordinary-fails", "mixed-context", "mixed-binding", "mixed-identity", "mixed-control", "mixed-discard", "subset", "override", "detached", "missing-reader", "missing-disposer", "observer", "cold"] as const) {
-  test(`Prepared queue scopes reach lifecycle disposal without ordinary downgrade (${scenario})`, async () => {
+  test(`Prepared queue scopes reach lifecycle disposal without ordinary downgrade (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-prepared-queue-scopes-"));
     const identity = { instanceId: "prepared", processId: process.pid, processBirthId: `${process.pid}:prepared`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -6921,7 +6921,7 @@ for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lo
 }
 
 for (const scenario of ["positive", "batch", "before-write", "after-write", "partial-result", "context", "binding", "identity", "abort", "origin-binding", "observer-context", "observer-throws"] as const) {
-  test(`Ordinary queued source hints require a whole ACK and fresh origin authority (${scenario})`, async () => {
+  test(`Ordinary queued source hints require a whole ACK and fresh origin authority (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-ordinary-queue-hint-"));
     const identity = { instanceId: "ordinary", processId: process.pid, processBirthId: `${process.pid}:ordinary`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -6982,7 +6982,7 @@ for (const scenario of ["positive", "batch", "before-write", "after-write", "par
 
 for (const scenario of ["positive", "lost", "before-write", "no-result", "readback", "batch", "mixed", "origin-missing", "origin-empty", "origin-owner",
   "origin-member", "origin-source", "origin-pending", "origin-context", "origin-binding", "origin-identity", "captured", "restart-held", "sticky-missing-witness"] as const) {
-  test(`Prepared partial queue scopes acknowledge only immutable whole-receipt origin (${scenario})`, async () => {
+  test(`Prepared partial queue scopes acknowledge only immutable whole-receipt origin (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-partial-queue-origin-"));
     const identity = { instanceId: "partial", processId: process.pid, processBirthId: `${process.pid}:partial`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -7161,7 +7161,7 @@ for (const scenario of ["hold", "publisher-fails", "authority", "context", "bind
 }
 
 for (const scenario of ["complete", "duplicate", "queued", "queued-complete", "queued-guarded", "queued-commit-fails", "publisher-fails", "missing-scope", "wrong-id", "conflicting-scope", "stopped", "detached"] as const) {
-  test(`Completion acceptance carrier gates only its local report before journal disposition (${scenario})`, async () => {
+  test(`Completion acceptance carrier gates only its local report before journal disposition (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-completion-publisher-"));
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
       getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"),

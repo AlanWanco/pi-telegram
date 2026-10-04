@@ -5,7 +5,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readSync, writeFileSync } from "node:fs";
+import { constants, existsSync, readSync, writeFileSync } from "node:fs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import {
@@ -5062,7 +5062,7 @@ for (const queueKind of ["prompt", "control"] as const) {
   });
 }
 
-test("Session succession adopts only unclaimed predecessor pending input, committing it away before successor admission", async () => {
+test("Session succession adopts only unclaimed predecessor pending input, committing it away before successor admission", { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
   await withJournalTempDir(async ({ dir }) => {
     const config = createTelegramConfigStore({ agentDir: dir });
     const runtimeIdentity = { instanceId: "same-process", processId: process.pid, processBirthId: "fixture-birth" };
@@ -5120,7 +5120,7 @@ test("Session succession adopts only unclaimed predecessor pending input, commit
   });
 });
 
-test("Active follower succession records the first session and advances only after adoption succeeds", async () => {
+test("Active follower succession records the first session and advances only after adoption succeeds", { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
   await withJournalTempDir(async ({ dir }) => {
     const config = createTelegramConfigStore({ agentDir: dir });
     let sessionId: string | undefined, key = "manual:a";

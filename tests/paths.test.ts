@@ -4,7 +4,8 @@
  */
 
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 
@@ -139,6 +140,17 @@ await test("resolveTelegramTempDir", () => {
     resolveTelegramTempDir().endsWith(join("tmp", "pi-telegram")),
     "temp dir ends with the platform-native tmp/pi-telegram suffix",
   );
+});
+
+await test("resolveTelegramTempDir canonicalizes a symlinked agent directory for strict journal anchors", () => {
+  const real = realpathSync(mkdtempSync(join(tmpdir(), "pi-telegram-paths-real-")));
+  const link = `${real}-link`;
+  try {
+    symlinkSync(real, link, "dir");
+    assert.equal(resolveTelegramTempDir(link), join(real, "tmp", "pi-telegram"));
+    assert.equal(resolveTelegramTempDir(join(link, "missing", "agent")), join(real, "missing", "agent", "tmp", "pi-telegram"),
+      "Only the existing prefix is resolved; missing components are kept verbatim");
+  } finally { rmSync(link, { force: true }); rmSync(real, { recursive: true, force: true }); }
 });
 
 await test("resolveTelegramRuntimeLogPath", () => {
