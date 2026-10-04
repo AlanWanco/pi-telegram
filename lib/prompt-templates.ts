@@ -79,7 +79,7 @@ export function substitutePromptTemplateArgs(
   return result.replace(/\$ARGUMENTS/g, allArgs).replace(/\$@/g, allArgs);
 }
 
-export function isTelegramPromptTemplateCommandName(name: string): boolean {
+function isTelegramPromptTemplateCommandName(name: string): boolean {
   return TELEGRAM_BOT_COMMAND_NAME_PATTERN.test(name);
 }
 

@@ -96,15 +96,15 @@ test("Activity API declares the Pi lifecycle compatibility floor", async () => {
   ) as { peerDependencies?: Record<string, string> };
   assert.equal(
     packageJson.peerDependencies?.["@earendil-works/pi-coding-agent"],
-    ">=0.84.4",
+    ">=1.0.0",
   );
   assert.equal(
     packageJson.peerDependencies?.["@earendil-works/pi-agent-core"],
-    ">=0.84.4",
+    ">=1.0.0",
   );
   assert.equal(
     packageJson.peerDependencies?.["@earendil-works/pi-ai"],
-    ">=0.84.4",
+    ">=1.0.0",
   );
 });
 

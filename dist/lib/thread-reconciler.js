@@ -295,7 +295,7 @@ export async function applyThreadReconciliationPlan(plan, ports) {
             }
             let deleteConfirmed = false;
             let superseded = false;
-            for (const method of ["closeForumTopic", "deleteForumTopic"]) {
+            for (const method of ports.skipCloseBeforeDelete ? ["deleteForumTopic"] : ["closeForumTopic", "deleteForumTopic"]) {
                 if (ports.isCleanupTargetProtected?.(action.target, action)) {
                     superseded = true;
                     break;

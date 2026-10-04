@@ -397,7 +397,7 @@ export function createTelegramPreviewController(
   };
 }
 
-export function createTelegramAssistantMessagePreviewHooks<TMessage>(
+function createTelegramAssistantMessagePreviewHooks<TMessage>(
   deps: TelegramAssistantMessagePreviewHookDeps<TMessage>,
 ): TelegramAssistantMessagePreviewHooks<TMessage> {
   return {
@@ -425,7 +425,7 @@ export function shouldSuppressPreviewForGuestTurn(
   return !!turn?.guestQueryId;
 }
 
-export async function handleTelegramAssistantMessagePreviewStart<TMessage>(
+async function handleTelegramAssistantMessagePreviewStart<TMessage>(
   message: TMessage,
   deps: TelegramAssistantMessagePreviewStartDeps<TMessage>,
 ): Promise<void> {
@@ -453,7 +453,7 @@ export async function handleTelegramAssistantMessagePreviewStart<TMessage>(
   deps.setState(next);
 }
 
-export async function handleTelegramAssistantMessagePreviewUpdate<TMessage>(
+async function handleTelegramAssistantMessagePreviewUpdate<TMessage>(
   message: TMessage,
   deps: TelegramAssistantMessagePreviewUpdateDeps<TMessage>,
 ): Promise<void> {

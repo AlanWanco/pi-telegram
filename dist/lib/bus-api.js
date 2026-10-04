@@ -60,12 +60,14 @@ export function createTelegramBusAwareApiRuntime(deps) {
                     options,
                 ]);
         },
-        downloadFile(fileId, suggestedName) {
+        downloadFile(fileId, suggestedName, source) {
+            // The source names the file (kind-scope-message); dropping it falls back to the bare generated name.
             return deps.ownsDirect()
-                ? deps.directRuntime.downloadFile(fileId, suggestedName)
+                ? deps.directRuntime.downloadFile(fileId, suggestedName, source)
                 : deps.callFollowerApi("downloadFile", [
                     fileId,
                     suggestedName,
+                    ...(source ? [source] : []),
                 ]);
         },
         deleteWebhook(signal) {

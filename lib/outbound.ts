@@ -9,7 +9,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { TelegramAssistantSegmentEvent } from "./activity.ts";
-import { resolveTelegramTempDir } from "./paths.ts";
+import { resolveTelegramAttachmentsDir } from "./paths.ts";
 import * as Replies from "./replies.ts";
 import type { TelegramPreparedPreviewDelivery } from "./preview.ts";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.ts";
@@ -202,7 +202,7 @@ export function registerTelegramOutboundHandler(
   };
 }
 
-export function getTelegramOutboundProgrammaticHandlers(
+function getTelegramOutboundProgrammaticHandlers(
   kind: string,
 ): TelegramOutboundProgrammaticHandler[] {
   const registry = getOrCreateOutboundHandlerRegistry();
@@ -451,7 +451,7 @@ function getVoiceReplyTemplateValues(
 }
 
 function getDefaultTelegramVoiceTempDir(): string {
-  return resolveTelegramTempDir();
+  return resolveTelegramAttachmentsDir();
 }
 
 async function generateTelegramVoiceReplyFileWithHandler(
@@ -598,7 +598,7 @@ async function transformTelegramOutboundTextWithHandler(
   return result.stdout.trim() || text;
 }
 
-export async function transformTelegramOutboundText(
+async function transformTelegramOutboundText(
   text: string,
   options: {
     handlers?: TelegramOutboundHandlerConfig[];
@@ -658,7 +658,7 @@ async function transformTelegramOutboundReplyMarkup<TReplyMarkup>(
   return { ...replyMarkup, inline_keyboard: translatedRows } as TReplyMarkup;
 }
 
-export async function transformTelegramOutboundTextReply<
+async function transformTelegramOutboundTextReply<
   TReplyMarkup = unknown,
 >(
   text: string,

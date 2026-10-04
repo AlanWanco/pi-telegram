@@ -7,6 +7,8 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openS
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameTelegramPathWithRetry, withTelegramFileTransaction } from "./locks.js";
+import { getTelegramJournalPublicationPaths } from "./paths.js";
+import { isWireRecord as isObject, hasOnlyWireKeys as onlyKeys, isNonNegativeWireInteger as safeTime, } from "./wire.js";
 function targetKey(target) {
     return `${target.chatId}:${target.threadId}`;
 }
@@ -134,16 +136,6 @@ export function createTelegramInactiveThreadCleanupReviewRuntime(deps) {
         },
     };
 }
-function isObject(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-}
-function onlyKeys(value, keys) {
-    const allowed = new Set(keys);
-    return Object.keys(value).every(key => allowed.has(key));
-}
-function safeTime(value) {
-    return Number.isSafeInteger(value) && value >= 0;
-}
 function validateWorkSet(value, profileName) {
     if (!isObject(value) || !onlyKeys(value, ["operationId", "createdAtMs", "entries"]) ||
         typeof value.operationId !== "string" || !value.operationId || !safeTime(value.createdAtMs) ||
@@ -199,7 +191,18 @@ function validateWorkSet(value, profileName) {
 function sameCandidates(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
 }
+function parseTelegramThreadCleanupWorkFile(value, profileName, tokenSha256) {
+    if (!isObject(value) || !onlyKeys(value, ["version", "profileName", "tokenSha256", "workSets"]) ||
+        value.version !== 1 || value.profileName !== profileName || value.tokenSha256 !== tokenSha256 || !Array.isArray(value.workSets))
+        throw new Error("Telegram Thread cleanup store identity or schema does not match.");
+    const workSets = value.workSets.map(workSet => validateWorkSet(workSet, profileName));
+    if (new Set(workSets.map(workSet => workSet.operationId)).size !== workSets.length)
+        throw new Error("Telegram Thread cleanup operation identity is ambiguous.");
+    return { version: 1, profileName, tokenSha256, workSets };
+}
 export function createTelegramThreadCleanupWorkStore(options) {
+    options = { ...options };
+    const publicationPaths = getTelegramJournalPublicationPaths(options.path, options.runtimeDir);
     const maxWorkSets = options.maxWorkSets ?? 32;
     const maxBytes = options.maxBytes ?? 1024 * 1024;
     const now = options.getNowMs ?? Date.now;
@@ -236,14 +239,7 @@ export function createTelegramThreadCleanupWorkStore(options) {
         finally {
             closeSync(fd);
         }
-        if (!isObject(value) || !onlyKeys(value, ["version", "profileName", "tokenSha256", "workSets"]) ||
-            value.version !== 1 || value.profileName !== options.profileName ||
-            value.tokenSha256 !== options.tokenSha256 || !Array.isArray(value.workSets))
-            throw new Error("Telegram Thread cleanup store identity or schema does not match.");
-        const workSets = value.workSets.map(workSet => validateWorkSet(workSet, options.profileName));
-        if (new Set(workSets.map(workSet => workSet.operationId)).size !== workSets.length)
-            throw new Error("Telegram Thread cleanup operation identity is ambiguous.");
-        return { version: 1, profileName: options.profileName, tokenSha256: options.tokenSha256, workSets };
+        return parseTelegramThreadCleanupWorkFile(value, options.profileName, options.tokenSha256);
     };
     const publish = (file) => {
         if (file.workSets.length > maxWorkSets)
@@ -251,8 +247,9 @@ export function createTelegramThreadCleanupWorkStore(options) {
         const serialized = `${JSON.stringify(file, null, 2)}\n`;
         if (Buffer.byteLength(serialized) > maxBytes)
             throw new Error("Telegram Thread cleanup byte capacity reached.");
-        const temporaryPath = `${options.path}.${process.pid}.${randomUUID()}.tmp`;
+        const temporaryPath = `${publicationPaths.temporaryBasePath}.${process.pid}.${randomUUID()}.tmp`;
         mkdirSync(dirname(options.path), { recursive: true, mode: 0o700 });
+        mkdirSync(dirname(temporaryPath), { recursive: true, mode: 0o700 });
         try {
             writeFileSync(temporaryPath, serialized, { mode: 0o600 });
             chmodSync(temporaryPath, 0o600);
@@ -269,7 +266,7 @@ export function createTelegramThreadCleanupWorkStore(options) {
             catch { /* rename consumed it */ }
         }
     };
-    const mutate = (operation) => withTelegramFileTransaction(`${options.path}.transaction`, () => operation(read()));
+    const mutate = (operation) => withTelegramFileTransaction(publicationPaths.transactionPath, () => operation(read()));
     return {
         prepare(operationId, candidates) {
             if (!operationId || candidates.length === 0 || candidates.some(candidate => candidate.profileName !== options.profileName))
@@ -343,7 +340,7 @@ export function createTelegramThreadCleanupWorkStore(options) {
             });
         },
         list() {
-            return structuredClone(withTelegramFileTransaction(`${options.path}.transaction`, () => read().workSets));
+            return structuredClone(withTelegramFileTransaction(publicationPaths.transactionPath, () => read().workSets));
         },
     };
 }

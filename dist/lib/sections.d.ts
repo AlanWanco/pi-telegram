@@ -121,8 +121,6 @@ export interface TelegramSectionRuntimeDeps {
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
 }
 /** @internal */
-export declare function setGlobalTelegramSectionRegistry(registry: TelegramSectionRegistry): void;
-/** @internal */
 export declare function createAndBindTelegramSectionRegistry(): TelegramSectionRegistry;
 /**
  * Register a Telegram Extension Section from any pi extension.

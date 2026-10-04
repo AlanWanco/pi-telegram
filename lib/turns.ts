@@ -86,7 +86,7 @@ export function createTelegramTurnPrefix(
   return `[${parts.join("|")}]`;
 }
 
-export function formatTelegramTurnPrefix(
+function formatTelegramTurnPrefix(
   _message: TelegramTurnMessage,
   basePrefix = TELEGRAM_PREFIX,
 ): string {

@@ -108,10 +108,6 @@ export declare function createTelegramBridgeDeliveryLifecycleHooks<TTransportSta
     getTransportStamp?: () => TTransportStamp;
     isTransportStampActive?: (stamp: TTransportStamp) => boolean;
 }): ReturnType<typeof createTelegramDeliveryLifecycleHooks>;
-export declare function classifyTelegramDeliveryTransportError(error: unknown): {
-    reason: Extract<TelegramDeliveryFailureReason, "commit-unknown" | "message-unavailable" | "rate-limited" | "transport-retryable" | "transport-failed">;
-    retryAfterMs?: number;
-};
 /** @internal */
 export interface TelegramDeliveryTargetPolicyView {
     canDeliver: boolean;

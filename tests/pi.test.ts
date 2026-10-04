@@ -58,6 +58,7 @@ test("Pi context mode helpers feature-detect passive run modes", () => {
 });
 
 test("Pi session identity adapter is lifecycle-alias agnostic", () => {
+  assert.equal(getExtensionContextSessionId(undefined), undefined, "Missing context cannot invent a session identity");
   const sessionManager = { getSessionId: () => "stable-session" };
   for (const lifecycleAlias of ["restart", "reload", "resume", "continue-recent"]) {
     const ctx = { sessionManager, lifecycleAlias } as unknown as ExtensionContext;

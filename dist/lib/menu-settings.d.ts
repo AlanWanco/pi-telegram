@@ -77,19 +77,9 @@ export interface TelegramSettingsMenuRuntimeDeps<TContext, TModel extends MenuMo
     sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramSettingsMenuReplyMarkup) => Promise<number | undefined>;
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
 }
-export declare const SETTINGS_MENU_TITLE = "<b>\u2699\uFE0F Settings:</b>";
-export declare const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE = "<b>\uD83E\uDDF9 Thread cleanup:</b>";
-export declare const INACTIVE_THREAD_REVIEW_TITLE = "<b>\uD83D\uDD0E Inactive tabs review:</b>";
-export declare const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>\uD83D\uDCDD Draft previews:</b>";
-export declare const ASSISTANT_RENDERING_SETTINGS_TITLE = "<b>\uD83E\uDDFE Assistant rendering:</b>";
-export declare const ACTIVITY_VERBOSITY_SETTINGS_TITLE = "<b>\uD83D\uDD2C Activity:</b>";
-export declare const TIME_INJECTION_MODE_SETTINGS_TITLE = "<b>\uD83D\uDD52 Time injection mode:</b>";
-export declare const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>\uD83D\uDC44 Voice reply mode:</b>";
-export declare const THREAD_DISPLAY_SETTINGS_TITLE = "<b>\uD83E\uDDF5 Thread display:</b>";
 export declare function buildTelegramSettingsMenuText(): string;
 export declare function buildThreadDisplaySettingsText(mode: TelegramThreadDisplayMode, custom?: boolean): string;
 export declare function buildAutomaticThreadCleanupSettingsText(enabled: boolean): string;
-export declare function buildInactiveThreadReviewText(count: number): string;
 export declare function buildInactiveThreadReviewReplyMarkup(operationId?: string, canCleanInactiveThreads?: boolean): TelegramSettingsMenuReplyMarkup;
 export declare function buildDraftPreviewsSettingsText(enabled: boolean): string;
 export declare function buildAssistantRenderingSettingsText(mode: TelegramAssistantRenderingMode): string;
@@ -97,7 +87,6 @@ export declare function buildActivityVerbositySettingsText(verbosity: TelegramAc
 export declare function buildVoiceReplyModeSettingsText(mode: TelegramVoiceReplyMode, configured?: boolean): string;
 export declare function buildTimeInjectionModeSettingsText(mode: TelegramTimeMode): string;
 export declare function buildTelegramSettingsMenuReplyMarkup(draftPreviewsEnabled: boolean, assistantRenderingModeOrVoiceReplyMode: TelegramAssistantRenderingMode | TelegramVoiceReplyMode, voiceReplyModeOrTimeInjectionMode: TelegramVoiceReplyMode | TelegramTimeMode, timeInjectionModeOrSectionRegistry?: TelegramTimeMode | TelegramSectionRegistry, sectionRegistryOrVoiceReplyModeConfigured?: TelegramSectionRegistry | boolean, voiceReplyModeConfigured?: boolean, automaticThreadCleanupEnabled?: boolean, activityVerbosity?: TelegramActivityVerbosity, threadDisplayMode?: TelegramThreadDisplayMode, threadDisplayCustom?: boolean): TelegramSettingsMenuReplyMarkup;
-export declare function openTelegramSettingsMenu<TModel extends MenuModel = MenuModel>(deps: TelegramSettingsMenuOpenDeps<TModel>, sectionRegistry?: TelegramSectionRegistry): Promise<void>;
 export declare function buildThreadDisplaySettingsReplyMarkup(mode: TelegramThreadDisplayMode, custom?: boolean): TelegramSettingsMenuReplyMarkup;
 export declare function buildAutomaticThreadCleanupSettingsReplyMarkup(enabled: boolean, canReviewInactiveThreads?: boolean): TelegramSettingsMenuReplyMarkup;
 export declare function buildDraftPreviewsSettingsReplyMarkup(enabled: boolean): TelegramSettingsMenuReplyMarkup;
@@ -105,12 +94,5 @@ export declare function buildAssistantRenderingSettingsReplyMarkup(mode: Telegra
 export declare function buildActivityVerbositySettingsReplyMarkup(verbosity: TelegramActivityVerbosity): TelegramSettingsMenuReplyMarkup;
 export declare function buildTimeInjectionModeSettingsReplyMarkup(mode: TelegramTimeMode): TelegramSettingsMenuReplyMarkup;
 export declare function buildVoiceReplyModeSettingsReplyMarkup(mode: TelegramVoiceReplyMode, configured?: boolean): TelegramSettingsMenuReplyMarkup;
-export declare function updateTelegramSettingsMenuMessage(deps: TelegramSettingsMenuMessageUpdateDeps, sectionRegistry?: TelegramSectionRegistry): Promise<void>;
-export declare function updateAutomaticThreadCleanupSettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
-export declare function updateDraftPreviewsSettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
-export declare function updateAssistantRenderingSettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
-export declare function updateActivityVerbositySettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
-export declare function updateTimeInjectionModeSettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
-export declare function updateVoiceReplyModeSettingsMessage(deps: TelegramSettingsMenuCallbackDeps): Promise<void>;
 export declare function handleTelegramSettingsMenuCallbackAction(callbackQueryId: string, data: string | undefined, deps: TelegramSettingsMenuCallbackDeps): Promise<boolean>;
 export declare function createTelegramSettingsMenuRuntime<TContext, TModel extends MenuModel = MenuModel>(deps: TelegramSettingsMenuRuntimeDeps<TContext, TModel>, sectionRegistry?: TelegramSectionRegistry): TelegramSettingsMenuRuntime<TContext>;

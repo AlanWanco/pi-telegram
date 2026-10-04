@@ -11,12 +11,15 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  readdirSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { createTelegramLockRuntime, readTelegramRuntimeState, mutateTelegramRuntimeStateSection } from "../lib/locks.ts";
 import { getTelegramProcessBirthIdentity } from "../lib/bus.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
@@ -56,16 +59,19 @@ function createTempPath(): { dir: string; path: string } {
 
 function createLedger(input: {
   path: string;
+  stateProfile?: string;
+  profileKey?: string;
   owner?: TelegramWorkspaceAdmissionOwner;
   getNowMs?: () => number;
-  getProcessLiveness?: () => "alive" | "dead" | "unverifiable";
+  getProcessLiveness?: (owner: TelegramWorkspaceAdmissionOwner) => "alive" | "dead" | "unverifiable";
   publishRename?: typeof renameSync;
   authorizeJournalWriterProtocolClosure?: Parameters<
     typeof createTelegramWorkspaceAdmissionLedger>[0]["authorizeJournalWriterProtocolClosure"];
 }): TelegramWorkspaceAdmissionLedger {
   return createTelegramWorkspaceAdmissionLedger({
     path: input.path,
-    profileKey,
+    stateProfile: input.stateProfile,
+    profileKey: input.profileKey ?? profileKey,
     owner: input.owner ?? owner,
     getNowMs: input.getNowMs,
     getProcessLiveness: input.getProcessLiveness ?? (() => "alive"),
@@ -97,6 +103,208 @@ function isAdmissionError(
 ): boolean {
   return error instanceof TelegramWorkspaceAdmissionError && error.code === code;
 }
+
+const rootProfileKey = createTelegramWorkspaceAdmissionProfileKey({ profileName: "default", botToken: "root-test-token" });
+function createStateLedger(input: Parameters<typeof createLedger>[0]): TelegramWorkspaceAdmissionLedger {
+  return createLedger({ stateProfile: "default", profileKey: rootProfileKey, ...input });
+}
+
+test("Consolidated admission observes without creation and refuses malformed or foreign storage", () => {
+  const temp = createTempPath();
+  try {
+    const ledger = createStateLedger({ path: temp.path });
+    assert.deepEqual(ledger.read(), { profileKey: rootProfileKey, leases: [] });
+    assert.deepEqual(readdirSync(temp.dir), []);
+    assert.throws(() => createStateLedger({ path: temp.path, stateProfile: "other" }), error => isAdmissionError(error, "invalid-input"));
+    for (const raw of ["{", JSON.stringify({ version: 1, profileKey: rootProfileKey, leases: [] }),
+      JSON.stringify({ version: 2, profiles: { default: { admission: { version: 1, profileKey: rootProfileKey, leases: [], futureGrant: true } } } })]) {
+      writeFileSync(temp.path, raw, { mode: 0o600 });
+      assert.throws(() => ledger.read(), error => isAdmissionError(error, "invalid-state"));
+      assert.throws(() => ledger.acquireAdmission({ operationId: "bad", operationKind: "send", scope: { kind: "profile" } }));
+      assert.equal(readFileSync(temp.path, "utf8"), raw);
+    }
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated admission supports nonleader leases and preserves all siblings and profiles", () => {
+  const temp = createTempPath();
+  try {
+    const transport = createTelegramLockRuntime({ statePath: temp.path, pid: 10, instanceId: "leader", runtimeGeneration: 1, isProcessAlive: () => true });
+    transport.acquire({ cwd: "/repo" });
+    for (const [profile, section, value] of [["default", "workspace", { binding: 55, issued: true }],
+      ["default", "runtime", { observation: true }], ["other", "workspace", { binding: 66 }]] as const)
+      mutateTelegramRuntimeStateSection(temp.path, profile, section, () => ({ value, result: true }), { isCurrent: () => true });
+    const before = readTelegramRuntimeState(temp.path), ledger = createStateLedger({ path: temp.path });
+    const lease = ledger.acquireAdmission({ operationId: "follower-send", operationKind: "send", scope: { kind: "target", target } });
+    assert.equal(lease.kind, "acquired");
+    const other = createStateLedger({ path: temp.path, stateProfile: "other", profileKey: createTelegramWorkspaceAdmissionProfileKey({ profileName: "other", botToken: "other-token" }) });
+    assert.equal(other.acquireAdmission({ operationId: "other-busy", operationKind: "send", scope: { kind: "profile" } }).kind, "acquired");
+    assert.equal(ledger.acquireRetirementFence({ operationId: "blocked", retirementIntentId: "intent", bindingKey: "binding", slot: "A", target, leaderEpoch: 1, retirementRequestedAtMs: 1 }).kind, "blocked");
+    if (lease.kind !== "acquired") return;
+    const stable = readFileSync(temp.path, "utf8"), inode = statSync(temp.path).ino;
+    const resumed = ledger.acquireAdmission({ operationId: "follower-send", operationKind: "send", scope: { kind: "target", target } });
+    assert.equal(resumed.kind, "acquired");
+    if (resumed.kind === "acquired") assert.deepEqual(resumed.lease, lease.lease);
+    assert.equal(readFileSync(temp.path, "utf8"), stable);
+    assert.equal(statSync(temp.path).ino, inode);
+    assert.equal(ledger.releaseAdmission(lease.lease), true);
+    assert.equal(acquireFence(ledger).phase, "fenced");
+    const after = readTelegramRuntimeState(temp.path);
+    for (const section of ["transport", "workspace", "runtime"] as const) assert.deepEqual(after.profiles.default?.[section], before.profiles.default?.[section]);
+    assert.deepEqual(after.profiles.other?.workspace, before.profiles.other?.workspace);
+    assert.equal(other.read().leases.length, 1);
+    assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "workspace-admission.json"]);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const prefix of ["before-rename", "after-rename"] as const) {
+  test(`Consolidated admission deletion issuance retains uncertainty (${prefix})`, () => {
+    const temp = createTempPath();
+    let fail = false;
+    try {
+      const ledger = createStateLedger({ path: temp.path, publishRename(source, destination) {
+        if (fail) {
+          if (prefix === "after-rename") renameSync(source, destination);
+          throw new Error("lost permit publication ACK");
+        }
+        renameSync(source, destination);
+      } });
+      const fenced = acquireFence(ledger);
+      fail = true;
+      assert.throws(() => ledger.issueDeletionPermit(fenced), error => isAdmissionError(error, "publication-unknown"));
+      const fresh = createStateLedger({ path: temp.path }), retained = fresh.read().fence;
+      assert.ok(retained && retained.destructiveKind !== "journal-writer-closure");
+      assert.equal(retained.phase, prefix === "after-rename" ? "deletion-issued" : "fenced");
+      if (prefix === "after-rename") {
+        assert.equal(fresh.issueDeletionPermit(retained).kind, "already-issued");
+        assert.throws(() => fresh.releaseUnissuedRetirementFence(retained));
+      } else assert.equal(fresh.issueDeletionPermit(retained).kind, "issued");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Consolidated admission keeps unverifiable leases and prunes only positively dead owners", () => {
+  const temp = createTempPath();
+  try {
+    const ledger = createStateLedger({ path: temp.path });
+    ledger.acquireAdmission({ operationId: "old", operationKind: "send", scope: { kind: "target", target } });
+    let liveness: "unverifiable" | "dead" = "unverifiable";
+    const next = createStateLedger({ path: temp.path, owner: { processId: 102, processBirthId: "102:new" }, getProcessLiveness: () => liveness });
+    const request = { operationId: "retire", retirementIntentId: "intent", bindingKey: "binding", slot: "A", target, leaderEpoch: 1, retirementRequestedAtMs: 1 };
+    assert.equal(next.acquireRetirementFence(request).kind, "blocked");
+    assert.equal(next.read().leases.length, 1);
+    liveness = "dead";
+    assert.equal(next.acquireRetirementFence(request).kind, "acquired");
+    assert.equal(next.read().leases.length, 0);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated admission preserves closure and exact custody-v3 writer protocol fences", () => {
+  const temp = createTempPath();
+  try {
+    const ledger = createStateLedger({ path: temp.path });
+    const closure = ledger.acquireJournalWriterClosure({ operationId: "closure", recoveryKey: "journal:work", requestedAtMs: 900 });
+    assert.equal(closure.kind, "acquired");
+    if (closure.kind !== "acquired") return;
+    const authority = { startupAuthorityId: "cutover:1", writerInventorySha256: "a".repeat(64), closureOperationId: "closure", recoveryKey: "journal:work" };
+    const installed = ledger.installJournalWriterProtocolMode(closure.fence, authority);
+    assert.deepEqual(createStateLedger({ path: temp.path }).read().writerProtocolMode, installed.mode);
+    assert.throws(() => ledger.acquireAdmission({ operationId: "generic", operationKind: "journal.append", scope: { kind: "profile" } }), error => isAdmissionError(error, "authority-changed"));
+    const admitted = ledger.acquireJournalWriterAdmission({ operationId: "v3", ...authority });
+    assert.equal(admitted.kind, "acquired");
+    assert.throws(() => ledger.acquireJournalWriterAdmission({ operationId: "wrong", ...authority, startupAuthorityId: "wrong" }), error => isAdmissionError(error, "authority-changed"));
+    if (admitted.kind === "acquired") assert.equal(ledger.releaseAdmission(admitted.lease), true);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const drift of ["path", "profileKey", "owner", "stateProfile"] as const) {
+  test(`Consolidated admission cannot borrow changed construction identity (${drift})`, () => {
+    const temp = createTempPath();
+    try {
+      const options = { path: temp.path, stateProfile: "default", profileKey: rootProfileKey, owner: { ...owner }, getProcessLiveness: () => "alive" as const };
+      const ledger = createTelegramWorkspaceAdmissionLedger(options);
+      const fenced = acquireFence(ledger), before = readFileSync(temp.path, "utf8");
+      if (drift === "path") options.path = join(temp.dir, "other.json");
+      if (drift === "profileKey") options.profileKey = createTelegramWorkspaceAdmissionProfileKey({ botToken: "new-token" });
+      if (drift === "owner") options.owner.processBirthId = "replacement";
+      if (drift === "stateProfile") options.stateProfile = "other";
+      assert.throws(() => ledger.issueDeletionPermit(fenced), error => isAdmissionError(error, "authority-changed"));
+      assert.throws(() => ledger.read(), error => isAdmissionError(error, "authority-changed"));
+      assert.equal(readFileSync(temp.path, "utf8"), before);
+      assert.equal(existsSync(join(temp.dir, "other.json")), false);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const boundary of ["before-write", "after-write-before-rename", "after-rename"] as const) {
+  test(`Consolidated admission recaptures construction identity at publication (${boundary})`, () => {
+    const temp = createTempPath();
+    let drift = false;
+    try {
+      const options = { path: temp.path, stateProfile: "default", profileKey: rootProfileKey, owner: { ...owner },
+        getProcessLiveness: () => "alive" as const,
+        onPublicationBoundary(at: "before-write" | "after-write-before-rename") {
+          if (drift && at === boundary) options.owner.processBirthId = "replaced";
+        },
+        publishRename(source: Parameters<typeof renameSync>[0], destination: Parameters<typeof renameSync>[1]) {
+          renameSync(source, destination);
+          if (drift && boundary === "after-rename") options.owner.processBirthId = "replaced";
+        },
+      };
+      const ledger = createTelegramWorkspaceAdmissionLedger(options), fenced = acquireFence(ledger);
+      drift = true;
+      assert.throws(() => ledger.issueDeletionPermit(fenced), error => isAdmissionError(error, boundary === "after-rename" ? "publication-unknown" : "authority-changed"));
+      const fresh = createStateLedger({ path: temp.path }), retained = fresh.read().fence;
+      assert.ok(retained && retained.destructiveKind !== "journal-writer-closure");
+      assert.equal(retained.phase, boundary === "after-rename" ? "deletion-issued" : "fenced");
+      if (boundary === "after-rename") assert.equal(fresh.issueDeletionPermit(retained).kind, "already-issued");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Consolidated admission refuses nested unknown evidence without silently dropping it", () => {
+  const temp = createTempPath();
+  try {
+    const ledger = createStateLedger({ path: temp.path });
+    ledger.acquireAdmission({ operationId: "known", operationKind: "send", scope: { kind: "target", target } });
+    mutateTelegramRuntimeStateSection(temp.path, "default", "admission", current => {
+      const state = current as { leases: Array<Record<string, unknown>> };
+      state.leases[0]!.unknownIssuedEffect = true;
+      return { value: state, result: true };
+    }, { isCurrent: () => true });
+    const before = readFileSync(temp.path, "utf8");
+    assert.throws(() => ledger.read(), error => isAdmissionError(error, "invalid-state"));
+    assert.throws(() => ledger.acquireAdmission({ operationId: "new", operationKind: "send", scope: { kind: "profile" } }), error => isAdmissionError(error, "invalid-state"));
+    assert.equal(readFileSync(temp.path, "utf8"), before);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated admission binding resolves independent profile sections without legacy fallback", () => {
+  const temp = createTempPath();
+  let profileName: string | undefined;
+  try {
+    const binding = createTelegramWorkspaceAdmissionRuntimeBinding({ getStatePath: () => temp.path, getProfileName: () => profileName, getBotToken: () => "root-test-token", owner, getProcessLiveness: () => "alive" });
+    binding.resolve()!.acquireAdmission({ operationId: "default", operationKind: "send", scope: { kind: "profile" } });
+    profileName = "other";
+    const next = binding.resolve()!;
+    assert.equal(next.read().leases.length, 0);
+    next.acquireAdmission({ operationId: "other", operationKind: "send", scope: { kind: "profile" } });
+    assert.deepEqual(Object.keys(readTelegramRuntimeState(temp.path).profiles).sort(), ["default", "other"]);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated admission cross-process contenders share one guard without overlap", async () => {
+  const temp = createTempPath(), readyAdmission = join(temp.dir, "ready-admission"), readyFence = join(temp.dir, "ready-fence"), startPath = join(temp.dir, "start");
+  try {
+    const admission = runRaceParticipant({ path: temp.path, readyPath: readyAdmission, startPath, action: "admission", operationId: "race-admission", stateProfile: "default" });
+    const fence = runRaceParticipant({ path: temp.path, readyPath: readyFence, startPath, action: "fence", operationId: "race-fence", stateProfile: "default" });
+    await waitForFiles([readyAdmission, readyFence]);
+    writeFileSync(startPath, "start");
+    const results = await Promise.all([admission, fence]);
+    assert.equal(results.filter(result => result.kind === "acquired").length, 1);
+    assert.equal(results.filter(result => result.kind === "blocked").length, 1);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
 
 test("Rejected retirement remains fenced until exact cancellation completion and cannot grant another permit", () => {
   const temp = createTempPath();
@@ -458,11 +666,11 @@ test("Workspace admission runtime binds profile paths to stable bot identity", (
   try {
     assert.equal(
       resolveTelegramWorkspaceAdmissionPath(temp.dir),
-      join(temp.dir, "tmp", "telegram", "workspace-admission.json"),
+      join(temp.dir, "tmp", "pi-telegram", "workspace-admission.json"),
     );
     assert.equal(
       resolveTelegramWorkspaceAdmissionPath(temp.dir, "work"),
-      join(temp.dir, "tmp", "telegram", "workspace-admission.work.json"),
+      join(temp.dir, "tmp", "pi-telegram", "workspace-admission.work.json"),
     );
     const firstProfileKey = createTelegramWorkspaceAdmissionProfileKey({
       profileName: "work",
@@ -1071,6 +1279,7 @@ function runRaceParticipant(input: {
   startPath: string;
   action: "admission" | "fence";
   operationId: string;
+  stateProfile?: string;
 }): Promise<RaceResult> {
   const moduleUrl = new URL("../lib/workspace-admission.ts", import.meta.url).href;
   const busUrl = new URL("../lib/bus.ts", import.meta.url).href;
@@ -1080,7 +1289,9 @@ function runRaceParticipant(input: {
     import { getTelegramProcessBirthIdentity } from ${JSON.stringify(busUrl)};
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     const owner = { processId: process.pid, processBirthId: getTelegramProcessBirthIdentity(process.pid, Date.now()) };
-    const ledger = createTelegramWorkspaceAdmissionLedger({ path: process.env.LEDGER_PATH, profileKey: ${JSON.stringify(profileKey)}, owner });
+    const ledger = createTelegramWorkspaceAdmissionLedger({ path: process.env.LEDGER_PATH,
+      stateProfile: ${JSON.stringify(input.stateProfile) ?? "undefined"},
+      profileKey: ${JSON.stringify(input.stateProfile === undefined ? profileKey : createTelegramWorkspaceAdmissionProfileKey({ profileName: input.stateProfile, botToken: "root-test-token" }))}, owner });
     writeFileSync(process.env.READY_PATH, "ready");
     while (!existsSync(process.env.START_PATH)) sleep(2);
     const action = process.env.ACTION;

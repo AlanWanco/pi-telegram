@@ -8,14 +8,15 @@
 
 import { randomUUID } from "node:crypto";
 import { createWriteStream, openAsBlob } from "node:fs";
-import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { request as requestHttps } from "node:https";
 import { join } from "node:path";
-import { resolveTelegramTempDir } from "./paths.ts";
+import type { TelegramAttachmentSource } from "./media.ts";
+import { resolveTelegramAttachmentsDir } from "./paths.ts";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-export const TELEGRAM_API_BASE = "https://api.telegram.org";
+const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 export const TELEGRAM_FILE_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -34,12 +35,10 @@ export function getTelegramInboundFileByteLimitFromEnv(
 }
 
 function getTelegramApiTempDir(): string {
-  return resolveTelegramTempDir();
+  return resolveTelegramAttachmentsDir();
 }
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const activeTelegramApiWorkspaceAdmissionOperationIds = new Set<string>();
-const TELEGRAM_TEMP_SCRATCH_FILE_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/u;
 const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(
   process.env,
   ["PI_TELEGRAM_INBOUND_FILE_MAX_BYTES", "TELEGRAM_MAX_FILE_SIZE_BYTES"],
@@ -750,6 +749,8 @@ export interface TelegramBridgeApiRuntimeDeps {
   tempDir: string;
   maxFileSizeBytes: number;
   tempFileMaxAgeMs: number;
+  /** Bot `@username` (or numeric id) naming private-chat attachments. */
+  getBotScope?: () => string | undefined;
   recordRuntimeEvent: (
     kind: "api" | "multipart" | "download",
     error: unknown,
@@ -774,7 +775,11 @@ export interface TelegramBridgeApiRuntime {
     fileName: string,
     options?: TelegramApiCallOptions,
   ) => Promise<TResponse>;
-  downloadFile: (fileId: string, suggestedName: string) => Promise<string>;
+  downloadFile: (
+    fileId: string,
+    suggestedName: string,
+    source?: TelegramAttachmentSource,
+  ) => Promise<string>;
   deleteWebhook: (signal?: AbortSignal) => Promise<boolean>;
   getUpdates: (
     body: Record<string, unknown>,
@@ -851,6 +856,28 @@ export interface TelegramBridgeApiRuntime {
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+/** Names follow `<kind>-<scope>-<messageId>[-<index>][-<name>|.<ext>]`. */
+/**
+ * `scope` is the bot `@username` (id fallback) in a private chat and the public chat `@username` (id fallback) elsewhere.
+ * A negative chat id loses its sign, so the name never contains two adjacent dashes.
+ */
+export function createTelegramAttachmentFileName(
+  source: TelegramAttachmentSource,
+  generatedName: string,
+  botScope?: string,
+): string {
+  const chat = source.chat;
+  const clean = (value: string): string => sanitizeFileName(value.replace(/^@/u, "")).replace(/^[-.]+/u, "");
+  const scope = source.scope ? clean(source.scope) : chat?.type === "private" || !chat
+    ? botScope ? clean(botScope) : chat ? String(Math.abs(chat.id)) : ""
+    : chat.username ? clean(chat.username) : String(Math.abs(chat.id));
+  const dot = generatedName.lastIndexOf(".");
+  const extension = dot > 0 ? sanitizeFileName(generatedName.slice(dot)) : "";
+  const tail = source.userFileName ? `-${clean(source.userFileName)}` : extension;
+  return [sanitizeFileName(source.kind), scope, String(source.messageId)].filter(Boolean).join("-") +
+    (source.index !== undefined ? `-${source.index}` : "") + tail;
 }
 
 class TelegramApiMalformedSuccessError extends Error {
@@ -1490,9 +1517,8 @@ export async function cleanupTelegramTempFiles(
     return 0;
   }
   for (const entry of entries) {
-    if (!entry.isFile() || !TELEGRAM_TEMP_SCRATCH_FILE_PATTERN.test(entry.name)) {
-      continue;
-    }
+    // The directory holds only attachment scratch files, so age alone decides.
+    if (!entry.isFile()) continue;
     const path = join(tempDir, entry.name);
     try {
       const stats = await stat(path);
@@ -1643,10 +1669,9 @@ export async function downloadTelegramFile(
   );
   assertTelegramFileSizeWithinLimit(file.file_size, options?.maxFileSizeBytes);
   await mkdir(tempDir, { recursive: true, mode: 0o700 });
-  const targetPath = join(
-    tempDir,
-    `${randomUUID()}-${sanitizeFileName(suggestedName)}`,
-  );
+  // Names carry scope and message id, so the same message maps to the same path; publish by rename.
+  const targetPath = join(tempDir, sanitizeFileName(suggestedName));
+  const partPath = `${targetPath}.${randomUUID()}.part`;
   const response = await callTelegramTransportRequest((family) =>
     telegramFetch(
       `${TELEGRAM_API_BASE}/file/bot${configuredBotToken}/${file.file_path}`,
@@ -1665,11 +1690,12 @@ export async function downloadTelegramFile(
   try {
     await writeTelegramDownloadResponse(
       response,
-      targetPath,
+      partPath,
       options?.maxFileSizeBytes,
     );
+    await rename(partPath, targetPath);
   } catch (error) {
-    await removeTelegramPartialDownload(targetPath);
+    await removeTelegramPartialDownload(partPath);
     throw error;
   }
   return targetPath;
@@ -1697,21 +1723,6 @@ export async function answerTelegramCallbackQuery(
         method: "answerCallbackQuery",
       }),
     );
-  }
-}
-
-export async function deleteTelegramMessage(
-  botToken: string | undefined,
-  chatId: number,
-  messageId: number,
-): Promise<void> {
-  try {
-    await callTelegram<boolean>(botToken, "deleteMessage", {
-      chat_id: chatId,
-      message_id: messageId,
-    });
-  } catch {
-    // ignore
   }
 }
 
@@ -1802,6 +1813,7 @@ export type TelegramWorkspaceThreadDeletionTransport = (
 
 export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
+  getBotScope?: () => string | undefined;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
   captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
   targetActivity?: TelegramApiTargetActivityRuntime;
@@ -1831,6 +1843,7 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
     tempDir: getTelegramApiTempDir(),
     maxFileSizeBytes: TELEGRAM_INBOUND_FILE_MAX_BYTES,
     tempFileMaxAgeMs: TELEGRAM_TEMP_FILE_MAX_AGE_MS,
+    ...(deps.getBotScope ? { getBotScope: deps.getBotScope } : {}),
     recordRuntimeEvent: deps.recordRuntimeEvent,
     captureRequestErrorHandler: deps.captureRequestErrorHandler,
   });
@@ -2040,11 +2053,13 @@ export function createTelegramBridgeApiRuntime(
      * Downloads a file from the Telegram servers into the local temp directory.
      * Used for inbound voice messages, photos, documents, etc.
      */
-    downloadFile: async (fileId, suggestedName) => {
+    downloadFile: async (fileId, suggestedName, source) => {
       try {
         return await deps.client.downloadFile(
           fileId,
-          suggestedName,
+          source
+            ? createTelegramAttachmentFileName(source, suggestedName, deps.getBotScope?.())
+            : suggestedName,
           deps.tempDir,
           {
             maxFileSizeBytes: deps.maxFileSizeBytes,

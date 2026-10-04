@@ -14,7 +14,7 @@ import {
 } from "@llblab/pi-telegram/activity";
 ```
 
-An issue #126 consumer can own optional Settings policy for reasoning, intermediate assistant prose, and tool rows. Those visibility choices do not become mandatory bridge-core settings.
+An external consumer can own optional Settings policy for reasoning, intermediate assistant prose, and tool rows. Those visibility choices do not become mandatory bridge-core settings.
 
 ## Ownership Boundary
 

@@ -498,7 +498,7 @@ export async function sendTelegramNativeMarkdownReply(chatId, replyToMessageId, 
     }
     return lastMessageId;
 }
-export async function sendTelegramNativeRichMessage(chatId, richMessage, deps, options) {
+async function sendTelegramNativeRichMessage(chatId, richMessage, deps, options) {
     const sent = await deps.sendRichMessage({
         chat_id: chatId,
         rich_message: richMessage,

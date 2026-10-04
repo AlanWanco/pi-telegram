@@ -1,7 +1,8 @@
 /**
  * Telegram status rendering helpers
  * Zones: telegram ui, pi agent diagnostics, tui
- * Owns status summaries, redacted runtime diagnostics, and compact connection-failure copy
+ * Owns status summaries, redacted diagnostics, projection lifecycle and compact connection-failure copy
+ * Excludes canonical state, transport admission and filesystem policy
  */
 /** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
 export declare function formatTelegramConnectionFailure(error: unknown): string;
@@ -378,7 +379,6 @@ export interface TelegramStatusRuntime<TContext extends TelegramStatusRuntimeCon
     getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
     getStatusState: () => TelegramBridgeStatusLineState;
 }
-export declare function redactTelegramRuntimeMessage(message: string, botToken: string | undefined): string;
 export declare function recordStructuredTelegramRuntimeEvent(events: TelegramRuntimeEvent[], input: TelegramRuntimeEventInput, options: {
     botToken?: string;
     maxEvents: number;
@@ -394,7 +394,6 @@ export declare function recordStructuredTelegramRuntimeEvent(events: TelegramRun
 export declare function registerTelegramStatusLineProvider(provider: TelegramStatusLineProvider, options: {
     id: string;
 }): () => void;
-export declare function getTelegramStatusLineProviderResults(ctx: TelegramStatusLineProviderContext): TelegramStatusLineProviderResult[];
 export declare function clearTelegramStatusLineProviders(): void;
 export declare function createTelegramRuntimeEventRecorder(options: TelegramRuntimeEventRecorderOptions): TelegramRuntimeEventRecorder;
 export declare function buildTelegramRuntimeEventLines(events: TelegramRuntimeEvent[]): string[];
@@ -418,18 +417,56 @@ export declare function createTelegramRuntimeLogScope(input: {
     state: TelegramBridgeStatusLineState;
     instanceId: string;
 }): TelegramRuntimeLogScope;
-export declare function createTelegramStatusSnapshot(state: TelegramBridgeStatusLineState): {
+export interface TelegramStatusSnapshot {
     runtime: Record<string, unknown>;
     liveRoster: Record<string, unknown>;
     diagnostics: Record<string, unknown>;
+}
+export interface TelegramStoredRuntimeProjection extends TelegramStatusSnapshot {
+    version: 1;
+    source: "snapshot";
+    writtenAtMs: number;
+}
+export declare function createTelegramStatusSnapshot(state: TelegramBridgeStatusLineState): TelegramStatusSnapshot;
+export interface TelegramRuntimeProjectionScope {
+    path: string;
+    profile: string;
+}
+export interface TelegramRuntimeProjectionStorage {
+    read: (scope: TelegramRuntimeProjectionScope) => unknown;
+    /** The adapter must enforce exact owner plus the supplied physical/logical scope in one transaction. */
+    publish: (scope: TelegramRuntimeProjectionScope, mutate: (current: unknown) => {
+        value: unknown;
+        changed: boolean;
+    }, isCurrent: () => boolean) => boolean;
+}
+export interface TelegramRuntimeProjectionStoreOptions {
+    getPath: () => string;
+    getProfile: () => string | undefined;
+    /** Capture exact owner/context/session authority at submission, never renew it after the queued await. */
+    captureAuthority: () => (() => boolean) | undefined;
+    storage: TelegramRuntimeProjectionStorage;
+    getNowMs?: () => number;
+}
+/** Observational runtime storage only; Workspace, admission, transport, logs and recovery remain with their owners. */
+export declare function createTelegramRuntimeProjectionStore(options: TelegramRuntimeProjectionStoreOptions): {
+    read: () => TelegramStoredRuntimeProjection | undefined;
+    persist: (snapshot: TelegramStatusSnapshot) => Promise<boolean>;
 };
 export declare function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
-    persistSnapshot: () => Promise<void>;
+    persistSnapshot: (isCurrent: () => boolean) => Promise<void>;
     recordError: (error: unknown) => void;
+    captureScope?: () => (() => boolean) | undefined;
     setTimer?: (callback: () => void, ms: number) => {
         unref?: () => void;
-    };
-}): () => void;
+    } | number;
+    clearTimer?: (timer: {
+        unref?: () => void;
+    } | number) => void;
+}): (() => void) & {
+    resume(): void;
+    suspend(): Promise<void>;
+};
 export declare function getTelegramStatusBarProcessingStatus(state: {
     hasActiveTurn: boolean;
     hasPendingDispatch: boolean;
@@ -439,6 +476,4 @@ export declare function getTelegramStatusBarProcessingStatus(state: {
 }): string | undefined;
 export declare function buildTelegramStatusBarText(theme: TelegramStatusBarTheme, state: TelegramStatusBarState): string;
 export declare function buildTelegramBridgeStatusLines(state: TelegramBridgeStatusLineState, options?: TelegramBridgeStatusLineOptions): string[];
-export declare function buildTelegramBridgeDiagnosticStatusLines(state: TelegramBridgeStatusLineState): string[];
-export declare function buildStatusHtml(ctx: TelegramStatusContext, activeModel: TelegramStatusActiveModel | undefined, bridgeStatus?: TelegramBridgeStatusLineState): string;
 export {};

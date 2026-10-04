@@ -8,12 +8,18 @@ import { chmodSync, closeSync, constants, createReadStream, fstatSync, lstatSync
   readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
+import { getTelegramJournalPublicationPaths } from "./paths.ts";
 import { createHash, randomUUID } from "node:crypto";
 
 import { Type } from "@sinclair/typebox";
 
 import { renameTelegramPathWithRetry, withTelegramFileTransaction } from "./locks.ts";
 import type { ExtensionAPI } from "./pi.ts";
+import {
+  isWireRecord as isRecord,
+  hasOnlyWireKeys as hasOnlyKeys,
+  isNonNegativeWireInteger as isSafeTime,
+} from "./wire.ts";
 
 const CHANNEL_POST_JOURNAL_VERSION = 1;
 const DEFAULT_MAX_RECORDS = 256;
@@ -31,12 +37,12 @@ export interface TelegramChannelPostMediaIntent {
   sha256: string;
 }
 
-export const TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES: Record<TelegramChannelPostMediaKind, number> = {
+const TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES: Record<TelegramChannelPostMediaKind, number> = {
   photo: 10 * 1024 * 1024,
   video: 50 * 1024 * 1024,
 };
-export const TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH = 1024;
-export const TELEGRAM_CHANNEL_POST_MEDIA_FILE_NAME_MAX_LENGTH = 255;
+const TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH = 1024;
+const TELEGRAM_CHANNEL_POST_MEDIA_FILE_NAME_MAX_LENGTH = 255;
 
 /** Safe, content-free local validation failure for channel media publication intent. */
 export class TelegramChannelPostValidationError extends Error {
@@ -195,6 +201,7 @@ interface TelegramChannelPostJournalFile {
 
 export interface TelegramChannelPostJournalStoreOptions {
   path: string;
+  runtimeDir?: string;
   profileName: string;
   tokenSha256: string;
   maxRecords?: number;
@@ -329,19 +336,6 @@ export function registerTelegramChannelPostListTool(
   });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const allowed = new Set(keys);
-  return Object.keys(value).every(key => allowed.has(key));
-}
-
-function isSafeTime(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
 function normalizeChannel(value: unknown): TelegramChannelPostAddress {
   if (Number.isSafeInteger(value) && (value as number) < 0) return value as number;
   if (typeof value === "string" && /^@[A-Za-z0-9_]{5,32}$/u.test(value)) {
@@ -454,9 +448,24 @@ function validateRecord(value: unknown): TelegramChannelPostRecord {
   throw new TelegramChannelPostJournalError("invalid", "Telegram channel post journal contains an invalid state.");
 }
 
+function parseTelegramChannelPostJournalFile(value: unknown, profileName: string, tokenSha256: string): TelegramChannelPostJournalFile {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["version", "profile", "tokenSha256", "records"]) ||
+      value.version !== CHANNEL_POST_JOURNAL_VERSION || value.profile !== profileName ||
+      value.tokenSha256 !== tokenSha256 || !Array.isArray(value.records)) {
+    throw new TelegramChannelPostJournalError("conflict", "Telegram channel post journal identity or schema does not match.");
+  }
+  const records = value.records.map(validateRecord);
+  if (new Set(records.map(record => record.operationId)).size !== records.length) {
+    throw new TelegramChannelPostJournalError("invalid", "Telegram channel post journal contains duplicate operation IDs.");
+  }
+  return { version: CHANNEL_POST_JOURNAL_VERSION, profile: profileName, tokenSha256, records };
+}
+
 export function createTelegramChannelPostJournalStore(
   options: TelegramChannelPostJournalStoreOptions,
 ): TelegramChannelPostJournalStore {
+  options = { ...options };
+  const publicationPaths = getTelegramJournalPublicationPaths(options.path, options.runtimeDir);
   const maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const now = options.getNowMs ?? Date.now;
@@ -491,17 +500,7 @@ export function createTelegramChannelPostJournalStore(
         throw new TelegramChannelPostJournalError("conflict", "Telegram channel post journal changed during inspection.");
       }
       const value = JSON.parse(readFileSync(fd, "utf8")) as unknown;
-      if (!isRecord(value) || !hasOnlyKeys(value, ["version", "profile", "tokenSha256", "records"]) ||
-          value.version !== CHANNEL_POST_JOURNAL_VERSION || value.profile !== options.profileName ||
-          value.tokenSha256 !== options.tokenSha256 || !Array.isArray(value.records)) {
-        throw new TelegramChannelPostJournalError("conflict", "Telegram channel post journal identity or schema does not match.");
-      }
-      const records = value.records.map(validateRecord);
-      if (new Set(records.map(record => record.operationId)).size !== records.length) {
-        throw new TelegramChannelPostJournalError("invalid", "Telegram channel post journal contains duplicate operation IDs.");
-      }
-      return { version: CHANNEL_POST_JOURNAL_VERSION, profile: options.profileName,
-        tokenSha256: options.tokenSha256, records };
+      return parseTelegramChannelPostJournalFile(value, options.profileName, options.tokenSha256);
     } catch (error) {
       if (error instanceof TelegramChannelPostJournalError) throw error;
       throw new TelegramChannelPostJournalError("io", "Could not read Telegram channel post journal.", error);
@@ -517,8 +516,9 @@ export function createTelegramChannelPostJournalStore(
     if (Buffer.byteLength(serialized) > maxBytes) {
       throw new TelegramChannelPostJournalError("capacity", "Telegram channel post journal byte limit reached.");
     }
-    const temporaryPath = `${options.path}.${process.pid}.${randomUUID()}.tmp`;
+    const temporaryPath = `${publicationPaths.temporaryBasePath}.${process.pid}.${randomUUID()}.tmp`;
     mkdirSync(dirname(options.path), { recursive: true, mode: 0o700 });
+    mkdirSync(dirname(temporaryPath), { recursive: true, mode: 0o700 });
     try {
       writeFileSync(temporaryPath, serialized, { encoding: "utf8", mode: 0o600 });
       chmodSync(temporaryPath, 0o600);
@@ -532,7 +532,7 @@ export function createTelegramChannelPostJournalStore(
   };
   const mutate = <T>(operation: (file: TelegramChannelPostJournalFile) => T): T => {
     try {
-      return withTelegramFileTransaction(`${options.path}.transaction`, () => operation(read()));
+      return withTelegramFileTransaction(publicationPaths.transactionPath, () => operation(read()));
     } catch (error) {
       if (error instanceof TelegramChannelPostJournalError) throw error;
       throw new TelegramChannelPostJournalError("io", "Telegram channel post journal mutation failed.", error);

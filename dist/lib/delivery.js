@@ -6,7 +6,7 @@
 import { markTelegramBusAggregateDelivery } from "./bus.js";
 import { assertTelegramInlineKeyboardCallbackData, } from "./keyboard.js";
 import { withTelegramReplyParameters, renderTelegramMessage, } from "./replies.js";
-import { getTelegramTargetThreadParams, } from "./target.js";
+import { areTelegramTargetsEqual as areDeliveryTargetsEqual, getTelegramTargetThreadParams, } from "./target.js";
 import { getTelegramApiRetryAfterMs, isRetryableTelegramApiError, isTelegramApiCommitUnknownError, isTelegramMessageUnavailableError, } from "./telegram-api.js";
 const TELEGRAM_DELIVERY_RUNTIME_KEY = "__piTelegramDeliveryRuntime__";
 class TelegramDeliveryTransportGenerationError extends Error {
@@ -69,7 +69,7 @@ function failure(reason, message, partial, retryAfterMs) {
         ? { ok: false, reason, message, ...retry }
         : { ok: false, reason, message, partial, ...retry };
 }
-export function classifyTelegramDeliveryTransportError(error) {
+function classifyTelegramDeliveryTransportError(error) {
     if (isTelegramApiCommitUnknownError(error))
         return { reason: "commit-unknown" };
     if (isTelegramMessageUnavailableError(error))
@@ -139,9 +139,6 @@ export function isTelegramDeliveryExplicitTargetAuthorized(candidate, view) {
     return (view.liveTargets ?? []).some(function (target) {
         return areDeliveryTargetsEqual(candidate, target);
     });
-}
-function areDeliveryTargetsEqual(left, right) {
-    return left.chatId === right.chatId && left.threadId === right.threadId;
 }
 function cloneTarget(target) {
     return target.threadId === undefined

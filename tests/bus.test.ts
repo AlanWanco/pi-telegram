@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  readdirSync,
   mkdtempSync,
   rmSync,
   statSync,
@@ -32,7 +33,6 @@ import {
   createTelegramBusFollowerSourceReferenceDeliveryIdentity,
   createTelegramBusFollowerRegistry,
   type TelegramBusEnvelope,
-  createTelegramBusFollowerThreadRestoreHandler,
   createTelegramBusProtocolIdentity,
   createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramFollowerApiCallAuthorizer,
@@ -416,7 +416,7 @@ test("Bus process runtime falls back to pid without a parent pid", () => {
 test("Bus transport boundary derives socket and pipe endpoints", () => {
   assert.equal(
     getTelegramBusLeaderEndpoint({ agentDir: "/agent", platform: "linux" }),
-    join("/agent", "tmp", "telegram", "bus.sock"),
+    join("/agent", "tmp", "pi-telegram", "bus.sock"),
   );
   assert.equal(
     getTelegramBusFollowerEndpoint({
@@ -424,7 +424,7 @@ test("Bus transport boundary derives socket and pipe endpoints", () => {
       platform: "linux",
       instanceId: "pid:123",
     }),
-    join("/agent", "tmp", "telegram", "followers", "pid_123.sock"),
+    join("/agent", "tmp", "pi-telegram", "followers", "pid_123.sock"),
   );
   const pipe = getTelegramBusLeaderEndpoint({
     agentDir: "C:\\Users\\Admin\\.pi\\agent",
@@ -513,25 +513,80 @@ test("Bus transport error classifier marks transient IPC failures retryable", ()
   );
 });
 
+// Uses POSIX absolute agent paths for both layouts, which a Windows host cannot resolve as exact absolute paths.
+test("Consolidated IPC uses short collision-resistant profile/recipient names and never redirects outside runtime", { skip: process.platform === "win32" }, () => {
+  const agentDir = "/agent";
+  const profiles = [undefined, "work", "WORK", "work/name", "work_name", "x".repeat(300)];
+  for (const platform of ["linux", "win32"] as const) {
+    const leaders = profiles.map(profile => getTelegramBusSocketPath(agentDir, platform, profile, "consolidated"));
+    const followers = profiles.map(profile => getTelegramBusFollowerSocketPath("pid:123", agentDir, platform, profile, "consolidated"));
+    assert.equal(new Set([...leaders, ...followers]).size, profiles.length * 2);
+    assert.equal(leaders[0], getTelegramBusSocketPath(agentDir, platform, "default", "consolidated"));
+    assert.notEqual(followers[1], getTelegramBusFollowerSocketPath("pid_123", agentDir, platform, "work", "consolidated"));
+    for (const endpoint of [...leaders, ...followers]) {
+      if (platform === "linux") assert.match(endpoint, /^\/agent\/tmp\/pi-telegram\/runtime\/(?:bus|f)\.[a-f0-9]{16}\.sock$/u);
+      else assert.equal(getTelegramBusTransportKind(endpoint), "pipe");
+      assert.equal(resolveTelegramBusSocketPath(endpoint, platform), endpoint);
+    }
+  }
+  const longLogical = getTelegramBusSocketPath("/" + "long".repeat(30), "linux", "work", "consolidated");
+  assert.match(longLogical, /\/tmp\/pi-telegram\/runtime\/bus\.[a-f0-9]{16}\.sock$/u, "Logical identity stays in the runtime namespace");
+  assert.match(resolveTelegramBusSocketPath(longLogical, "linux"), /pi-telegram-[^/]+\/[a-f0-9]{16}\.sock$/u,
+    "Only an over-capacity socket uses the bounded private fallback");
+  assert.throws(() => getTelegramBusFollowerSocketPath("pid:123", "relative-agent", "linux", "work", "consolidated"), /exact absolute runtime path/u);
+});
+
+test("Consolidated bus process runtime retains its layout and selector while resolving current profile values", () => {
+  let profile: string | undefined = "work";
+  const input = { pid: 42, parentPid: 1, createdAtMs: 1000, getActiveProfileName: () => profile, endpointLayout: "consolidated" as const };
+  const runtime = createTelegramBusProcessRuntime(input);
+  input.getActiveProfileName = () => "replacement";
+  input.endpointLayout = undefined as unknown as "consolidated";
+  assert.equal(runtime.getLeaderSocketPath(), getTelegramBusSocketPath(undefined, undefined, "work", "consolidated"));
+  assert.equal(runtime.getFollowerSocketPath(), getTelegramBusFollowerSocketPath(runtime.instanceId, undefined, undefined, "work", "consolidated"));
+  profile = "other";
+  assert.equal(runtime.getLeaderSocketPath(), getTelegramBusSocketPath(undefined, undefined, "other", "consolidated"));
+});
+
+test("Consolidated native IPC request/ACK and profile restart keep every socket/staging artifact below runtime", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-ipc-"));
+  let profile = "work";
+  const socketPath = () => getTelegramBusSocketPath(dir, process.platform, profile, "consolidated");
+  const server = createTelegramBusLocalServer({ socketPath,
+    handleEnvelope: envelope => ({ kind: "bus.ack", requestId: envelope.requestId, ok: true }) });
+  try {
+    for (const next of ["work", "other"]) {
+      profile = next;
+      await server.start();
+      const response = await sendTelegramBusLocalEnvelope({ socketPath: socketPath(), envelope: {
+        kind: "follower.heartbeat", requestId: next, instanceId: "follower-a", sentAtMs: 1000 } });
+      assert.equal(response?.kind, "bus.ack");
+      assert.equal(response?.requestId, next);
+      if (process.platform !== "win32") assert.deepEqual(readdirSync(join(dir, "tmp", "pi-telegram")), ["runtime"]);
+      await server.stop();
+    }
+  } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Bus socket path is scoped under the agent temp directory", () => {
   assert.equal(
     getTelegramBusSocketPath("/agent", "linux"),
-    join("/agent", "tmp", "telegram", "bus.sock"),
+    join("/agent", "tmp", "pi-telegram", "bus.sock"),
   );
   assert.equal(
     getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux"),
-    join("/agent", "tmp", "telegram", "followers", "pid_123.sock"),
+    join("/agent", "tmp", "pi-telegram", "followers", "pid_123.sock"),
   );
 });
 
 test("Bus socket paths isolate named profiles and preserve default Unix paths", () => {
   assert.equal(
     getTelegramBusSocketPath("/agent", "linux", "work"),
-    join("/agent", "tmp", "telegram", "bus.work.sock"),
+    join("/agent", "tmp", "pi-telegram", "bus.work.sock"),
   );
   assert.equal(
     getTelegramBusFollowerSocketPath("pid:123", "/agent", "linux", "work"),
-    join("/agent", "tmp", "telegram", "followers", "work", "pid_123.sock"),
+    join("/agent", "tmp", "pi-telegram", "followers", "work", "pid_123.sock"),
   );
   assert.notEqual(
     getTelegramBusSocketPath("/agent", "linux", "work"),
@@ -732,42 +787,15 @@ test("Bus contract parses exact follower session replacement envelopes and rejec
   );
 });
 
-test("Bus contract encodes and parses follower target replacement envelopes", () => {
-  assert.deepEqual(
-    parseTelegramBusEnvelope(
-      encodeTelegramBusEnvelope({
-        kind: "leader.replaceFollowerTarget",
-        requestId: "leader:6",
-        recipientInstanceId: "inst-b",
-        target: { chatId: 7, threadId: 42 },
-        oldTarget: { chatId: 7, threadId: 10 },
-        reason: "thread-restore",
-        sentAtMs: 6000,
-      }).trimEnd(),
-    ),
-    {
-      kind: "leader.replaceFollowerTarget",
-      requestId: "leader:6",
-      recipientInstanceId: "inst-b",
-      target: { chatId: 7, threadId: 42 },
-      oldTarget: { chatId: 7, threadId: 10 },
-      reason: "thread-restore",
-      sentAtMs: 6000,
-    },
-  );
-  assert.equal(
-    parseTelegramBusEnvelope(
-      JSON.stringify({
-        kind: "leader.replaceFollowerTarget",
-        requestId: "leader:bad",
-        recipientInstanceId: "inst-b",
-        target: { chatId: 7 },
-        reason: "thread-restore",
-        sentAtMs: 6000,
-      }),
-    ),
-    undefined,
-  );
+test("Bus contract rejects retired follower target replacement envelopes", () => {
+  for (const generation of [undefined, "generation-b"]) {
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({
+      kind: "leader.replaceFollowerTarget", requestId: "leader:6",
+      recipientInstanceId: "inst-b", recipientRegistrationGeneration: generation,
+      target: { chatId: 7, threadId: 42 }, oldTarget: { chatId: 7, threadId: 10 },
+      reason: "thread-restore", auth: "fixture", sentAtMs: 6000,
+    })), undefined);
+  }
 });
 
 test("Bus contract encodes and parses queue handoff envelopes", () => {
@@ -2632,40 +2660,6 @@ test("Bus follower registry resolves followers by target", () => {
     "thread",
   );
   assert.equal(registry.getByTarget({ chatId: 1, threadId: 3 }), undefined);
-});
-
-test("Follower restore rejects missing, mismatched, and same old/new targets before IPC", async () => {
-  const registry = createTelegramBusFollowerRegistry();
-  const target = { chatId: 1, threadId: 2 };
-  registry.register({ instanceId: "f", registrationGeneration: "g", target, connectedAtMs: 1 });
-  const restore = createTelegramBusFollowerThreadRestoreHandler({
-    followerRegistry: registry,
-    followerTargetController: { replaceTarget: async () => assert.fail("invalid restore reached IPC") },
-  });
-  for (const oldTarget of [undefined, { chatId: 1, threadId: 4 }, target]) {
-    assert.equal(await restore({ record: { instanceId: "f" }, target, oldTarget }), false);
-  }
-});
-
-test("Follower restore cannot overwrite registration or old target changed during ACK", async () => {
-  for (const replacement of [
-    { registrationGeneration: "new", target: { chatId: 1, threadId: 2 } },
-    { registrationGeneration: "old", target: { chatId: 1, threadId: 4 } },
-  ]) {
-    const registry = createTelegramBusFollowerRegistry();
-    const follower = { instanceId: "f", registrationGeneration: "old", target: { chatId: 1, threadId: 2 }, connectedAtMs: 1 };
-    registry.register(follower);
-    const restore = createTelegramBusFollowerThreadRestoreHandler({
-      followerRegistry: registry,
-      followerTargetController: { replaceTarget: async () => {
-        registry.register({ ...follower, ...replacement });
-        return true;
-      } },
-    });
-    assert.equal(await restore({ record: { instanceId: "f" }, target: { chatId: 1, threadId: 3 }, oldTarget: follower.target }), false);
-    assert.deepEqual(registry.get("f")?.target, replacement.target);
-    assert.equal(registry.get("f")?.registrationGeneration, replacement.registrationGeneration);
-  }
 });
 
 test("Bus follower registry replaces stale registrations by profile and target", () => {

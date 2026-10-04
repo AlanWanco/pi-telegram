@@ -11,9 +11,6 @@ export interface TelegramChannelPostMediaIntent {
     sizeBytes: number;
     sha256: string;
 }
-export declare const TELEGRAM_CHANNEL_POST_MEDIA_MAX_BYTES: Record<TelegramChannelPostMediaKind, number>;
-export declare const TELEGRAM_CHANNEL_POST_CAPTION_MAX_LENGTH = 1024;
-export declare const TELEGRAM_CHANNEL_POST_MEDIA_FILE_NAME_MAX_LENGTH = 255;
 /** Safe, content-free local validation failure for channel media publication intent. */
 export declare class TelegramChannelPostValidationError extends Error {
     constructor(message: string);
@@ -70,6 +67,7 @@ export type TelegramChannelPostRecord = TelegramChannelPostRecordBase & ({
 } & TelegramPublishedChannelPostIdentity));
 export interface TelegramChannelPostJournalStoreOptions {
     path: string;
+    runtimeDir?: string;
     profileName: string;
     tokenSha256: string;
     maxRecords?: number;

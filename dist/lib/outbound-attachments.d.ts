@@ -8,7 +8,6 @@ import type { ExtensionAPI } from "./pi.ts";
 import { type TelegramTarget } from "./target.ts";
 export declare const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES: number;
 export declare function getTelegramOutboundAttachmentByteLimitFromEnv(env: NodeJS.ProcessEnv, names: string[], defaultValue?: number): number;
-export declare const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES: number;
 export interface TelegramOutboundAttachmentToolResult {
     content: Array<{
         type: "text";

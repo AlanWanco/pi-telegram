@@ -9,6 +9,7 @@ import type { TelegramThreadDisplayMode } from "./config.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import { type TelegramApiCallOptions } from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
+import type { TelegramAttachmentSource } from "./media.ts";
 import * as Threads from "./threads.ts";
 import { type TelegramBusEnvelope, type TelegramBusFollowerRegistry, type TelegramBusFollowerView, type TelegramBusInstanceRegistration, type TelegramBusProtocolIdentity, type TelegramBusSocketPathSource } from "./bus.ts";
 import type { TelegramQueueHandoffPayload } from "./queue.ts";
@@ -101,14 +102,14 @@ export interface TelegramBusFollowerDisconnectHandlerDeps {
 export interface TelegramBusLeaderApiProxyDeps {
     call: (method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<unknown>;
     callMultipart: (method: string, fields: Record<string, string>, fieldName: string, filePath: string, fileName: string, options?: TelegramApiCallOptions) => Promise<unknown>;
-    downloadFile: (fileId: string, destinationDir: string) => Promise<unknown>;
+    downloadFile: (fileId: string, suggestedName: string, source?: TelegramAttachmentSource) => Promise<unknown>;
     recoverStaleTargetError?: (apiBody: unknown, error: unknown) => Promise<unknown> | unknown;
 }
 export interface TelegramBusLeaderRuntimeAssemblyDeps<TContext> {
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
     persistThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     onThreadDisplayChanged?: () => void;
-    runtime: Omit<TelegramBusLeaderRuntimeDeps<TContext>, "callApi" | "onFollowerDisconnected" | "onFollowerConfirmedDead" | "onFollowerConfirmedDeadPreserved" | "getTelegramProfile" | "provisionFollowerTarget" | "provisionLeaderTarget" | "recordRuntimeEvent">;
+    runtime: Omit<TelegramBusLeaderRuntimeDeps<TContext>, "callApi" | "onFollowerDisconnected" | "onFollowerConfirmedDead" | "onFollowerConfirmedDeadPreserved" | "getTelegramProfile" | "getAllowedUserId" | "provisionFollowerTarget" | "commitFollowerRegistration" | "provisionLeaderTarget" | "recordRuntimeEvent">;
     getAllowedUserId: () => number | undefined;
     instanceId: string;
     getCwd?: (ctx: TContext) => string | undefined;
@@ -168,6 +169,11 @@ export interface TelegramBusFollowerMessageOwnershipRecord {
     target?: TelegramTarget;
 }
 export type TelegramBusFollowerMessageOwnershipRecorder = (record: TelegramBusFollowerMessageOwnershipRecord) => void;
+export type TelegramBusFollowerRegistrationCommitter = (input: {
+    registration: TelegramBusInstanceRegistration;
+    target?: TelegramTarget;
+    slot?: string;
+}, publish: () => void) => Promise<void> | void;
 export interface TelegramBusLeaderRuntimeDeps<TContext> {
     socketPath: TelegramBusSocketPathSource;
     commitEndpointPublication?: (commit: () => void) => boolean;
@@ -195,6 +201,7 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
     provisionFollowerTarget?: (registration: TelegramBusInstanceRegistration, options?: {
         existingWorkspaceBindingOnly?: boolean;
     }) => Promise<TelegramTarget | undefined> | TelegramTarget | undefined;
+    commitFollowerRegistration?: TelegramBusFollowerRegistrationCommitter;
     renameFollowerThread?: (follower: TelegramBusFollowerView, threadName: string) => Promise<{
         threadName: string;
     }> | {
@@ -209,16 +216,22 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
     settleFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     getFollowerDisplayTitle?: (follower: TelegramBusFollowerView) => string | undefined;
     onFollowerRegistered?: () => void;
+    /** Observation only: reacquire admission and inspect work, never infer completion.
+     * Listener settlement ends its currentness fence; return asynchronous work to retain that fence. */
+    onWorkspaceRestoreRecipientObserved?: (follower: TelegramBusFollowerView, isCurrent: () => boolean) => Promise<void> | void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getTelegramProfile?: () => string | undefined;
+    getAllowedUserId?: () => number | undefined;
     provisionLeaderTarget?: (ctx: TContext) => Promise<void> | void;
     runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
     runWithWorkspaceCapacity?: TelegramWorkspaceCapacityRunner;
     getNowMs?: () => number;
     timeoutMs?: number;
     followerPruneIntervalMs?: number;
+    /** Leader housekeeping after each current prune pass; throttling is the callee's concern. */
+    afterFollowerPrune?: () => void;
     followerStaleAfterMs?: number;
     isFollowerProcessAlive?: (pid: number) => boolean;
     shouldCleanupConfirmedDeadFollower?: () => Promise<boolean> | boolean;
@@ -281,6 +294,7 @@ export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
         slot?: string;
         threadName?: string;
     }) | undefined;
+    commitFollowerRegistration?: TelegramBusFollowerRegistrationCommitter;
     onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<void> | void;
     renameFollowerThread?: (follower: TelegramBusFollowerView, threadName: string) => Promise<{
         threadName: string;
@@ -296,9 +310,14 @@ export declare function createTelegramBusLeaderEnvelopeHandler(deps: {
     settleFollowerSessionReplacement?: TelegramBusFollowerSessionReplacementOperation;
     getFollowerDisplayTitle?: (follower: TelegramBusFollowerView) => string | undefined;
     onFollowerRegistered?: () => void;
+    onWorkspaceRestoreRecipientObserved?: TelegramBusLeaderRuntimeDeps<unknown>["onWorkspaceRestoreRecipientObserved"];
+    getWorkspaceRestoreObservationGeneration?: () => number | undefined;
+    recordRuntimeEvent?: TelegramBusLeaderRuntimeDeps<unknown>["recordRuntimeEvent"];
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
     getCurrentLeaderEpoch?: () => number | string | undefined;
+    getTelegramProfile?: () => string | undefined;
+    getAllowedUserId?: () => number | undefined;
     runFollowerMutation?: TelegramBusFollowerMutationRunner;
     runWorkspaceAdmission?: TelegramBusWorkspaceAdmissionRunner;
     runWithWorkspaceCapacity?: TelegramWorkspaceCapacityRunner;

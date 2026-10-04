@@ -74,10 +74,8 @@ interface InboundHandlerInvocation {
     args: string[];
 }
 export declare function registerTelegramInboundHandler(kind: string, handler: TelegramInboundProgrammaticHandler): () => void;
-export declare function getTelegramInboundProgrammaticHandlers(kind: string): TelegramInboundProgrammaticHandler[];
 export declare function clearTelegramInboundHandlers(): void;
 export declare function telegramInboundHandlerMatchesFile(handler: TelegramInboundHandlerConfig, file: TelegramInboundHandlerFile): boolean;
-export declare function findTelegramInboundHandlers(handlers: TelegramInboundHandlerConfig[] | undefined, file: TelegramInboundHandlerFile): TelegramInboundHandlerConfig[];
 export declare function buildTelegramInboundHandlerInvocation(handler: CommandTemplateConfig, file: TelegramInboundHandlerFile, cwd: string, appendFileIfMissing?: boolean): InboundHandlerInvocation;
 export declare function processTelegramInboundHandlers<TFile extends TelegramInboundHandlerFile>(options: {
     files: TFile[];

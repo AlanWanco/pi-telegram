@@ -24,6 +24,7 @@ import {
 export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
+import { isWireRecord as isPlainConfigRecord } from "./wire.ts";
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
 import { withTelegramFileTransaction } from "./locks.ts";
 
@@ -75,7 +76,7 @@ export type TelegramBotTokenReference =
  * environment-variable references. Any other `$`-prefixed value is malformed
  * rather than a literal secret so a broken reference fails closed.
  */
-export function getTelegramBotTokenReference(
+function getTelegramBotTokenReference(
   value: string | undefined,
 ): TelegramBotTokenReference | undefined {
   const trimmed = value?.trim();
@@ -115,8 +116,6 @@ export function getTelegramBotTokenDiagnostic(
   return `Telegram bot token environment variable ${reference.variable} is not set.`;
 }
 
-export type TelegramOutboundCommandTemplateConfig =
-  string | CommandTemplateObjectConfig;
 export interface TelegramOutboundHandlerConfig extends CommandTemplateObjectConfig {
   type?: string;
   match?: string | string[];
@@ -463,10 +462,6 @@ export async function writeTelegramConfig(
   await chmod(tempConfigPath, 0o600);
   await rename(tempConfigPath, configPath);
   await chmod(configPath, 0o600);
-}
-
-function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function cloneTelegramConfig<T>(value: T): T {
@@ -963,7 +958,7 @@ export function createTelegramConfigStore(
   };
 }
 
-export function createTelegramDraftPreviewsChecker(
+function createTelegramDraftPreviewsChecker(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => boolean {
   return () => {
@@ -977,7 +972,7 @@ export function createTelegramDraftPreviewsChecker(
   };
 }
 
-export function createTelegramDraftPreviewsSetter(
+function createTelegramDraftPreviewsSetter(
   configStore: TelegramMutableConfigStore,
 ): (enabled: boolean) => Promise<void> {
   return async (enabled) => {
@@ -996,7 +991,7 @@ export function createTelegramDraftPreviewsSetter(
   };
 }
 
-export function createTelegramAssistantRenderingModeGetter(
+function createTelegramAssistantRenderingModeGetter(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => TelegramAssistantRenderingMode {
   return () => {
@@ -1006,7 +1001,7 @@ export function createTelegramAssistantRenderingModeGetter(
   };
 }
 
-export function createTelegramAssistantRenderingModeSetter(
+function createTelegramAssistantRenderingModeSetter(
   configStore: TelegramMutableConfigStore,
 ): (mode: TelegramAssistantRenderingMode) => Promise<void> {
   return async (mode) => {
@@ -1022,7 +1017,7 @@ export function createTelegramAssistantRenderingModeSetter(
   };
 }
 
-export function createTelegramActivityVerbosityGetter(
+function createTelegramActivityVerbosityGetter(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => TelegramActivityVerbosity {
   return () => {
@@ -1044,13 +1039,13 @@ export function createTelegramActivityVerbosityGetter(
   };
 }
 
-export function createTelegramActivityVerbosityRefresher(
+function createTelegramActivityVerbosityRefresher(
   configStore: TelegramMutableConfigStore,
 ): () => Promise<void> {
   return () => loadLatestTelegramConfig(configStore);
 }
 
-export function createTelegramActivityVerbositySetter(
+function createTelegramActivityVerbositySetter(
   configStore: TelegramMutableConfigStore,
 ): (verbosity: TelegramActivityVerbosity) => Promise<void> {
   return async (verbosity) => {
@@ -1210,13 +1205,13 @@ export function createTelegramProactivePushTargetGetter(deps: {
   };
 }
 
-export function createTelegramAutomaticThreadCleanupChecker(
+function createTelegramAutomaticThreadCleanupChecker(
   configStore: Pick<TelegramConfigStore, "get">,
 ): () => boolean {
   return () => configStore.get().threads?.automaticCleanup ?? true;
 }
 
-export function createTelegramAutomaticThreadCleanupResolver(
+function createTelegramAutomaticThreadCleanupResolver(
   configStore: TelegramMutableConfigStore,
 ): () => Promise<boolean> {
   return async () => {
@@ -1230,7 +1225,7 @@ export function createTelegramAutomaticThreadCleanupResolver(
   };
 }
 
-export function createTelegramAutomaticThreadCleanupSetter(
+function createTelegramAutomaticThreadCleanupSetter(
   configStore: TelegramMutableConfigStore,
 ): (enabled: boolean) => Promise<void> {
   return async (enabled) => {

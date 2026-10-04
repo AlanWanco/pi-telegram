@@ -156,7 +156,6 @@ export declare function createTelegramNativeMarkdownPreviewFinalizer<TReplyMarku
 }) => Promise<boolean>;
 export declare function createTelegramAssistantPreviewRuntime<TMessage, TReplyMarkup = TelegramPreviewReplyMarkup>(deps: TelegramAssistantPreviewRuntimeDeps<TMessage, TReplyMarkup>): TelegramAssistantPreviewRuntime<TMessage, TReplyMarkup>;
 export declare function createTelegramPreviewController(deps: TelegramPreviewControllerDeps): TelegramPreviewController;
-export declare function createTelegramAssistantMessagePreviewHooks<TMessage>(deps: TelegramAssistantMessagePreviewHookDeps<TMessage>): TelegramAssistantMessagePreviewHooks<TMessage>;
 /**
  * Returns true when the active turn is a Telegram Guest Mode query. A guest
  * query allows exactly one answer within a limited Telegram response window,
@@ -165,8 +164,6 @@ export declare function createTelegramAssistantMessagePreviewHooks<TMessage>(dep
 export declare function shouldSuppressPreviewForGuestTurn(turn: {
     guestQueryId?: string;
 } | null | undefined): boolean;
-export declare function handleTelegramAssistantMessagePreviewStart<TMessage>(message: TMessage, deps: TelegramAssistantMessagePreviewStartDeps<TMessage>): Promise<void>;
-export declare function handleTelegramAssistantMessagePreviewUpdate<TMessage>(message: TMessage, deps: TelegramAssistantMessagePreviewUpdateDeps<TMessage>): Promise<void>;
 export declare function buildTelegramPreviewFinalText(state: TelegramPreviewState): string | undefined;
 export declare function createTelegramPreviewRuntimeState(): TelegramPreviewRuntimeState;
 export declare function allocateTelegramDraftId(currentDraftId: number, maxDraftId: number): number;

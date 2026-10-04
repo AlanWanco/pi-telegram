@@ -835,6 +835,7 @@ interface TelegramLifecycleBindingDeps {
   publicationRuntime: TelegramBridgePublicationRuntime;
   activityRuntime: Activity.TelegramActivityRuntime;
   activityVerbosityRuntime?: ActivityVerbosity.TelegramActivityVerbosityRuntime;
+  diagnostics?: { onSessionStart(): void; onSessionShutdown(): Promise<void> };
   assistantOutputRuntime: Pick<
     Activity.TelegramAssistantOutputRuntime,
     "start" | "beginTurn" | "hasAdmittedTelegramIntermediate" | "waitForIdle" | "stop"
@@ -941,6 +942,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   publicationRuntime,
   activityRuntime,
   activityVerbosityRuntime,
+  diagnostics,
   assistantOutputRuntime,
   sessionLifecycleRuntime,
   configStore,
@@ -1278,6 +1280,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityRuntime.recordInputSource(event.source ?? "unknown");
     },
     async onSessionStart(event, ctx) {
+      diagnostics?.onSessionStart();
       cancelPendingFinalPublication();
       previewRuntime.invalidate();
       assistantOutputRuntime.start();
@@ -1289,6 +1292,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      const diagnosticsStopped = diagnostics?.onSessionShutdown();
       shutdownGenerativeAppLiveSurfaces?.();
       agentLifecycleHooks.clearRetainedAgentEnd();
       activityRuntime.onSessionShutdown();
@@ -1299,6 +1303,8 @@ export function registerTelegramLifecycleRuntimeHooks({
       cancelPendingFinalPublication();
       uiPromptActive = false;
       compactionObserver.onSessionShutdown();
+      await diagnosticsStopped;
+      if (!isSessionContextActive(ctx)) return;
       if (event.reason === "quit" && disconnectOnQuit) {
         try {
           const automaticCleanupEnabled =

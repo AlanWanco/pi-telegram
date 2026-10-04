@@ -1189,12 +1189,22 @@ test("Named setup preserves a display preference changed while the token form wa
   }
 });
 
-test("Lifecycle binding disconnects only graceful quit and preserves cleanup after failure", async () => {
+test("Lifecycle binding drains diagnostics before quit cleanup and preserves cleanup after failure", async () => {
   const events: string[] = [];
+  let holdDiagnostics = false, current = true;
+  let releaseDiagnostics: (() => void) | undefined;
   let disconnectFails = false;
   let automaticCleanupEnabled = true;
   const harness = createBindingApiHarness();
   const deps = {
+    diagnostics: {
+      onSessionStart() {},
+      onSessionShutdown() {
+        events.push("diagnostics:suspend");
+        return holdDiagnostics ? new Promise<void>(resolve => { releaseDiagnostics = resolve; }) : Promise.resolve();
+      },
+    },
+    isSessionContextActive: () => current,
     pi: harness.api,
     activityRuntime: {
       recordInputSource: () => {},
@@ -1332,18 +1342,21 @@ test("Lifecycle binding disconnects only graceful quit and preserves cleanup aft
   );
 
   assert.deepEqual(events, [
-    "live-surfaces-shutdown",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "disconnect-on-quit",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "disconnect-on-quit",
-    "runtime:automatic-disconnect-on-quit",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "disconnect-on-quit", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "disconnect-on-quit",
+    "runtime:automatic-disconnect-on-quit", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "composed-shutdown",
   ]);
+  events.length = 0;
+  holdDiagnostics = true;
+  const stopped = shutdown({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext);
+  await Promise.resolve();
+  assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"]);
+  current = false;
+  releaseDiagnostics!();
+  await stopped;
+  assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"], "Retired shutdown cannot continue into a successor after the drain");
 });
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {

@@ -5,14 +5,16 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { resolveTelegramRuntimeLogPath, resolveTelegramPreviousSharedRuntimeLogPath, resolveTelegramRuntimeDir, resolveTelegramRuntimeLogsDir } from "../lib/paths.ts";
 import {
   createTelegramRuntimeJsonlLog,
+  createTelegramRuntimeDiagnosticsRuntime,
   getTelegramPreviousRuntimeLogPath,
   getTelegramRuntimeLogPath,
 } from "../lib/logging.ts";
@@ -26,22 +28,272 @@ async function readJsonl(path: string): Promise<unknown[]> {
     .map((line) => JSON.parse(line) as unknown);
 }
 
+function createScopedDiagnosticsFixture() {
+  const callbacks: Array<() => void> = [], cleared: unknown[] = [];
+  const scope: { ctx: { id: string } | undefined; generation: number } = { ctx: { id: "old" }, generation: 1 };
+  const counts = { projections: 0, publications: 0, statusUpdates: 0 };
+  const diagnostics = createTelegramRuntimeDiagnosticsRuntime<{ id: string }>({
+    snapshotTimer: {
+      setTimer(callback) { callbacks.push(callback); return { unref() {} }; },
+      clearTimer(handle) { cleared.push(handle); },
+    },
+  });
+  diagnostics.bindStatus({
+    instanceId: "fixture",
+    session: {
+      get: () => scope.ctx, getGeneration: () => scope.generation,
+      isCurrent: (ctx, generation = scope.generation) => ctx === scope.ctx && generation === scope.generation,
+    },
+    updateStatus() { counts.statusUpdates += 1; },
+    getStatusState() {
+      counts.projections += 1;
+      return { pollingActive: false, pendingDispatch: false, compactionInProgress: false,
+        activeToolExecutions: 0, pendingModelSwitch: false, queuedItems: [], recentRuntimeEvents: [] };
+    },
+    async persistSnapshot() { counts.publications += 1; },
+  });
+  return { callbacks, cleared, scope, counts, diagnostics };
+}
+
+for (const succession of ["replace", "same-context-generation", "clear"] as const) {
+  test(`Diagnostics captures exact session before reading a deferred projection (${succession})`, async () => {
+    const f = createScopedDiagnosticsFixture();
+    f.diagnostics.onSessionStart();
+    f.diagnostics.scheduleSnapshotPersist();
+    if (succession === "replace") f.scope.ctx = { id: "new" };
+    else if (succession === "same-context-generation") f.scope.generation += 1;
+    else f.scope.ctx = undefined;
+    f.callbacks.shift()!();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.counts, { projections: 0, publications: 0, statusUpdates: 0 });
+    if (succession !== "clear") {
+      f.diagnostics.scheduleSnapshotPersist();
+      f.callbacks.shift()!();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.counts.publications, 1, "A successor requires its own fresh request");
+    }
+    await f.diagnostics.onSessionShutdown();
+  });
+}
+
+test("Status-menu persistence cannot bypass diagnostics shutdown ownership", async () => {
+  const f = createScopedDiagnosticsFixture();
+  f.diagnostics.onSessionStart();
+  assert.ok(f.diagnostics.getStatusLines().length > 0);
+  assert.equal(f.counts.projections, 1, "Immediate menu rendering stays available");
+  const late = f.callbacks.shift()!;
+  await f.diagnostics.onSessionShutdown();
+  assert.equal(f.cleared.length, 1);
+  late();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.counts.projections, 1, "No deferred re-read after shutdown");
+  assert.equal(f.counts.publications, 0);
+  const retired = f.scope.ctx!;
+  f.scope.ctx = { id: "new" };
+  f.diagnostics.updateStatus(retired);
+  assert.equal(f.counts.statusUpdates, 0);
+  await f.diagnostics.onSessionShutdown();
+});
+
+test("Shared log paths put only the active log in root and keep legacy resolvers unchanged", () => {
+  assert.equal(resolveTelegramRuntimeLogPath("/agent"), join("/agent", "tmp", "pi-telegram", "logs.jsonl"));
+  assert.equal(resolveTelegramPreviousSharedRuntimeLogPath("/agent"), join("/agent", "tmp", "pi-telegram", "logs", "logs._prev.jsonl"));
+  assert.equal(resolveTelegramRuntimeDir("/agent"), join("/agent", "tmp", "pi-telegram", "runtime"));
+  assert.equal(resolveTelegramRuntimeLogsDir("/agent"), join("/agent", "tmp", "pi-telegram", "logs"));
+});
+
+test("Shared JSONL scope reset appends profile markers without erasing another profile or resetting its dedupe", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-reset-")), path = join(dir, "logs.jsonl");
+  let profile = "alpha";
+  try {
+    const log = createTelegramRuntimeJsonlLog({ path, getNowMs: () => 1000,
+      sharedProfiles: { getProfileName: () => profile, captureAuthority: () => () => true } });
+    log.resetIfScopeChanged("same-scope", "connect");
+    profile = "beta";
+    log.resetIfScopeChanged("same-scope", "connect");
+    profile = "alpha";
+    log.resetIfScopeChanged("same-scope", "connect");
+    const rows = await readJsonl(path) as Array<{ profile: string; kind: string }>;
+    assert.deepEqual(rows.map(row => [row.kind, row.profile]), [["reset", "alpha"], ["reset", "beta"]]);
+    assert.equal(existsSync(join(dir, "logs", "logs._prev.jsonl")), false);
+    assert.deepEqual((await readdir(dir)).sort(), ["logs.jsonl", "runtime"]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Shared JSONL captures profile at submission and preserves interleaved append order", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-order-")), path = join(dir, "logs.jsonl");
+  let profile = "alpha";
+  try {
+    const log = createTelegramRuntimeJsonlLog({ path, canReset: () => false,
+      sharedProfiles: { getProfileName: () => profile, captureAuthority: () => undefined } });
+    log.record({ at: 1, category: "test", message: "a-first" });
+    profile = "beta";
+    log.record({ at: 2, category: "test", message: "b" });
+    profile = "alpha";
+    log.record({ at: 3, category: "test", message: "a-last" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const rows = await readJsonl(path) as Array<{ profile: string; message: string }>;
+    assert.deepEqual(rows.map(row => [row.profile, row.message]), [["alpha", "a-first"], ["beta", "b"], ["alpha", "a-last"]]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Shared JSONL rotation preserves the whole mixed-profile segment below logs and later reset never erases it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-rotate-")), path = join(dir, "logs.jsonl"), previous = join(dir, "logs", "logs._prev.jsonl");
+  let profile = "alpha";
+  try {
+    const stateText = JSON.stringify({ version: 2, profiles: { alpha: { runtime: { source: "snapshot" } } } });
+    await writeFile(join(dir, "state.json"), stateText);
+    const seeds = [{ kind: "event", profile: "alpha", message: "a-seed" }, { kind: "event", profile: "beta", message: "b-seed" }];
+    const seedText = seeds.map(row => JSON.stringify(row) + "\n").join("");
+    await writeFile(path, seedText);
+    const first = { at: 1, category: "test", message: "a".repeat(600) };
+    const firstLine = JSON.stringify({ kind: "event", ...first, profile: "alpha" }) + "\n";
+    const log = createTelegramRuntimeJsonlLog({ path, maxBytes: Buffer.byteLength(seedText) + Buffer.byteLength(firstLine),
+      sharedProfiles: { getProfileName: () => profile, captureAuthority: () => () => true } });
+    log.record(first);
+    profile = "beta";
+    log.record({ at: 2, category: "test", message: "b".repeat(100) });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const archived = await readJsonl(previous) as Array<{ profile: string; message: string }>;
+    assert.deepEqual(archived.map(row => row.profile), ["alpha", "beta", "alpha"]);
+    const current = await readJsonl(path) as Array<{ kind: string; profile: string }>;
+    assert.deepEqual(current.map(row => [row.kind, row.profile]), [["reset", "beta"], ["event", "beta"]]);
+    profile = "alpha";
+    log.reset("restart");
+    assert.deepEqual(await readJsonl(previous), archived);
+    assert.equal((await readJsonl(path)).length, 3);
+    assert.deepEqual((await readdir(dir)).sort(), ["logs", "logs.jsonl", "runtime", "state.json"]);
+    assert.equal(await readFile(join(dir, "state.json"), "utf8"), stateText);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const drift of ["generation", "profile", "path", "missing-grant", "serialization"] as const) {
+  test(`Shared JSONL queued rotation never borrows fresh authority (${drift})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-drift-")), originalPath = join(dir, "logs.jsonl");
+    let path = originalPath, profile = "alpha", generation = 1;
+    try {
+      const seed = JSON.stringify({ kind: "event", profile: "beta", message: "protected-old-evidence" }) + "\n";
+      await writeFile(path, seed);
+      const log = createTelegramRuntimeJsonlLog({ path: () => path, maxBytes: Buffer.byteLength(seed),
+        sharedProfiles: { getProfileName: () => profile, captureAuthority() {
+          if (drift === "missing-grant") return undefined;
+          const captured = generation;
+          return () => captured === generation;
+        } } });
+      log.record({ at: 1, category: "test", message: "captured-alpha",
+        ...(drift === "serialization" ? { details: { toJSON() { generation++; return { observed: true }; } } } : {}) });
+      if (drift === "generation") generation++;
+      if (drift === "profile") profile = "beta";
+      if (drift === "path") path = join(dir, "replacement.jsonl");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(existsSync(join(dir, "logs", "logs._prev.jsonl")), false);
+      assert.equal(existsSync(join(dir, "replacement.jsonl")), false);
+      const rows = await readJsonl(originalPath) as Array<{ profile: string; message: string }>;
+      assert.deepEqual(rows.map(row => row.profile), ["beta", "alpha"]);
+      assert.equal(rows[1]?.message, "captured-alpha");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Shared JSONL captures callable capabilities instead of adopting caller replacements", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-capabilities-")), path = join(dir, "logs.jsonl");
+  try {
+    const options = { path: () => path, canReset: () => false,
+      sharedProfiles: { getProfileName: () => "alpha", captureAuthority: () => () => false } };
+    const log = createTelegramRuntimeJsonlLog(options);
+    options.path = () => join(dir, "replacement.jsonl");
+    options.canReset = () => true;
+    options.sharedProfiles.getProfileName = () => "replacement";
+    options.sharedProfiles.captureAuthority = () => () => true;
+    log.reset("refused");
+    log.record({ at: 1, category: "test", message: "retained" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(existsSync(join(dir, "replacement.jsonl")), false);
+    const rows = await readJsonl(path) as Array<{ profile: string; kind: string }>;
+    assert.deepEqual(rows.map(row => [row.kind, row.profile]), [["event", "alpha"]]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ["commit", "serialization"] as const) {
+  test(`Shared JSONL reset and rotation refuse authority lost at ${boundary}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-boundary-")), path = join(dir, "logs.jsonl");
+    let generation = 1;
+    try {
+      const seed = JSON.stringify({ kind: "event", profile: "beta", message: "protected" }) + "\n";
+      await writeFile(path, seed);
+      const log = createTelegramRuntimeJsonlLog({ path, maxBytes: 1,
+        getNowMs: () => { if (boundary === "serialization") generation++; return 1000; },
+        commitReset: commit => { if (boundary === "commit") generation++; commit(); return true; },
+        sharedProfiles: { getProfileName: () => "alpha", captureAuthority: () => { const captured = generation; return () => captured === generation; } } });
+      log.reset("refused");
+      assert.equal(await readFile(path, "utf8"), seed);
+      log.record({ at: 1, category: "test", message: "observed" });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(existsSync(join(dir, "logs", "logs._prev.jsonl")), false);
+      assert.equal((await readJsonl(path)).length, 2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Shared JSONL reset-only streams use the same whole-segment bounded rotation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-reset-rotation-")), path = join(dir, "logs.jsonl");
+  try {
+    const log = createTelegramRuntimeJsonlLog({ path, maxBytes: 150, getNowMs: () => 1000,
+      sharedProfiles: { getProfileName: () => "alpha", captureAuthority: () => () => true } });
+    log.reset("first"); log.reset("second"); log.reset("third");
+    assert.equal(existsSync(join(dir, "logs", "logs._prev.jsonl")), true);
+    const rows = await readJsonl(path) as Array<{ reason: string }>;
+    assert.equal(rows[0]?.reason, "max-bytes");
+    assert.equal(rows.at(-1)?.reason, "third");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Shared JSONL profile-tagged appends serialize across actual processes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-shared-log-processes-")), path = join(dir, "logs.jsonl"), start = join(dir, "start");
+  try {
+    const moduleUrl = new URL("../lib/logging.ts", import.meta.url).href;
+    const children = ["alpha", "beta"].map(profile => {
+      const ready = join(dir, `ready-${profile}`);
+      const source = `
+        import { existsSync, writeFileSync } from "node:fs";
+        import { createTelegramRuntimeJsonlLog } from ${JSON.stringify(moduleUrl)};
+        const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+        const log = createTelegramRuntimeJsonlLog({ path: process.env.LOG_PATH, canReset: () => false,
+          sharedProfiles: { getProfileName: () => process.env.PROFILE, captureAuthority: () => undefined } });
+        writeFileSync(process.env.READY, "ready");
+        while (!existsSync(process.env.START)) sleep(2);
+        for (let index = 0; index < 25; index++) log.record({ at: index, category: "test", message: String(index) });
+        await new Promise(resolve => setTimeout(resolve, 50));
+      `;
+      return { ready, done: runNodeEval(source, { env: { LOG_PATH: path, PROFILE: profile, READY: ready, START: start } }) };
+    });
+    const deadline = Date.now() + 3000;
+    while (!children.every(child => existsSync(child.ready)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(children.every(child => existsSync(child.ready)), true);
+    await writeFile(start, "start");
+    for (const child of children) { const result = await child.done; assert.equal(result.code, 0, result.stderr); }
+    const rows = await readJsonl(path) as Array<{ profile: string; message: string }>;
+    assert.equal(rows.length, 50);
+    for (const profile of ["alpha", "beta"]) assert.equal(new Set(rows.filter(row => row.profile === profile).map(row => row.message)).size, 25);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("Runtime log paths preserve default compatibility and isolate named profiles", async () => {
   assert.equal(
     getTelegramRuntimeLogPath("/agent"),
-    join("/agent", "tmp", "telegram", "logs.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent"),
-    join("/agent", "tmp", "telegram", "logs._prev.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs._prev.jsonl"),
   );
   assert.equal(
     getTelegramRuntimeLogPath("/agent", "omp"),
-    join("/agent", "tmp", "telegram", "logs.omp.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs.omp.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent", "omp"),
-    join("/agent", "tmp", "telegram", "logs.omp._prev.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs.omp._prev.jsonl"),
   );
 });
 
@@ -65,11 +317,11 @@ test("Runtime JSONL paths do not collide across profile lifecycle names", () => 
   assert.equal(paths.size, 2 + profiles.length * 2);
   assert.equal(
     getTelegramRuntimeLogPath("/agent", "previous"),
-    join("/agent", "tmp", "telegram", "logs.previous.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs.previous.jsonl"),
   );
   assert.equal(
     getTelegramPreviousRuntimeLogPath("/agent", "previous"),
-    join("/agent", "tmp", "telegram", "logs.previous._prev.jsonl"),
+    join("/agent", "tmp", "pi-telegram", "logs.previous._prev.jsonl"),
   );
 });
 

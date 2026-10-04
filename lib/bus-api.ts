@@ -12,6 +12,7 @@ import {
   buildTelegramAnswerGuestQueryBody,
   isTelegramMessageNotModifiedError,
 } from "./telegram-api.ts";
+import type { TelegramAttachmentSource } from "./media.ts";
 import type {
   TelegramAnswerGuestQueryOptions,
   TelegramApiCallOptions,
@@ -125,12 +126,14 @@ export function createTelegramBusAwareApiRuntime(
             options,
           ]) as Promise<TResponse>);
     },
-    downloadFile(fileId: string, suggestedName: string): Promise<string> {
+    downloadFile(fileId: string, suggestedName: string, source?: TelegramAttachmentSource): Promise<string> {
+      // The source names the file (kind-scope-message); dropping it falls back to the bare generated name.
       return deps.ownsDirect()
-        ? deps.directRuntime.downloadFile(fileId, suggestedName)
+        ? deps.directRuntime.downloadFile(fileId, suggestedName, source)
         : (deps.callFollowerApi("downloadFile", [
             fileId,
             suggestedName,
+            ...(source ? [source] : []),
           ]) as Promise<string>);
     },
     deleteWebhook(signal?: AbortSignal): Promise<boolean> {

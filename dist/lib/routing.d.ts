@@ -7,6 +7,7 @@ import * as Bus from "./bus.ts";
 import * as Commands from "./commands.ts";
 import type { TelegramConfigStore } from "./config.ts";
 import type { TelegramInboundHandlerRuntime } from "./inbound.ts";
+import type { TelegramUpdateJournalQueuedCompletion, TelegramUpdateJournalQueuedReceiptEvidence } from "./journal.ts";
 import * as Media from "./media.ts";
 import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
@@ -15,11 +16,12 @@ import * as PromptTemplates from "./prompt-templates.ts";
 import * as Queue from "./queue.ts";
 import type { TelegramBridgeRuntime } from "./runtime.ts";
 import type { TelegramSectionRegistry } from "./sections.ts";
-import type { TelegramInputRichMessage } from "./telegram-api.ts";
+import type { TelegramApiCallOptions, TelegramInputRichMessage } from "./telegram-api.ts";
 import * as TextGroups from "./text-groups.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import type { TelegramInstanceThreadIdentityCandidate, TelegramTopicTargetRecord } from "./threads.ts";
 import * as Turns from "./turns.ts";
+import type { createTelegramWorkspaceExternalProtectionCapture } from "./workspace-retirement.ts";
 interface TelegramPromptPeerView {
     id?: unknown;
     is_bot?: unknown;
@@ -37,9 +39,37 @@ export declare function resolveTelegramGuestPromptPeer(input: {
     guestBotCallerChat?: TelegramPromptPeerView;
     ownerUserId?: number;
 }): string | undefined;
+/** Stable file scope of the remote Guest Mode peer: username, else numeric id; never the bot's own scope. */
+export declare function resolveTelegramGuestFileScope(input: Parameters<typeof resolveTelegramGuestPromptPeer>[0]): string;
 import * as Threads from "./threads.ts";
 import * as Updates from "./updates.ts";
+/** One admitted Restore attempt through recipient readiness, never source dispatch or cleanup. */
+export declare function advanceTelegramWorkspaceRestore(input: {
+    request: Threads.TelegramWorkspaceRestoreRequest;
+    authority: Threads.TelegramWorkspaceRestoreAuthority;
+    restoreStore: Threads.TelegramWorkspaceRestore;
+    getRecipient: () => Threads.TelegramWorkspaceRestoreRecipient | undefined;
+    /** Adapter proves current canonical ownership and authenticates observations; apply needs a fresh issuance. */
+    runRecipient: (input: {
+        intent: Threads.TelegramWorkspaceRestoreIntent;
+        mode: "apply" | "inspect";
+        isCurrent: () => boolean;
+    }) => Promise<{
+        operationId: string;
+        recipient: Threads.TelegramWorkspaceRestoreRecipient;
+        target: Threads.TelegramWorkspaceRestoreRequest["target"];
+        slot: string;
+        ready: boolean;
+    } | undefined>;
+    /**
+     * Recovery for a same-session successor already on the relocated target: it may receive the first grant, but only
+     * read-only inspection runs. It never commits a new relocation or applies a target.
+     */
+    inspectOnly?: true;
+}): Promise<Threads.TelegramWorkspaceRestoreIntent | undefined>;
 export declare const TELEGRAM_ALL_TAB_COMMAND_MAX_AGE_MS: number;
+/** One user-facing answer for expired or previous-process routing controls. */
+export declare const TELEGRAM_ROUTING_CHOICE_EXPIRED = "\u231B Routing choice expired.";
 export declare function isTelegramAllTabCommandExpired(message: {
     date?: number;
     message_thread_id?: number;
@@ -66,7 +96,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     configStore: Pick<TelegramConfigStore, "get" | "getAllowedUserId" | "persistAllowedUserId" | "persist"> & {
         set?: TelegramConfigStore["set"];
     };
-    callApi?: <TResponse>(method: string, body: Record<string, unknown>) => Promise<TResponse>;
+    callApi?: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     getCurrentInstanceId?: () => string | undefined;
     getAdmissionScope?: () => string | undefined;
     getAdmissionJournalBinding?: () => string | undefined;
@@ -87,11 +117,32 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     handleTelegramTopicLifecycleUpdate?: (lifecycle: Updates.TelegramTopicLifecycleUpdate<TMessage>, ctx: TContext) => Promise<void> | void;
     handleTelegramThreadTargetObserved?: (target: Threads.TelegramTopicTargetRecord["target"], ctx: TContext) => Promise<void> | void;
     foreignOwnedUpdateForwarder?: Updates.TelegramForeignOwnedUpdateForwarder<TContext, Updates.TelegramMessageReactionUpdated, TCallbackQuery, TMessage>;
-    replaceFollowerThreadTarget?: (input: {
-        record: Threads.TelegramTopicTargetRecord;
-        target: Threads.TelegramTopicTargetRecord["target"];
-        oldTarget: Threads.TelegramTopicTargetRecord["target"];
-    }) => Promise<boolean>;
+    getWorkspaceRestoreStore?: () => Threads.TelegramWorkspaceRestore | undefined;
+    captureWorkspaceExternalProtection?: ReturnType<typeof createTelegramWorkspaceExternalProtectionCapture>;
+    /** Strict committed abandonment plus retained original; shared by Restore and temporary-input cancellation. */
+    inspectRestoreSourceAbandonment?: (updateId: number, journalBindingKey: string) => Threads.TelegramTemporaryThreadCancellationEvidence | undefined;
+    /** Strict active-journal observation only; a hint or missing source never substitutes for this ACK. */
+    inspectRestoreSourceCompletion?: (expected: Updates.TelegramDeferredSourceEvidence & {
+        completionSha256: string;
+    }) => (Updates.TelegramDeferredSourceEvidence & {
+        completionSha256: string;
+    }) | undefined;
+    inspectRestoreQueuedReceipt?: (expected: TelegramUpdateJournalQueuedCompletion & {
+        journalBindingKey: string;
+    }) => TelegramUpdateJournalQueuedReceiptEvidence | undefined;
+    hasWorkspaceRestoreAuthority?: () => boolean;
+    /** Strict complete namespace plus exact current/historical references; only an empty result clears journal protection. */
+    inspectTemporaryThreadSources?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[]) => readonly number[] | undefined;
+    /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 1000 ms. */
+    temporaryThreadCleanupDelayMs?: number;
+    getSessionGeneration?: () => number;
+    workspaceRestoreRecipient?: {
+        getSessionId: (ctx: TContext) => string | undefined;
+        getCwd: (ctx: TContext) => string | undefined;
+        getLeaderIdentity: Threads.TelegramLeaderThreadStateRuntime["getIdentity"];
+        followerRegistry: Pick<Bus.TelegramBusFollowerRegistry, "get" | "register">;
+        runFollower: ReturnType<typeof Bus.createTelegramBusWorkspaceRestoreController>;
+    };
     bridgeRuntime: TelegramBridgeRuntime;
     activeTurnRuntime: Queue.TelegramActiveTurnStore;
     mediaGroupRuntime: Media.TelegramMediaGroupController<TMessage, TContext>;
@@ -183,7 +234,21 @@ export declare function createTelegramInboundRouteRuntime<TUpdate extends Update
     message?: TMessage;
     edited_message?: TMessage;
     callback_query?: TCallbackQuery;
-}, TMessage extends TelegramRoutedMessage, TCallbackQuery extends TelegramRoutedCallbackQuery, TContext, TModel extends Model.MenuModel>(deps: TelegramInboundRouteRuntimeDeps<TMessage, TCallbackQuery, TContext, TModel>): Updates.TelegramUpdateRuntimeController<TContext, TUpdate>;
+}, TMessage extends TelegramRoutedMessage, TCallbackQuery extends TelegramRoutedCallbackQuery, TContext, TModel extends Model.MenuModel>(deps: TelegramInboundRouteRuntimeDeps<TMessage, TCallbackQuery, TContext, TModel>): Updates.TelegramUpdateRuntimeController<TContext, TUpdate> & {
+    expireRoutingInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["expireRoutingInput"]>;
+    shouldReviewHistoricalInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["shouldReviewHistoricalInput"]>;
+    shouldHoldPendingInput: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["shouldHoldPendingInput"]>;
+    forgetPreviousWorld(input: Updates.TelegramHeldSourcePreparation<TContext>, captureTransport?: (ctx: TContext) => (() => boolean) | undefined): Promise<{
+        forgotten: number;
+        deleted: number;
+    }>;
+    beforeQueueReceiptPublished: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["beforeQueueReceiptPublished"]>;
+    onQueueReceiptCommitted: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["onQueueReceiptCommitted"]>;
+    onQueueReceiptCompleted: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["onQueueReceiptCompleted"]>;
+    onUpdateCompleted: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["onUpdateCompleted"]>;
+    onWorkspaceRestoreRecipientObserved(follower: Bus.TelegramBusFollowerView, isCurrent: () => boolean, ctx: TContext | undefined): Promise<void> | undefined;
+    waitForRestoreSettlement(): Promise<void>;
+};
 export interface TelegramAssistantOutputAuthority<TTransportStamp> {
     transportStamp: TTransportStamp;
     route: "direct" | "follower" | "none";

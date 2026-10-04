@@ -43,7 +43,7 @@ export function registerTelegramInboundHandler(kind, handler) {
         }
     };
 }
-export function getTelegramInboundProgrammaticHandlers(kind) {
+function getTelegramInboundProgrammaticHandlers(kind) {
     const registry = getOrCreateInboundHandlerRegistry();
     return [
         ...(registry.handlers.get(kind) ?? []),
@@ -117,7 +117,7 @@ export function telegramInboundHandlerMatchesFile(handler, file) {
         return true;
     return matchesAnyPattern(matchPatterns, file.kind);
 }
-export function findTelegramInboundHandlers(handlers, file) {
+function findTelegramInboundHandlers(handlers, file) {
     if (!Array.isArray(handlers))
         return [];
     return handlers.filter((handler) => !!handler &&

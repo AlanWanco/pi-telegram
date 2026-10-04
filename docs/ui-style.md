@@ -54,6 +54,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |
 | `➡️` | Choose replacement target | Thread replace/restore target buttons that select which Pi instance should move to the current thread | Use inside the second replace/restore chooser, not for ordinary reroutes. |
 | `☑️` | Activate / choose this item | Model detail activation action, generated button-only choice heading | Positive selection cue; use `🟢 Active` for already-current state. |
+| `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and confirmed `⛔️ Routing cancelled.` feedback | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal must be stated in the chooser and bound to exact eligible target authority. |
 | `❌` | No / cancel / terminal failure | Confirmation cancel buttons and terminal failure notices | Do not use for a recoverable operation failure that leaves session state intact. |
 | `🗑` | Delete / defer removal | Destructive confirmations and removal reaction | In the queue menu, reversible Keep/Skip selectors replace immediate deletion. |
 
@@ -70,7 +71,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
-| `🟢` | Current/active/enabled `On` | Current option in vertical lists, active state rows, active `On` toggle | One strong current marker per option list. |
+| `🟢` | Current/active/enabled `On` | Current option in vertical lists, active state rows, active `On` toggle | One marker per selected list value; inactive list values stay unmarked. |
 | `🟡` | Active `Off` or elevated/filter state | Active `Off` toggle, Priority/Scoped active tab | Yellow means intentionally not-normal or off/default-caution, not error. |
 | `🔴` | Active destructive/deferred disposition | Active queue `Skip` selector | Red distinguishes a prompt that will be discarded at dispatch from reversible neutral or elevated state. |
 | `🟣` | Normal/default active tab | Normal priority tab, All/default scope tab, active page picker | Use for neutral active tabs. |
@@ -109,6 +110,18 @@ Some emoji are intentionally local examples or decorative variants, not global s
 
 Thread UI rule: when a message heading, chooser, or status line is specifically about Telegram/Pi threads or target thread selection, start the heading with `🧵`. Button labels for concrete thread targets should stay clean (`threadName` or slot fallback) and should not add `🧵` to every target button unless the row would otherwise be ambiguous.
 
+## Button Control Hierarchy
+
+All inline controls are buttons at the transport level. The local UI kit gives them three visual roles:
+
+- **Action button:** Performs an action or navigation, using its semantic emoji and Capitalized action text.
+- **List-item button:** Represents a value in a collection. Use lowercase value labels; only selected values carry a state-circle emoji, while unselected values have no emoji. A list may support single or multiple selection.
+- **Radio-style button:** Represents a labelled state choice. Use Capitalized labels and an indicator on every value: a semantic colored circle for active values, `⚫️` for inactive values. A radio group normally selects one value; checkbox-like binary controls and tabs reuse this same visual family rather than introducing separate label grammars.
+
+Selection cardinality belongs to the control's domain, not to the visual family. Independent checkbox dimensions or tab groups may each have an active value. Do not confuse list and radio-style controls merely because both can select one item. Canonical names, identifiers and numeric/spatial tokens keep their own spelling; casing rules apply to authored value words.
+
+These are button-based visual grammars, not claims that Telegram exposes native list, radio, checkbox or tab widgets. Selection markers project actual state; they never grant callback, mutation or routing authority. The specialized rules below define each reuse.
+
 ## Action Buttons
 
 Action buttons perform an operation.
@@ -143,7 +156,7 @@ Examples:
 
 ## Boolean Toggles
 
-Boolean settings use a horizontal `On` / `Off` pair.
+Boolean settings are checkbox-like binary controls rendered with the radio-style grammar as a horizontal `On` / `Off` pair.
 
 Rules:
 
@@ -161,7 +174,7 @@ Examples:
 
 ## Horizontal Tabs
 
-Tabs or small mutually-exclusive scopes use a horizontal row.
+Tabs or small mutually-exclusive scopes reuse the radio-style grammar in a horizontal row.
 
 Rules:
 
@@ -177,25 +190,25 @@ Examples:
 
 - `🟡 Scoped` / `⚫️ All`
 - `⚫️ Priority` / `🟣 Normal`
-- `1` / `🟣 2` / `3`
 
 ## Option Lists
 
-Option lists choose one value from a fixed set, for example model selection, thinking level, voice reply mode, or time injection mode.
+Option lists represent values from a collection and may allow single or multiple selection. Current model selection, thinking level, voice reply mode and time injection mode are single-choice examples.
 
 Rules:
 
 - Put each option on its own row when labels are long, the set may grow, or scanning benefits from full width.
 - A fixed set of short, ordered peer values may use compact rows of up to three buttons.
 - Keep a semantically distinct value such as thinking `off` on its own full-width row before grouped intensity values.
-- Mark only the current value with `🟢`.
-- Leave non-current values without emoji.
-- Use lowercase labels when the option is a value.
+- Mark only selected values with the appropriate state circle (`🟢` by default); a multi-select list marks each selected value.
+- Leave unselected values without emoji, never with the radio family's `⚫️` placeholder.
+- Use lowercase authored value labels; preserve canonical names, identifiers and numeric/spatial tokens.
 
 Examples:
 
 - Vertical: `hidden`, `🟢 mirror`, `always`.
 - Thinking: full-width `off`, then `minimal` / `low` / `🟢 medium`, then `high` / `xhigh` / `max`.
+- Numeric page picker (list grammar, not radio-style tabs): `1` / `🟣 2` / `3`.
 
 ## Generated Prompt Buttons
 
@@ -211,6 +224,7 @@ Rules:
 - First-level submenus opened from the main inline menu start with `⬆️ Main menu`.
 - Deeper submenus start with `⬆️ Back`.
 - `Main menu` returns to the root inline menu.
+- Choosing a Thinking level refreshes the same chooser and its current marker without leaving the submenu; only the top `Main menu` button returns to the root.
 - `Back` returns one level up, never directly to the root unless the parent is the root.
 
 Examples:

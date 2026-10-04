@@ -24,7 +24,7 @@ import {
   updateTelegramPromptTurnText,
 } from "../lib/turns.ts";
 import { getTelegramVoiceReplyMode } from "../lib/voice.ts";
-import type { TelegramMediaMessage } from "../lib/media.ts";
+import { downloadTelegramMessageFiles, type TelegramMediaMessage } from "../lib/media.ts";
 import type { PendingTelegramTurn } from "../lib/queue.ts";
 
 // Formatting tests finalize immediately; queue integration tests own delayed finalization.
@@ -1195,6 +1195,25 @@ test("Turn edit preserves voice reply tags", () => {
   });
   assert.equal(updated.voiceReplyPreferred, true);
   assert.equal(updated.voiceReplyRequired, false);
+});
+
+test("Video and animated stickers never enter image payloads", async () => {
+  const messages = [{ message_id: 1, chat: { id: 7 }, message_thread_id: 42, sticker: { file_id: "static" } },
+    { message_id: 2, chat: { id: 7 }, message_thread_id: 42, sticker: { file_id: "video", is_video: true } },
+    { message_id: 3, chat: { id: 7 }, message_thread_id: 42, sticker: { file_id: "animated", is_animated: true } }];
+  const files = await downloadTelegramMessageFiles(messages, { downloadFile: async (_id, name) => `/tmp/${name}` });
+  const binaryReads: string[] = [];
+  const turn = await buildTelegramPromptTurn({ telegramPrefix: "[telegram]", messages, historyTurns: [], queueOrder: 1,
+    rawText: "Stickers", files, inferImageMimeType: () => "image/webp", readBinaryFile: async path => {
+      binaryReads.push(path);
+      assert.equal(path, "/tmp/sticker-1.webp", "non-image bytes must not be read for an image part");
+      return new Uint8Array([0x52, 0x49, 0x46, 0x46]);
+    } });
+  assert.deepEqual(binaryReads, ["/tmp/sticker-1.webp"]);
+  assert.equal(turn.content.filter(part => part.type === "image").length, 1);
+  assert.match(turn.historyText, /sticker-2\.webm/);
+  assert.match(turn.historyText, /sticker-3\.tgs/);
+  assert.deepEqual(turn.target, { chatId: 7, threadId: 42 });
 });
 
 test("Turn helpers assemble prompt turns with text, ids, history, and image payloads", async () => {

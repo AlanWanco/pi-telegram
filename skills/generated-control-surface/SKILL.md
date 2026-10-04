@@ -46,7 +46,7 @@ A disabled control is not an action: it needs no prompt or selected style and mu
 
 Prompts must name any target, operation, constraint, or freshness identity whose omission could change the action. Reuse visible context only when it remains unambiguous under delayed or reordered clicks. Never encode volatile output that should be freshly inspected.
 
-Every generated human-readable action label must use `emoji + space + text`; emoji-free text labels are invalid. Choose the emoji by action semantics, keep its meaning consistent, and never rely on emoji or color alone. Coordinates, established symbolic controls, and intentionally spatial glyphs already satisfy the marker role through their domain grammar. If prompt buttons are unavailable, preserve the same choices as a numbered list.
+Every generated human-readable action label must use `emoji + space + text`; emoji-free text labels are invalid. Choose the emoji by action semantics, keep its meaning consistent, and never rely on emoji or color alone. State/value controls follow their UI-kit grammar; unmarked inactive list items are not action labels. Coordinates, established symbolic controls, and intentionally spatial glyphs already satisfy the marker role through their domain grammar. If prompt buttons are unavailable, preserve the same choices as a numbered list.
 
 ## Layout Kernel
 
@@ -97,10 +97,10 @@ Show concise failure evidence and emit valid recovery controls such as diagnose,
 Before sending:
 
 - At least one useful button is present whenever the transport supports prompt buttons.
-- Every human-readable button label begins with a semantic emoji and one ASCII space.
+- Every human-readable action label begins with a semantic emoji and one ASCII space; state/value controls follow their owning documented grammar.
 - State, actions, owner, and target agree.
 - Live claims are fresh; adaptation and incompleteness are explicit.
-- Every prompt is sufficient and every label follows its semantic emoji rule.
+- Every prompt is sufficient; labels follow their control grammar.
 - Row grouping reflects real hierarchy or peer relationships.
 - High-impact actions require confirmation.
 - No secret or hidden reasoning appears.

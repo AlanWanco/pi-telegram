@@ -6,7 +6,7 @@
  */
 import { type PathLike } from "node:fs";
 import { type TelegramProcessLiveness } from "./bus.ts";
-import type { TelegramTarget } from "./target.ts";
+import { type TelegramTarget } from "./target.ts";
 export interface TelegramWorkspaceAdmissionOwner {
     processId: number;
     processBirthId: string;
@@ -22,7 +22,7 @@ export type TelegramWorkspaceAdmissionScope = {
 } | {
     kind: "profile";
 };
-export interface TelegramWorkspaceAdmissionLease {
+interface TelegramWorkspaceAdmissionLease {
     operationId: string;
     operationKind: string;
     profileKey: string;
@@ -30,9 +30,9 @@ export interface TelegramWorkspaceAdmissionLease {
     owner: TelegramWorkspaceAdmissionOwner;
     acquiredAtMs: number;
 }
-export type TelegramWorkspaceDestructiveFenceKind = "pressure-retirement" | "manual-thread-cleanup" | "journal-writer-closure";
+type TelegramWorkspaceDestructiveFenceKind = "pressure-retirement" | "manual-thread-cleanup" | "journal-writer-closure";
 export type TelegramWorkspaceDeletionFenceKind = Exclude<TelegramWorkspaceDestructiveFenceKind, "journal-writer-closure">;
-export interface TelegramWorkspaceJournalWriterClosureFence {
+interface TelegramWorkspaceJournalWriterClosureFence {
     destructiveKind: "journal-writer-closure";
     phase: "fenced";
     operationId: string;
@@ -43,7 +43,7 @@ export interface TelegramWorkspaceJournalWriterClosureFence {
     acquiredAtMs: number;
 }
 export declare function normalizeTelegramWorkspaceJournalWriterClosureFence(value: unknown, profileKey: string): TelegramWorkspaceJournalWriterClosureFence | undefined;
-export interface TelegramWorkspaceJournalWriterProtocolMode {
+interface TelegramWorkspaceJournalWriterProtocolMode {
     version: 1;
     protocol: "custody-v3";
     profileKey: string;
@@ -100,8 +100,7 @@ export interface TelegramWorkspaceDeletionPermit {
     readonly leaderEpoch: number | string;
     readonly issuedAtMs: number;
 }
-export type TelegramWorkspaceAdmissionBlockReason = "retirement-fenced" | "admission-active" | "retirement-active";
-export type TelegramWorkspaceAdmissionAcquireResult = {
+type TelegramWorkspaceAdmissionAcquireResult = {
     kind: "acquired";
     lease: TelegramWorkspaceAdmissionLease;
     resumed: boolean;
@@ -109,7 +108,7 @@ export type TelegramWorkspaceAdmissionAcquireResult = {
     kind: "blocked";
     reason: "retirement-fenced";
 };
-export type TelegramWorkspaceRetirementFenceAcquireResult = {
+type TelegramWorkspaceRetirementFenceAcquireResult = {
     kind: "acquired";
     fence: TelegramWorkspaceRetirementFence;
     resumed: boolean;
@@ -117,11 +116,11 @@ export type TelegramWorkspaceRetirementFenceAcquireResult = {
     kind: "blocked";
     reason: "admission-active" | "retirement-active";
 };
-export type TelegramWorkspaceJournalWriterProtocolInstallResult = {
+type TelegramWorkspaceJournalWriterProtocolInstallResult = {
     mode: TelegramWorkspaceJournalWriterProtocolMode;
     resumed: boolean;
 };
-export type TelegramWorkspaceJournalWriterClosureAcquireResult = {
+type TelegramWorkspaceJournalWriterClosureAcquireResult = {
     kind: "acquired";
     fence: TelegramWorkspaceJournalWriterClosureFence;
     resumed: boolean;
@@ -129,7 +128,7 @@ export type TelegramWorkspaceJournalWriterClosureAcquireResult = {
     kind: "blocked";
     reason: "admission-active" | "retirement-active";
 };
-export type TelegramWorkspaceDeletionPermitResult = {
+type TelegramWorkspaceDeletionPermitResult = {
     kind: "issued";
     fence: TelegramWorkspaceRetirementFence;
     permit: TelegramWorkspaceDeletionPermit;
@@ -137,15 +136,17 @@ export type TelegramWorkspaceDeletionPermitResult = {
     kind: "already-issued";
     fence: TelegramWorkspaceRetirementFence;
 };
-export interface TelegramWorkspaceAdmissionLedgerSnapshot {
+interface TelegramWorkspaceAdmissionLedgerSnapshot {
     profileKey: string;
     leases: TelegramWorkspaceAdmissionLease[];
     fence?: TelegramWorkspaceDestructiveFence;
     writerProtocolMode?: TelegramWorkspaceJournalWriterProtocolMode;
 }
-export type TelegramWorkspaceAdmissionPublicationBoundary = "before-write" | "after-write-before-rename";
-export interface TelegramWorkspaceAdmissionLedgerOptions {
+type TelegramWorkspaceAdmissionPublicationBoundary = "before-write" | "after-write-before-rename";
+interface TelegramWorkspaceAdmissionLedgerOptions {
     path: string;
+    /** Explicit logical section identity for the consolidated root; absent means the standalone ledger adapter. */
+    stateProfile?: string;
     profileKey: string;
     owner: TelegramWorkspaceAdmissionOwner;
     getNowMs?: () => number;
@@ -232,22 +233,29 @@ export interface TelegramWorkspaceAdmissionLedger {
 export declare function resolveTelegramWorkspaceDestructiveFenceKind(fence: {
     destructiveKind?: TelegramWorkspaceDestructiveFenceKind;
 }): TelegramWorkspaceDestructiveFenceKind;
+/** Pure damage check for one consolidated admission section under its own stored profile key; throws when invalid. */
+export declare function assertTelegramConsolidatedAdmissionSection(value: unknown, stateProfile: string): void;
 export declare function createTelegramWorkspaceAdmissionOperationId(): string;
 export declare function createTelegramWorkspaceAdmissionProfileKey(input: {
     profileName?: string;
     botToken: string;
 }): string;
-export interface TelegramWorkspaceAdmissionRuntimeBinding {
+interface TelegramWorkspaceAdmissionRuntimeBinding {
     resolve: () => TelegramWorkspaceAdmissionLedger | undefined;
 }
 export declare function createTelegramWorkspaceAdmissionRuntimeBinding(input: {
     getProfileName: () => string | undefined;
     getBotToken: () => string | undefined;
-    getPath: (profileName?: string) => string;
     owner: TelegramWorkspaceAdmissionOwner;
     getNowMs?: () => number;
     getProcessLiveness?: (owner: TelegramWorkspaceAdmissionOwner) => TelegramProcessLiveness;
-}): TelegramWorkspaceAdmissionRuntimeBinding;
+} & ({
+    getPath: (profileName?: string) => string;
+    getStatePath?: never;
+} | {
+    getStatePath: () => string;
+    getPath?: never;
+})): TelegramWorkspaceAdmissionRuntimeBinding;
 export declare function runWithTelegramWorkspaceAdmissions<T>(input: {
     ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "releaseAdmission">;
     operationId: string;

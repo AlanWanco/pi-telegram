@@ -24,7 +24,6 @@ export interface TelegramTurnMessage {
 }
 export type DownloadedTelegramTurnFile = DownloadedTelegramMessageFile;
 export declare function createTelegramTurnPrefix(attributes?: Record<string, string | undefined>): string;
-export declare function formatTelegramTurnPrefix(_message: TelegramTurnMessage, basePrefix?: string): string;
 export { truncateTelegramQueueSummary };
 export declare function formatTelegramTurnStatusSummary(rawText: string, files: DownloadedTelegramTurnFile[], handlerOutputs?: string[]): string;
 export declare function buildTelegramTurnPrompt(options: {

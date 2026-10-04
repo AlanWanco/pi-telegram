@@ -8,6 +8,7 @@ import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.ts";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.ts";
 import {
   createTelegramWorkspaceAdmissionOperationId,
   runWithTelegramWorkspaceAdmissionsAsync,
@@ -20,7 +21,6 @@ import {
   getTelegramThreadOwnerKey,
   isSameTelegramProcessInstance,
   isTelegramTopicTargetStaleError,
-  normalizeTelegramWorkspacePath,
   provisionOwnBusTopic,
   type TelegramOwnTopicProvisionResult,
   type TelegramTopicTargetStore,
@@ -179,7 +179,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
   getNowMs?: () => number;
 }
 
-export function markTelegramConfigSyncChange<
+function markTelegramConfigSyncChange<
   TSyncState extends TelegramSyncState,
 >(state: TSyncState, action: string, options?: { nowMs?: number }): TSyncState {
   const nowMs = options?.nowMs ?? Date.now();
@@ -245,7 +245,7 @@ export interface TelegramSessionRestartThreadCleanupDeps<
   suspendPolling: () => Promise<void>;
 }
 
-export function createTelegramSessionRestartThreadCleanupHandler<
+function createTelegramSessionRestartThreadCleanupHandler<
   TSyncState extends TelegramSyncState,
 >(
   deps: TelegramSessionRestartThreadCleanupDeps<TSyncState>,
@@ -997,7 +997,7 @@ export async function ensureTelegramLeaderThreadBinding(
   }
 }
 
-export const TELEGRAM_SYNC_SLICE_TARGET_BINDINGS = "target-bindings";
+const TELEGRAM_SYNC_SLICE_TARGET_BINDINGS = "target-bindings";
 
 export const TELEGRAM_SYNC_SLICES = [
   "bot-identity",

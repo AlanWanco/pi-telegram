@@ -16,17 +16,10 @@ export type TelegramBotTokenReference = {
 } | {
     kind: "malformed";
 };
-/**
- * Parse a persisted bot-token value. `$NAME` and `${NAME}` are exact
- * environment-variable references. Any other `$`-prefixed value is malformed
- * rather than a literal secret so a broken reference fails closed.
- */
-export declare function getTelegramBotTokenReference(value: string | undefined): TelegramBotTokenReference | undefined;
 /** Resolve a persisted token at a validation/activation boundary. */
 export declare function resolveTelegramBotToken(value: string | undefined, env?: NodeJS.ProcessEnv): string | undefined;
 /** Redacted diagnostic for an unresolved or malformed token reference. */
 export declare function getTelegramBotTokenDiagnostic(value: string | undefined, env?: NodeJS.ProcessEnv): string | undefined;
-export type TelegramOutboundCommandTemplateConfig = string | CommandTemplateObjectConfig;
 export interface TelegramOutboundHandlerConfig extends CommandTemplateObjectConfig {
     type?: string;
     match?: string | string[];
@@ -179,13 +172,6 @@ export declare function normalizeTelegramDefaultProfileConfig(config: TelegramCo
     changed: boolean;
 };
 export declare function createTelegramConfigStore(options?: TelegramConfigStoreOptions): TelegramConfigStore;
-export declare function createTelegramDraftPreviewsChecker(configStore: Pick<TelegramConfigStore, "get">): () => boolean;
-export declare function createTelegramDraftPreviewsSetter(configStore: TelegramMutableConfigStore): (enabled: boolean) => Promise<void>;
-export declare function createTelegramAssistantRenderingModeGetter(configStore: Pick<TelegramConfigStore, "get">): () => TelegramAssistantRenderingMode;
-export declare function createTelegramAssistantRenderingModeSetter(configStore: TelegramMutableConfigStore): (mode: TelegramAssistantRenderingMode) => Promise<void>;
-export declare function createTelegramActivityVerbosityGetter(configStore: Pick<TelegramConfigStore, "get">): () => TelegramActivityVerbosity;
-export declare function createTelegramActivityVerbosityRefresher(configStore: TelegramMutableConfigStore): () => Promise<void>;
-export declare function createTelegramActivityVerbositySetter(configStore: TelegramMutableConfigStore): (verbosity: TelegramActivityVerbosity) => Promise<void>;
 export declare function createTelegramVoiceReplyModeGetter(configStore: Pick<TelegramConfigStore, "get">): () => "manual" | "mirror" | "always";
 export declare function createTelegramVoiceReplyModeConfiguredChecker(configStore: Pick<TelegramConfigStore, "get">): () => boolean;
 export declare function createTelegramVoiceReplyModeSetter(configStore: TelegramMutableConfigStore): (replyMode: "manual" | "hidden" | "mirror" | "always" | undefined) => Promise<void>;
@@ -203,9 +189,6 @@ export declare function createTelegramProactivePushTargetGetter(deps: {
     getAssignedTarget: () => TelegramProactivePushTarget | undefined;
     getAllowedUserId: () => number | undefined;
 }): () => TelegramProactivePushTarget | undefined;
-export declare function createTelegramAutomaticThreadCleanupChecker(configStore: Pick<TelegramConfigStore, "get">): () => boolean;
-export declare function createTelegramAutomaticThreadCleanupResolver(configStore: TelegramMutableConfigStore): () => Promise<boolean>;
-export declare function createTelegramAutomaticThreadCleanupSetter(configStore: TelegramMutableConfigStore): (enabled: boolean) => Promise<void>;
 export declare function createTelegramConfigControls(configStore: TelegramMutableConfigStore): {
     areDraftPreviewsEnabled: () => boolean;
     setDraftPreviewsEnabled: (enabled: boolean) => Promise<void>;

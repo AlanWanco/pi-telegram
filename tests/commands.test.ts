@@ -709,14 +709,14 @@ test("Connect recovers disposable runtime corruption and retries exactly once", 
   ]);
 });
 
-test("Connect performs filesystem recovery before its one reconnect attempt", async () => {
+for (const corruptState of [false, true]) test(`Connect deletes damaged ownership debris and Workspace state, then reconnects (${corruptState})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-connect-recovery-"));
   try {
     const ownersPath = join(dir, "owners.json");
     const statePath = join(dir, "state.json");
     const configPath = join(dir, "telegram.json");
     writeFileSync(ownersPath, "{truncated");
-    writeFileSync(statePath, "{truncated");
+    writeFileSync(statePath, corruptState ? "{truncated" : "{}");
     writeFileSync(configPath, JSON.stringify({ botToken: "preserved" }));
     const harness = createCommandRegistrationApiHarness();
     const notifications: string[] = [];
@@ -757,12 +757,14 @@ test("Connect performs filesystem recovery before its one reconnect attempt", as
     assert.equal(starts, 2);
     assert.equal(stops, 1);
     assert.equal(existsSync(ownersPath), false);
-    assert.equal(existsSync(statePath), false);
+    if (corruptState) assert.equal(existsSync(statePath), false, "Operator policy: unreadable state is acceptable loss");
+    else assert.equal(readFileSync(statePath, "utf8"), "{}");
     assert.equal(
       readFileSync(configPath, "utf8"),
       JSON.stringify({ botToken: "preserved" }),
     );
     assert.equal(notifications.length, 1);
+    assert.equal(existsSync(join(dir, "recovery")), false);
     assert.equal(notifications[0], "Telegram bridge connected; temporary state recovered.");
 
     await getRequiredCommand(harness.commands, "telegram-connect").handler(

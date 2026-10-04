@@ -22,14 +22,21 @@
  */
 
 import {
-  existsSync,
   lstatSync,
   readFileSync,
-  readdirSync,
+  opendirSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { decodeTelegramSessionDirectoryName, resolveTelegramTempDir } from "../dist/lib/paths.js";
 
+const MAX_DIRECTORY_ENTRIES = 10_000;
+const MAX_FILES = 4_096;
+const MAX_BYTES = 64 * 1024 * 1024;
+let remainingEntries = MAX_DIRECTORY_ENTRIES;
+let remainingFiles = MAX_FILES;
+let remainingBytes = MAX_BYTES;
+const SESSION_SNAPSHOT_PATTERN = /^(?:journal\.[a-f0-9]{16}|inbox)(?:\.[a-zA-Z0-9._-]+)?\.json$/u;
 const SNAPSHOT_PATTERN = /^(?:inbox|follower-inbox-[a-f0-9]{16})(?:\.[a-zA-Z0-9._-]+)?\.json$/u;
 const SEGMENT_NAME_PATTERN = /^\d{16}\.json$/u;
 const AUTHORITY_STATES = new Set(["pending", "retry-wait", "queued", "failed"]);
@@ -114,8 +121,24 @@ function isNonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-function readJson(path) {
+function listDirectory(path) {
+  const directory = opendirSync(path);
+  const names = [];
   try {
+    for (;;) {
+      const entry = directory.readSync();
+      if (!entry) return names.sort();
+      if (--remainingEntries < 0) throw new Error("journal directory listing limit exhausted");
+      names.push(entry.name);
+    }
+  } finally { directory.closeSync(); }
+}
+
+function readJson(path, stat) {
+  try {
+    if (--remainingFiles < 0 || stat.size > remainingBytes)
+      throw new Error("journal file/byte inspection limit exhausted");
+    remainingBytes -= stat.size;
     return JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
     block(
@@ -306,46 +329,56 @@ function validateSegment(value) {
 }
 
 const agentDir = resolveAgentDir();
-const runtimeDir = join(agentDir, "tmp", "telegram");
-if (!existsSync(runtimeDir)) {
-  console.log("SAFE: no Telegram runtime directory exists.");
-  process.exit(0);
-}
-
+const runtimeDir = resolveTelegramTempDir(agentDir);
 let runtimeNames;
+let observedRuntime = false;
 try {
-  runtimeNames = readdirSync(runtimeDir);
+  if (!lstatSync(runtimeDir).isDirectory()) throw new Error("non-directory Telegram runtime or link");
+  observedRuntime = true;
+  runtimeNames = listDirectory(runtimeDir);
 } catch (error) {
-  block(
-    `cannot verify Telegram runtime directory ${runtimeDir}: ${error instanceof Error ? error.message : String(error)}`,
-  );
+  if (error?.code === "ENOENT" && !observedRuntime) {
+    console.log("SAFE: no Telegram runtime directory exists.");
+    process.exit(0);
+  }
+  block(`cannot verify Telegram runtime directory ${runtimeDir}: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 }
 
-const snapshotNames = runtimeNames.filter((name) => SNAPSHOT_PATTERN.test(name));
-const snapshotSet = new Set(snapshotNames);
-for (const name of runtimeNames) {
-  const snapshotName = name.endsWith(".segments")
-    ? name.slice(0, -".segments".length)
-    : undefined;
-  if (snapshotName && SNAPSHOT_PATTERN.test(snapshotName)) {
-    if (!snapshotSet.has(snapshotName)) {
-      block(
-        `cannot verify orphan journal segments without ${join(runtimeDir, snapshotName)}`,
-      );
+function collectSnapshots(directory, names, pattern, strict = false) {
+  const snapshots = names.filter(name => pattern.test(name));
+  const snapshotSet = new Set(snapshots);
+  for (const name of names) {
+    // Legacy recovery folders hold no journal authority; current releases delete them.
+    if (name.toLowerCase() === "recovery") continue;
+    const snapshotName = name.endsWith(".segments") ? name.slice(0, -".segments".length) : undefined;
+    if (snapshotName && pattern.test(snapshotName)) {
+      if (!snapshotSet.has(snapshotName)) block(`cannot verify orphan journal segments without ${join(directory, snapshotName)}`);
+      continue;
     }
-    continue;
+    if (!pattern.test(name) && (strict || /^(?:inbox|follower-inbox|journal\.)/iu.test(name)))
+      block(`cannot verify unrecognized journal-like artifact ${join(directory, name)}`);
   }
-  if (
-    (name.startsWith("inbox") || name.startsWith("follower-inbox")) &&
-    !SNAPSHOT_PATTERN.test(name)
-  ) {
-    block(`cannot verify unrecognized journal-like artifact ${join(runtimeDir, name)}`);
-  }
+  return snapshots.map(name => join(directory, name));
 }
 
-for (const name of snapshotNames) {
-  const path = join(runtimeDir, name);
+const snapshotPaths = collectSnapshots(runtimeDir, runtimeNames, SNAPSHOT_PATTERN);
+for (const name of runtimeNames.filter(name => name.toLowerCase() === "sessions")) {
+  const root = join(runtimeDir, name);
+  try {
+    if (name !== "sessions" || !lstatSync(root).isDirectory()) throw new Error("noncanonical session root or link/type");
+    for (const sessionName of listDirectory(root)) {
+      const directory = join(root, sessionName);
+      if (decodeTelegramSessionDirectoryName(sessionName) === undefined || !lstatSync(directory).isDirectory()) {
+        block(`cannot verify session folder ${directory}`);
+        continue;
+      }
+      snapshotPaths.push(...collectSnapshots(directory, listDirectory(directory), SESSION_SNAPSHOT_PATTERN, true));
+    }
+  } catch (error) { block(`cannot verify session journals ${root}: ${String(error)}`); }
+}
+
+for (const path of snapshotPaths) {
   let pathStat;
   try {
     pathStat = lstatSync(path);
@@ -357,7 +390,7 @@ for (const name of snapshotNames) {
     block(`cannot verify non-file journal snapshot ${path}`);
     continue;
   }
-  const snapshot = validateSnapshot(readJson(path));
+  const snapshot = validateSnapshot(readJson(path, pathStat));
   if (!snapshot) {
     block(`cannot verify malformed journal snapshot ${path}`);
     continue;
@@ -367,14 +400,19 @@ for (const name of snapshotNames) {
   let botIdentity = snapshot.botIdentity;
   const entries = snapshot.entries;
   const segmentDir = `${path}.segments`;
-  if (existsSync(segmentDir)) {
+  let segmentDirectoryStat;
+  try { segmentDirectoryStat = lstatSync(segmentDir); }
+  catch (error) {
+    if (error?.code !== "ENOENT") block(`cannot verify journal segments ${segmentDir}: ${String(error)}`);
+  }
+  if (segmentDirectoryStat) {
     let segmentNames;
     try {
-      if (!lstatSync(segmentDir).isDirectory()) {
+      if (!segmentDirectoryStat.isDirectory()) {
         block(`cannot verify non-directory journal segments ${segmentDir}`);
         continue;
       }
-      segmentNames = readdirSync(segmentDir);
+      segmentNames = listDirectory(segmentDir);
     } catch (error) {
       block(`cannot verify journal segments ${segmentDir}: ${String(error)}`);
       continue;
@@ -389,7 +427,6 @@ for (const name of snapshotNames) {
       SEGMENT_NAME_PATTERN.test(candidate),
     ).sort()) {
       const nameRevision = Number(segmentName.slice(0, 16));
-      if (nameRevision <= revision) continue;
       const segmentPath = join(segmentDir, segmentName);
       let segmentStat;
       try {
@@ -398,9 +435,9 @@ for (const name of snapshotNames) {
         block(`cannot verify journal segment ${segmentPath}: ${String(error)}`);
         break;
       }
-      const segment = segmentStat.isFile()
-        ? validateSegment(readJson(segmentPath))
-        : undefined;
+      if (!segmentStat.isFile()) { block(`cannot verify non-file journal segment ${segmentPath}`); break; }
+      if (nameRevision <= revision) continue;
+      const segment = validateSegment(readJson(segmentPath, segmentStat));
       if (
         !segment ||
         segment.revision !== nameRevision ||
@@ -426,10 +463,10 @@ for (const name of snapshotNames) {
   }
   if (entries.size > 0) {
     block(
-      `${path} retains ${entries.size} unresolved update(s); drain with 0.28.x before downgrade.`,
+      `${path} retains ${entries.size} unresolved update(s); drain with a compatible runtime before downgrade.`,
     );
   }
 }
 
 if (process.exitCode) process.exit(1);
-console.log(`SAFE: ${snapshotNames.length} Telegram journal(s) contain no unresolved updates.`);
+console.log(`SAFE: ${snapshotPaths.length} Telegram journal(s) contain no unresolved updates.`);

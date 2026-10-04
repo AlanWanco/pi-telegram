@@ -71,7 +71,7 @@ import {
   updateTelegramStatusMessage,
   updateTelegramThinkingMenuMessage,
 } from "../lib/menu.ts";
-import type { MenuModel } from "../lib/model.ts";
+import type { MenuModel, ThinkingLevel } from "../lib/model.ts";
 import type { TelegramQueueItem } from "../lib/queue.ts";
 import { createTelegramExtensionSectionRegistry } from "../lib/sections.ts";
 
@@ -1088,7 +1088,7 @@ test("Menu runtime routes stored callback queries through callback action ports"
         events.push("unexpected:model-menu");
       },
       updateThinkingMenuMessage: async () => {
-        events.push("unexpected:thinking-menu");
+        events.push("thinking-menu");
       },
       updateStatusMessage: async () => {
         events.push("status-menu");
@@ -1156,7 +1156,7 @@ test("Menu runtime routes stored callback queries through callback action ports"
     "answer:",
     "thinking:high",
     "status",
-    "status-menu",
+    "thinking-menu",
     "answer:Thinking: high",
     "set-model:gpt-5",
     "current:gpt-5",
@@ -1166,6 +1166,60 @@ test("Menu runtime routes stored callback queries through callback action ports"
     "model-menu",
     "answer:Switching to gpt-5 and continuing…",
   ]);
+});
+
+test("Thinking choices remain in the same submenu until explicit Main menu navigation", async () => {
+  const model = createMenuModel("openai", "gpt-5", true);
+  const state = createMenuState<typeof model>(2, { mode: "status", threadId: 17 });
+  let level: ThinkingLevel = "medium";
+  const renders: Array<{ menuMode: typeof state.mode; text: string; markup: TelegramInlineKeyboardMarkup }> = [];
+  const sets: ThinkingLevel[] = [];
+  const actions = createTelegramMenuActionRuntime<{ idle: boolean }, typeof model>({
+    getModelMenuState: async () => state,
+    getActiveModel: () => model,
+    getThinkingLevel: () => level,
+    buildStatusHtml: () => "Main menu",
+    storeModelMenuState: () => {},
+    isIdle: () => true,
+    canOfferInFlightModelSwitch: () => false,
+    sendTextReply: async () => undefined,
+    sendInteractiveMessage: async () => { assert.fail("Selection must edit its existing menu"); },
+    editInteractiveMessage: async (chatId, messageId, text, mode, markup) => {
+      assert.equal(chatId, state.chatId); assert.equal(messageId, 2); assert.equal(mode, "html");
+      renders.push({ menuMode: state.mode, text, markup: markup! });
+    },
+  });
+  const deps = {
+    getStoredModelMenuState: (messageId?: number, chatId?: number) => messageId === state.messageId && chatId === state.chatId ? state : undefined,
+    getActiveModel: () => model, getThinkingLevel: () => level,
+    setThinkingLevel: (next: ThinkingLevel) => { level = next; sets.push(next); },
+    updateStatus: () => {},
+    updateModelMenuMessage: actions.updateModelMenuMessage,
+    updateThinkingMenuMessage: actions.updateThinkingMenuMessage,
+    updateStatusMessage: actions.updateStatusMessage,
+    answerCallbackQuery: async () => {},
+    isIdle: (ctx: { idle: boolean }) => ctx.idle,
+    hasAbortHandler: () => false, hasActiveToolExecutions: () => false,
+    setModel: async () => { assert.fail("Thinking selection must not select a model"); },
+    setCurrentModel: () => {}, stagePendingModelSwitch: () => {}, restartInterruptedTelegramTurn: () => false,
+  };
+  const click = (data: string) => handleTelegramMenuCallbackRuntime({ id: data, data,
+    message: { message_id: 2, message_thread_id: 17, chat: { id: state.chatId } } }, { idle: true }, deps);
+  await click("menu:thinking");
+  for (const next of ["high", "off", "off"] as const) {
+    await click(`thinking:set:${next}`);
+    assert.equal(state.mode, "thinking", "Choosing a level must not navigate to the root");
+    const last = renders.at(-1)!;
+    assert.equal(last.text, buildThinkingMenuText());
+    assert.deepEqual(last.markup, buildThinkingMenuReplyMarkup(next));
+    assert.equal(state.threadId, 17);
+  }
+  assert.deepEqual(sets, ["high", "off", "off"]);
+  assert.equal(renders.some(render => render.menuMode === "status"), false);
+  await click("menu:back");
+  assert.equal(state.mode, "status");
+  assert.equal(renders.at(-1)?.text, "Main menu");
+  assert.deepEqual(renders.at(-1)?.markup, buildStatusReplyMarkup(model, "off"));
 });
 
 test("Menu callback handler captures runtime ports", async () => {
@@ -1460,8 +1514,8 @@ test("Menu helpers handle status and thinking callback actions", async () => {
           events.push(`set:${level}`);
         },
         getCurrentThinkingLevel: () => "high",
-        updateStatusMessage: async () => {
-          events.push("status:update");
+        updateThinkingMenuMessage: async () => {
+          events.push("thinking:update");
         },
         answerCallbackQuery: async (_id, text) => {
           events.push(`answer:${text ?? ""}`);
@@ -1492,7 +1546,7 @@ test("Menu helpers handle status and thinking callback actions", async () => {
   assert.equal(events[0], "menu:model");
   assert.equal(events[1], "answer:");
   assert.equal(events[2], "set:high");
-  assert.equal(events[3], "status:update");
+  assert.equal(events[3], "thinking:update");
   assert.equal(events[4], "answer:Thinking: high");
   assert.equal(events[5], "answer:This model has no reasoning controls.");
 });
@@ -1588,6 +1642,8 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
 
 test("Menu action runtime with state builder opens menus from settings runtime", async () => {
   const events: string[] = [];
+  const statusMarkups: unknown[] = [];
+  let pendingCancellations = 1;
   const modelA = createMenuModel("openai", "gpt-5");
   const state = createMenuState<typeof modelA>(2, {
     scope: "all",
@@ -1624,6 +1680,7 @@ test("Menu action runtime with state builder opens menus from settings runtime",
     }),
     getActiveModel: () => modelA,
     getThinkingLevel: () => "medium",
+    getPendingCancellationCount: () => pendingCancellations,
     buildStatusHtml: () => "status",
     storeModelMenuState: (nextState) => {
       events.push(`store:${nextState.messageId}`);
@@ -1631,9 +1688,10 @@ test("Menu action runtime with state builder opens menus from settings runtime",
     isIdle: () => true,
     canOfferInFlightModelSwitch: () => false,
     sendTextReply: async () => {},
-    editInteractiveMessage: async () => {},
-    sendInteractiveMessage: async (_chatId, text) => {
+    editInteractiveMessage: async (_chat, _message, _text, _mode, markup) => { statusMarkups.push(markup); },
+    sendInteractiveMessage: async (_chatId, text, _mode, markup) => {
       events.push(`send:${text}`);
+      if (text === "status") statusMarkups.push(markup);
       return 99;
     },
   });
@@ -1647,6 +1705,14 @@ test("Menu action runtime with state builder opens menus from settings runtime",
     "send:<b>🤖 Choose a model:</b>",
     "store:99",
   ]);
+  const ctx = { cwd: "/repo", modelRegistry: { refresh: () => {}, getAvailable: (): [typeof modelA] => [modelA] } };
+  await runtime.sendStatusMessage(1, 2, ctx);
+  assert.match(JSON.stringify(statusMarkups.at(-1)), /Pending cancellations: 1/);
+  assert.match(JSON.stringify(statusMarkups.at(-1)), /reroutecancel:review:open/);
+  assert.doesNotMatch(JSON.stringify(statusMarkups.at(-1)), /Historical inputs|reroutecancel:history:/);
+  pendingCancellations = 0;
+  await runtime.updateStatusMessage(state, ctx);
+  assert.doesNotMatch(JSON.stringify(statusMarkups.at(-1)), /reroutecancel/);
 });
 
 test("Menu helpers update and send interactive menu messages", async () => {
