@@ -3405,13 +3405,11 @@ for (const grouped of [false, true]) test(`Retain-only historical claims refuse 
     journal.appendBatch([{ update_id: 1, message: { text: "/protected" } }, { update_id: 2, message: { text: "independent" } }]);
     let signal!: AbortSignal;
     const executed: number[] = [];
-    journal.routingInputs!.arm({ journalBindingKey: bindingKey, operatorUserId: 7, isCurrent: () => true,
-      publishedAtMs: Date.now(), entries: [journal.read().entries[0]!] });
     const original = structuredClone(journal.read().entries[0]!);
     const worker = createTelegramUpdateWorkerRuntime<string>({
       journal, getJournalBindingKey: () => bindingKey, hasAuthority: () => true, spendHistoricalInput: true,
       getNowMs: () => Date.now() + 2 * 60 * 60_000,
-      expireRoutingInput() { assert.fail("Retain-only startup originals cannot expire through an old routing clock"); },
+      expireRoutingInput() { assert.fail("A historical original without a saved chooser clock cannot invent expiry"); },
       shouldReviewHistoricalInput(entry, _ctx, captured) { signal = captured; return entry.updateId === 1 ? "retain" : false; },
       executeUpdate(update) {
         executed.push(update.update_id);
@@ -3441,7 +3439,7 @@ for (const grouped of [false, true]) test(`Retain-only historical claims refuse 
 });
 
 for (const fault of ["none", "hold", "authority-before-commit", "classification-error"] as const) {
-  test(`New-world restart spends previous routing inputs without delivery, copy or completion (${fault})`, async () => {
+  test(`New-world restart preserves chooser clocks and spends only unclocked routing input (${fault})`, async () => {
     await withAbandonmentJournal(async ({ journal, bindingKey, path }) => {
       journal.appendBatch([1, 2, 3, 4, 5].map(id => ({ update_id: id, message: { text: `old-${id}` } })), 5);
       const route = (ids: number[]) => ({ journalBindingKey: bindingKey, operatorUserId: 7, isCurrent: () => true, publishedAtMs: Date.now(),
@@ -3471,12 +3469,12 @@ for (const fault of ["none", "hold", "authority-before-commit", "classification-
         } else if (fault === "classification-error") {
           assert.deepEqual(ids(), [1, 2, 3, 4, 5], "an unknown classification never spends or executes");
           failClassification = false; worker.signal(); await worker.waitForDrain();
-          assert.deepEqual(ids(), [4, 5]);
+          assert.deepEqual(ids(), [1, 2, 4, 5]);
         } else if (fault === "authority-before-commit") {
           assert.deepEqual(ids(), [1, 2, 3, 4, 5], "spending commits only under current transport authority");
           authority = true; await worker.stop(); worker.start("ctx"); await worker.waitForDrain();
-          assert.deepEqual(ids(), [4, 5], JSON.stringify(worker.getState()));
-        } else assert.deepEqual(ids(), [4, 5], "armed, selected and classified routing inputs are spent; queued and interrupted work stay");
+          assert.deepEqual(ids(), [1, 2, 4, 5], JSON.stringify(worker.getState()));
+        } else assert.deepEqual(ids(), [1, 2, 4, 5], "clock-bearing sources wait for their deadline; unclocked classified input is spent");
         assert.deepEqual(handled, [], "spending never delivers input");
         assert.deepEqual(completed, [], "spending is not task completion");
         if (fault !== "hold") {
@@ -3490,6 +3488,44 @@ for (const fault of ["none", "hold", "authority-before-commit", "classification-
     });
   });
 }
+
+test("Confirmed chooser expiry clears deferred custody before a stalled or failed observer", async () => {
+  await withAbandonmentJournal(async ({ journal: initial, path, bindingKey }) => {
+    let now = Date.now(), captured!: AbortSignal;
+    const snapshot = initial.read();
+    const journal = createTelegramUpdateJournalStore({ path, profileName: snapshot.profile, botIdentity: snapshot.botIdentity, getNowMs: () => now });
+    journal.appendBatch([{ update_id: 1, message: { text: "terminal source must not become a cleanup retry body" } }]);
+    const armed = journal.routingInputs!.arm({ journalBindingKey: bindingKey, entries: journal.read().entries,
+      operatorUserId: 7, publishedAtMs: now, isCurrent: () => true });
+    now = armed[0]!.routingInput!.expiresAtMs;
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), delays: number[] = [];
+    const worker = createTelegramUpdateWorkerRuntime<string>({
+      journal, getJournalBindingKey: () => bindingKey, getNowMs: () => now, hasAuthority: () => true,
+      executeUpdate() { assert.fail("An expired chooser source never executes"); },
+      scheduleRetry(_callback, delay) { delays.push(delay); return 0; }, cancelRetry() {},
+      async expireRoutingInput(source, _ctx, signal) {
+        captured = signal;
+        assert.ok(source.expire());
+        entered.resolve();
+        await release.promise;
+        throw new Error("fixture permanent post-expiry observer failure");
+      },
+    });
+    try {
+      worker.start("ctx"); await entered.promise;
+      assert.equal(journal.read().entries.length, 0);
+      assert.equal(worker.getState().deferredClaimCount, 0);
+      assert.equal(worker.getState().abandoningClaimCount ?? 0, 0);
+      assert.equal(worker.isRoutingInputCurrent?.({ updateId: 1, signal: captured }), false, "No source body stays in deferredSources while the observer is stalled");
+      release.resolve(); await worker.waitForDrain();
+      assert.deepEqual(delays, [], "Post-ACK failure never schedules a source retry");
+      worker.signal(); await worker.waitForDrain();
+      assert.equal(worker.getState().phase, "idle");
+      assert.ok(journal.routingInputs!.inspectExpiry(1));
+      assert.equal(journal.inspectAbandonedPending(1), undefined);
+    } finally { release.resolve(); await worker.stop(); }
+  });
+});
 
 test("Held preparation is once per quiescent owner and never joins worker drain or shutdown", async () => {
   await withAbandonmentJournal(async ({ journal, bindingKey }) => {

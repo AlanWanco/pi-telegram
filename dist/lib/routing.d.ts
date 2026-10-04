@@ -121,6 +121,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     captureWorkspaceExternalProtection?: ReturnType<typeof createTelegramWorkspaceExternalProtectionCapture>;
     /** Strict committed abandonment plus retained original; shared by Restore and temporary-input cancellation. */
     inspectRestoreSourceAbandonment?: (updateId: number, journalBindingKey: string) => Threads.TelegramTemporaryThreadCancellationEvidence | undefined;
+    inspectRoutingInputGroupExpiry?: (input: Threads.TelegramTemporaryThreadInput) => readonly Threads.TelegramTemporaryThreadCancellationEvidence[] | undefined;
     /** Strict active-journal observation only; a hint or missing source never substitutes for this ACK. */
     inspectRestoreSourceCompletion?: (expected: Updates.TelegramDeferredSourceEvidence & {
         completionSha256: string;

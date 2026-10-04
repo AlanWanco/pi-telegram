@@ -374,6 +374,9 @@ export interface TelegramRoutingInputAuthority {
     operatorUserId: number;
     isCurrent(): boolean;
 }
+/** Expiry drops a donor attempt without retaining its body or claiming recipient execution/cancellation. */
+export type TelegramRoutingInputExpiryResult = Omit<TelegramUpdateJournalPendingAbandonmentResult, "retainedPath">;
+export type TelegramRoutingInputExpiryEvidence = Omit<TelegramUpdateJournalAbandonedPendingEvidence, "retainedPath">;
 /** Package-private v1 capability; raw input custody does not expose it. */
 export interface TelegramRoutingInputJournal {
     arm(input: TelegramRoutingInputAuthority & {
@@ -385,7 +388,9 @@ export interface TelegramRoutingInputJournal {
     };
     expire(input: Omit<TelegramRoutingInputAuthority, "entries"> & {
         entry: TelegramUpdateJournalEntry;
-    }): TelegramUpdateJournalPendingAbandonmentResult;
+    }): TelegramRoutingInputExpiryResult;
+    inspectExpiry(updateId: number): TelegramRoutingInputExpiryEvidence | undefined;
+    inspectGroupExpiry(updateIds: readonly number[]): TelegramRoutingInputExpiryEvidence[] | undefined;
 }
 export interface TelegramUpdateJournalStore {
     routingInputs?: TelegramRoutingInputJournal;
@@ -804,6 +809,7 @@ export interface TelegramUpdateJournalBindingRuntime {
     getActiveRecoveryKey: () => string | undefined;
     /** Exact historical proof lookup; no store, admission, execution, recovery or mutation port. */
     inspectSourceAbandonment: (journalBindingKey: string, updateId: number) => TelegramUpdateJournalAbandonedPendingEvidence | undefined;
+    inspectSourceGroupExpiry: (journalBindingKey: string, updateIds: readonly number[]) => TelegramRoutingInputExpiryEvidence[] | undefined;
     inspectSourceCompletion: (journalBindingKey: string, expected: TelegramUpdateJournalSourceCompletion) => TelegramUpdateJournalSourceCompletion | undefined;
     inspectQueuedReceipt: (journalBindingKey: string, expected: TelegramUpdateJournalQueuedCompletion) => TelegramUpdateJournalQueuedReceiptEvidence | undefined;
     /** In-process `/new` succession: move unclaimed predecessor pending inputs into the successor session journal. */

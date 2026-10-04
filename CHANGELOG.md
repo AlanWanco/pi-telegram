@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.52.1: Finite chooser lifetime, continue cancellation and callback copy
+
+- `Chooser expiry`: Fixed 60-minute clocks end unselected/unacknowledged donor routing without archives or replay. Fully resolved disposable tabs use fenced one-shot cleanup; accepted queues, independent work and restored Threads survive. Confirmed expiry clears worker custody even if cleanup fails; metadata retries use body-free proof and never repeat an issued delete. Cold startup preserves deadlines, and queue admission retains selected lifetime metadata.
+- `Continue cancellation`: Negative reactions to an original standalone `/continue` now settle and remove its exact waiting continuation, even while other work runs. Other prompts, the Pi-owned dispatched head, active work and synthetic model continuations remain untouched. Positive reactions preserve the control lane; failed receipt settlement keeps the item waiting, and duplicate reactions cannot cancel twice.
+- `Callback copy`: Shared typed callback toasts omit a terminal sentence period on direct and follower delivery. Questions, exclamations, ellipses, in-chat notices and explicit raw API payloads keep their punctuation.
+
 ## 0.52.0: Workspace Restore, routing lifetime and resilient runtime storage
 
 - `Restore foundation`: One snapshot owns binding, slot, targets and one-shot grants. Publication and late creation receipts share a transaction; unnamed owners round-trip. Unknown or contradictory creation evidence blocks new Restore; absence and expiry never prove availability. Loading validates receipts before replacing working state, preserving disk, memory and source protection on conflict. Recovered targets survive expiry; conflicting creation stays blocked.

@@ -2750,6 +2750,47 @@ export function createTelegramTopicTargetStore(options) {
                     });
                     return recorded && current() ? recorded : undefined;
                 },
+                recordTemporaryThreadInputExpiry(expected, inputValue, authority, inspect) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input) || typeof inspect !== "function")
+                        return undefined;
+                    const operator = authority.operatorUserId, executor = structuredClone(authority.executor);
+                    const bound = classifyTemporaryTarget(read(), expected).kind === "bound";
+                    const current = () => authority.isCurrent() && authority.operatorUserId === operator &&
+                        isDeepStrictEqual(authority.executor, executor) && input.updateIds.every(updateId => {
+                        const evidence = inspect(updateId);
+                        return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId &&
+                            evidence.operatorAuthorityId === `telegram-owner:${operator}`;
+                    }) && authority.isCurrent();
+                    return advanceTemporary(expected, { ...authority, isCurrent: current }, (entry, file) => {
+                        if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(value => isDeepStrictEqual(value, input)) ||
+                            entry.completedInputs?.some(value => isDeepStrictEqual(value, input)))
+                            return false;
+                        const cancelled = entry.cancelledInputs ?? [];
+                        if (cancelled.some(value => isDeepStrictEqual(value, input)))
+                            return "unchanged";
+                        const operations = file.operations.filter(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+                            request.source.updateIds.some(id => input.updateIds.includes(id)));
+                        if (operations.some(({ request }) => !request.source.updateIds.every(id => input.updateIds.includes(id))))
+                            return false;
+                        // Forget only expired donor intent; canonical binding, recipient queue and immutable settlement proofs are untouched.
+                        file.operations = file.operations.filter(value => !operations.includes(value));
+                        // Once bound, this is no longer a disposable tab. Forget its temporary frame, not the binding or other journal sources.
+                        if (bound) {
+                            file.temporaryThreads = file.temporaryThreads?.filter(value => value !== entry);
+                            if (!file.temporaryThreads?.length)
+                                delete file.temporaryThreads;
+                            return true;
+                        }
+                        const forwarded = entry.forwardedInputs?.filter(value => !isDeepStrictEqual(value, input));
+                        if (forwarded?.length)
+                            entry.forwardedInputs = forwarded;
+                        else
+                            delete entry.forwardedInputs;
+                        entry.cancelledInputs = [...cancelled, input];
+                        return true;
+                    });
+                },
                 recordTemporaryThreadForwardIssued(expected, inputValue, authority) {
                     const input = structuredClone(inputValue);
                     if (!isTemporaryThreadInput(input))
@@ -2808,7 +2849,7 @@ export function createTelegramTopicTargetStore(options) {
                         return entry;
                     });
                 },
-                forgetPreviousWorld(authority) {
+                forgetPreviousWorld(authority, preserveTemporaryTokens = []) {
                     if (!authority.isCurrent())
                         return undefined;
                     const executor = structuredClone(authority.executor), operator = authority.operatorUserId;
@@ -2817,13 +2858,14 @@ export function createTelegramTopicTargetStore(options) {
                     const current = () => authority.isCurrent() && authority.operatorUserId === operator && isDeepStrictEqual(authority.executor, executor);
                     const previous = (value) => value.operatorUserId === operator && value.executor.instanceId !== executor.instanceId;
                     const before = storage.read(), file = structuredClone(before);
-                    const operations = file.operations.filter(previous), temporaryThreads = (file.temporaryThreads ?? []).filter(previous);
+                    const forgetTemporary = (value) => previous(value) && !preserveTemporaryTokens.includes(value.token);
+                    const operations = file.operations.filter(previous), temporaryThreads = (file.temporaryThreads ?? []).filter(forgetTemporary);
                     if (!current())
                         return undefined;
                     if (!operations.length && !temporaryThreads.length)
                         return { operations, temporaryThreads };
                     file.operations = file.operations.filter(value => !previous(value));
-                    const remaining = (file.temporaryThreads ?? []).filter(value => !previous(value));
+                    const remaining = (file.temporaryThreads ?? []).filter(value => !forgetTemporary(value));
                     if (remaining.length)
                         file.temporaryThreads = remaining;
                     else

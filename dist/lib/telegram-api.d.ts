@@ -514,6 +514,8 @@ export declare function fetchTelegramBotIdentity(botToken: string, fetchImpl?: t
  */
 export declare function callTelegramMultipart<TResponse>(botToken: string | undefined, method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions): Promise<TResponse>;
 export declare function downloadTelegramFile(botToken: string | undefined, fileId: string, suggestedName: string, tempDir: string, options?: TelegramFileDownloadOptions): Promise<string>;
+/** Tooltip-like callback answers omit a terminal sentence period; ellipses and other punctuation stay literal. */
+export declare function formatTelegramCallbackAnswerText(text: string | undefined): string | undefined;
 export declare function answerTelegramCallbackQuery(botToken: string | undefined, callbackQueryId: string, text?: string, options?: TelegramAnswerCallbackQueryOptions): Promise<void>;
 export declare function createTelegramChatActionSender<TAction extends string>(sendChatAction: (chatId: number, action: TAction, options?: {
     message_thread_id?: number;

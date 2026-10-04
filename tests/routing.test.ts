@@ -51,6 +51,62 @@ import { createTelegramBusLeaderRuntime } from "../lib/bus-leader.ts";
 import { createRouteHarness, type RouteHarnessOptions, type TestContext, type TestModel,
   type TestMessage, type TestCallbackQuery, type TestUpdate, type TestUser } from "./fixtures/routing.ts";
 
+for (const mode of ["waiting", "positive", "foreign-user", "foreign-chat", "dispatched", "started", "receipt-failure"] as const) {
+  test(`Standalone continue reaction keeps exact queue and durable source ownership (${mode})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "telegram-continue-reaction-"));
+    let now = Date.now(), refuseSettlement = mode === "receipt-failure", discarded = 0;
+    const options = { path: join(dir, "inbox.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:continue" }), getNowMs: () => now };
+    const journal = Journal.createTelegramUpdateJournalStore(options), key = Journal.createTelegramUpdateJournalBindingKey(options);
+    const ctx = { cwd: "/repo" };
+    let worker: Updates.TelegramUpdateWorkerRuntime<TestContext>;
+    const harness = createRouteHarness({ getAdmissionJournalBinding: () => key, isContextActive: () => true,
+      onItemsDiscarded(items, current) {
+        if (refuseSettlement) throw new Error("fixture continue settlement refused");
+        assert.equal(worker.completeQueueReceipts({ receipts: items.flatMap(item => item.admissionReceipts ?? []), ctx: current, reason: "discard" }), true);
+        discarded++;
+      } });
+    worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
+      journal, getJournalBindingKey: () => key, hasAuthority: () => true, getNowMs: () => now,
+      getQueueOwnerIdentity: () => ({ instanceId: "leader-a", processId: process.pid, processBirthId: "fixture-continue", sessionGeneration: 1 }),
+      scheduleRetry() { return 0; }, cancelRetry() {},
+      defaultHandle: (update, current, execution) => harness.routeRuntime.handleUpdate(update, current, execution),
+    });
+    const feed = async (update: TestUpdate & Journal.TelegramJournaledUpdate) => { journal.appendBatch([update]); worker.signal(); await worker.waitForDrain(); };
+    const reaction = (id: number): TestUpdate & Journal.TelegramJournaledUpdate => ({ update_id: id, message_reaction: { message_id: 12,
+      chat: { id: mode === "foreign-chat" ? 200 : 100, type: "private" }, user: { id: mode === "foreign-user" ? 8 : 7, is_bot: false },
+      old_reaction: [], new_reaction: [{ type: "emoji", emoji: mode === "positive" ? "👍" : "👎" }] } });
+    try {
+      worker.start(ctx); await worker.waitForDrain();
+      await feed({ update_id: 1, message: { message_id: 11, chat: { id: 100, type: "private" }, from: { id: 7, is_bot: false }, text: "unrelated prompt" } });
+      await feed({ update_id: 2, message: { message_id: 12, chat: { id: 100, type: "private" }, from: { id: 7, is_bot: false }, text: "/continue" } });
+      const [continuation, ordinary] = harness.telegramQueueStore.getQueuedItems();
+      assert.equal(continuation?.kind, "prompt"); assert.equal(continuation?.queueLane, "control");
+      assert.equal(journal.read().entries.find(entry => entry.updateId === 2)?.state, "queued", "The continuation owns an actual durable receipt");
+      if (mode === "dispatched") harness.bridgeRuntime.lifecycle.setDispatchPending(true);
+      else if (mode === "started") {
+        assert.equal(worker.completeQueueReceipts({ receipts: continuation!.admissionReceipts!, ctx, reason: "prompt-handoff" }), true);
+        harness.activeTurnRuntime.set(continuation as Queue.PendingTelegramTurn);
+        harness.telegramQueueStore.setQueuedItems([ordinary!]);
+      } else harness.activeTurnRuntime.set({ ...(ordinary as Queue.PendingTelegramTurn), sourceMessageIds: [99], admissionReceipts: [] });
+      await feed(reaction(3));
+      if (mode === "receipt-failure") {
+        assert.equal(harness.telegramQueueStore.getQueuedItems()[0], continuation, "Failed settlement keeps the exact continuation waiting");
+        assert.equal(journal.read().entries.find(entry => entry.updateId === 2)?.state, "queued");
+        refuseSettlement = false; now += 2000; worker.signal(); await worker.waitForDrain();
+      }
+      const cancelled = mode === "waiting" || mode === "receipt-failure";
+      assert.deepEqual(harness.telegramQueueStore.getQueuedItems(), cancelled || mode === "started" ? [ordinary] : [continuation, ordinary]);
+      assert.equal(discarded, cancelled ? 1 : 0);
+      if (cancelled) {
+        assert.equal(journal.read().entries.some(entry => entry.updateId === 2), false);
+        await feed(reaction(4)); assert.equal(discarded, 1, "Repeated dislike cannot settle the continuation twice");
+      }
+      assert.equal(harness.activeTurnRuntime.has(), mode !== "dispatched", "Dislike does not abort any started work");
+      assert.equal(continuation?.queueLane, "control", "Reactions never demote the continuation to the normal lane");
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
 async function openRerouteSubmenu(routeRuntime: ReturnType<typeof createRouteHarness>["routeRuntime"], events: string[], rerouteId = "1"): Promise<string> {
   await routeRuntime.handleUpdate({ callback_query: { id: `open-${rerouteId}`, from: { id: 7, is_bot: false },
     message: { message_id: 99, chat: { id: 100, type: "private" } }, data: `reroutemenu:${rerouteId}` } }, { cwd: "/repo" });
@@ -2750,8 +2806,8 @@ for (const scenario of ["bound", "drift", "forwarded", "projected-media"] as con
   });
 });
 
-for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restart", "stale-timer", "missing-view", "retention-fault", "lost-ack", "group", "group-half-hour", "unconfirmed", "clock-before", "clock-after", "refused-restore", "wrong-target", "selection-fault", "operator-loss", "epoch-loss", "authority-loss", "binding-loss", "selection-boundary"] as const) {
-  test(`Native unselected routing TTL retains originals without deleting tabs (${scenario})`, async () => {
+for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restart", "stale-timer", "missing-view", "expiry-fault", "lost-ack", "group", "group-half-hour", "unconfirmed", "clock-before", "clock-after", "refused-restore", "wrong-target", "selection-fault", "operator-loss", "epoch-loss", "authority-loss", "binding-loss", "selection-boundary"] as const) {
+  test(`Native routing TTL discards chooser sources without archiving or touching unowned tabs (${scenario})`, async () => {
     await withTopicStore(async (threadStore, path) => {
       threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId: 100, threadId: 42 }, status: "active",
         createdAtMs: 1, updatedAtMs: 1, instanceId: "leader-a", slot: "A", threadName: "Axial" });
@@ -2762,7 +2818,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
         onPublicationBoundary(point: string, target: string) {
           const retention = target.startsWith(`${path}.ttl.retained`);
           if (point === "before-write" && retention) copies++;
-          if (fault && scenario !== "lost-ack" && point === "before-write" && retention) throw new Error("fixture TTL retention failed");
+          if (fault && scenario === "expiry-fault" && point === "before-write" && !retention) throw new Error("fixture TTL expiry failed");
         } };
       const binding = Journal.createTelegramUpdateJournalBindingKey(options); currentBinding = binding;
       const journal = Journal.createTelegramUpdateJournalStore(options);
@@ -2782,6 +2838,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
         if (fault && scenario === "lost-ack") { fault = false; throw new Error("fixture TTL removal ACK lost"); }
         return result;
       } };
+      let carrier: TestMessage | undefined;
       const edits: string[] = [], completed: number[] = [], timers: Array<{ callback: () => void; delay: number; cancelled: boolean }> = [];
       let apiCalls = 0;
       const createHarness = () => createRouteHarness({ threadStore, isContextActive: () => active,
@@ -2802,11 +2859,15 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
       let harness = createHarness();
       const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
         journal, getJournalBindingKey: () => currentBinding, hasAuthority: () => true, isContextCurrent: () => active,
+        getQueueOwnerIdentity: () => ({ instanceId: "leader-a", processId: process.pid, processBirthId: "fixture-ttl", sessionGeneration: 1 }),
         getNowMs: () => now, scheduleRetry(callback, delay) { const timer = { callback, delay, cancelled: false }; timers.push(timer); return timer; },
         cancelRetry(handle) { (handle as typeof timers[number]).cancelled = true; },
         expireRoutingInput: (source, ctx, signal) => harness.routeRuntime.expireRoutingInput(source, ctx, signal),
         shouldReviewHistoricalInput: (entry, ctx, signal) => harness.routeRuntime.shouldReviewHistoricalInput(entry, ctx, signal),
-        defaultHandle: (update, ctx, execution) => harness.routeRuntime.handleUpdate(update, ctx, execution),
+        defaultHandle: (update, ctx, execution) => {
+          if (update.update_id === 123) carrier = update.message;
+          return harness.routeRuntime.handleUpdate(update, ctx, execution);
+        },
         onUpdateCompleted: id => completed.push(id),
         recordRuntimeEvent: (category, error, details) => harness.events.push(`worker:${category}:${String(error)}:${JSON.stringify(details)}`),
       });
@@ -2837,7 +2898,8 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
           await click("reroute:1:42");
           assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0, "Unknown clock publication cannot skip selection authority");
           now = 4_000_000; worker.signal(); await worker.waitForDrain();
-          assert.equal(journal.read().entries.some(entry => entry.updateId === 123), true);
+          assert.equal(journal.read().entries.some(entry => entry.updateId === 123), scenario === "clock-before", "A lost clock ACK reconciles only exact persisted lifetime metadata");
+          if (scenario === "clock-after") assert.equal(Updates.getTelegramUpdateExecutionFence(carrier)?.isCurrent(), false);
           await worker.stop(); harness = createHarness(); worker.start({ cwd: "/repo" }); await worker.waitForDrain();
           assert.equal(journal.read().entries.some(entry => entry.updateId === 123), scenario === "clock-before", "Reconstruction uses only a positively retained clock");
           assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
@@ -2855,7 +2917,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
           assert.equal(journal.read().entries.find(value => value.updateId === 123)?.routingInput?.phase, "selected");
           if (grouped) assert.equal(journal.read().entries.find(value => value.updateId === 124)?.routingInput?.phase, "selected");
           now = 4_000_000; worker.signal(); await worker.waitForDrain();
-          assert.equal(journal.read().entries.find(value => value.updateId === 123)?.routingInput?.phase, "selected");
+          assert.equal(journal.read().entries.find(value => value.updateId === 123)?.routingInput?.phase, "selected", JSON.stringify({ events: harness.events, state: worker.getState(), entries: journal.read().entries }));
           assert.equal(harness.telegramQueueStore.getQueuedItems().length, 1);
           assert.equal(journal.read().operatorDispositions, undefined); return;
         }
@@ -2865,8 +2927,8 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
           now = 4_000_000; worker.signal(); await worker.waitForDrain();
           await click("reroute:1:42", 201);
           assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
-          assert.equal(journal.read().operatorDispositions, undefined);
-          assert.equal(journal.read().entries.some(entry => entry.updateId === 123), true); return;
+          assert.equal(journal.routingInputs!.inspectExpiry(123)?.operatorAuthorityId, "telegram-owner:7");
+          assert.equal(journal.read().entries.some(entry => entry.updateId === 123), false); return;
         }
         if (scenario === "refused-restore" || scenario === "wrong-target") {
           await click(scenario === "refused-restore" ? "reroutenew:1:42" : "reroute:1:43");
@@ -2889,7 +2951,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
         if (scenario === "binding-loss") currentBinding = "foreign";
         now = original.routingInput!.expiresAtMs;
         if (scenario === "selection-boundary") await click("reroute:1:42");
-        fault = scenario === "retention-fault" || scenario === "lost-ack";
+        fault = scenario === "expiry-fault" || scenario === "lost-ack";
         const timer = timers.findLast(value => !value.cancelled);
         timer?.callback(); worker.signal(); await worker.waitForDrain();
         if (scenario === "authority-loss" || scenario === "binding-loss" || scenario === "operator-loss" || scenario === "epoch-loss") {
@@ -2898,7 +2960,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
         if (scenario === "lost-ack") {
           assert.equal(journal.read().entries.some(value => value.updateId === 123), false);
           worker.signal(); await worker.waitForDrain();
-          assert.equal(copies, 1, "Lost expiry ACK reads exact retained disposition without another copy");
+          assert.equal(copies, 0, "Lost expiry ACK reconciles a body-free discard tombstone");
         }
         if (fault) {
           assert.equal(journal.read().entries.some(value => value.updateId === 123), true);
@@ -2906,16 +2968,26 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "restar
           fault = false; worker.signal(); await worker.waitForDrain();
         }
         assert.equal(journal.read().entries.some(value => value.updateId === 123), false, JSON.stringify({ events: harness.events, state: worker.getState() }));
-        const retention = journal.inspectAbandonedPending(123)!;
-        assert.deepEqual(JSON.parse(await readFile(retention.retainedPath, "utf8")).entry, original);
+        assert.equal(journal.inspectAbandonedPending(123), undefined);
+        assert.equal(journal.routingInputs!.inspectExpiry(123)?.operatorAuthorityId, "telegram-owner:7");
+        assert.equal(copies, 0, "TTL never archives prompt bodies");
         if (grouped) {
           assert.equal(journal.read().entries.some(value => value.updateId === 124), false);
-          assert.deepEqual(JSON.parse(await readFile(journal.inspectAbandonedPending(124)!.retainedPath, "utf8")).entry, originals[1]);
+          assert.ok(journal.routingInputs!.inspectExpiry(124));
         }
         assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
         assert.equal(completed.includes(123), false, "Expiry is not task completion");
         if (scenario === "expiry") assert.deepEqual(edits.filter(text => text.includes("\u231b")), ["<b>\u231b Routing choice expired.</b>"]);
-        assert.equal(apiCalls, initialApiCalls, "TTL never probes or deletes a tab");
+        assert.equal(apiCalls, initialApiCalls, "TTL never probes or deletes an unowned tab");
+        if (scenario === "expiry") {
+          assert.equal(Updates.getTelegramUpdateExecutionFence(carrier)?.isCurrent(), false);
+          Updates.reportTelegramUpdateCompleted(carrier);
+          Updates.reportTelegramQueueAdmission([carrier], [{ receiptId: "too-late", queueKind: "prompt", sourceUpdateIds: [123], journalBindingKey: binding }]);
+          await new Promise<void>(resolve => setImmediate(resolve)); await worker.waitForDrain();
+          assert.equal(Updates.getTelegramUpdateExecutionFence(carrier)?.isCurrent(), false, "A late report cannot revive an expired carrier");
+          assert.equal(worker.getState().phase, "idle", "A late report does not block unrelated work");
+          assert.equal(journal.read().entries.length, 0);
+        }
         assert.equal(journal.read().operatorDispositions?.length, grouped ? 2 : 1);
         await click("reroute:1:42", 201);
         assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0, "Stale chooser cannot revive archived input");
@@ -3099,7 +3171,7 @@ const ALL_COMMAND_SCENARIOS = {
 type AllCommandScenario = (typeof ALL_COMMAND_SCENARIOS)[keyof typeof ALL_COMMAND_SCENARIOS][number];
 
 function createAllCommandFixture(scenario: AllCommandScenario,
-  { threads, open, path }: Parameters<Parameters<typeof fixture>[0]>[0], journalPath = `${path}.all`) {
+  { threads, open, path }: Parameters<Parameters<typeof fixture>[0]>[0], journalPath = `${path}.all`, expiryClock?: () => number) {
   const asFollower = scenario.includes("-follower"), realIpc = scenario.includes("-ipc"), drainRecipient = scenario.includes("-worker"), loseDeliveryReply = scenario.includes("-lost-reply");
   const restoreReplyBoundary = scenario === "restore-sibling-follower-ipc-apply-before-reply" ? "before" :
     scenario === "restore-sibling-follower-ipc-apply-after-reply" || scenario === "restore-sibling-follower-ipc-inspect-after-reply" ? "after" : undefined;
@@ -3113,19 +3185,21 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     const finished = new Promise<void>(resolve => { finish = resolve; });
     restoreReplyGates.set(mode, { wait, release, finished, finish });
   }
-  const options = { path: journalPath, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:all" }) };
+  const options = { path: journalPath, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:all" }),
+    ...(expiryClock ? { getNowMs: expiryClock } : {}) };
   const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
   const resolve = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined,
     getBotToken: () => "fixture:all", getBotId: () => undefined, getJournalPath: () => options.path,
     withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(path) }).withSourceSerialization });
   const journal = resolve()!.journal;
+  if (expiryClock) journal.routingInputs = Journal.createTelegramUpdateJournalStore(options).routingInputs;
   const queuedCommand = scenario.startsWith("restore-queue-") || scenario.startsWith("restore-sibling-from-prompt") ||
     scenario === "membership-media-group" || scenario === "membership-text-real-gate";
   const queueOwnedRestore = queuedCommand || scenario === "restore-sibling-after-forward";
   const selectedRestoreUpdateId = scenario.startsWith("restore-sibling-from-prompt") || scenario === "restore-sibling-after-forward" ? 150 : 123;
   const expired = scenario.startsWith("expired");
   // Cancel needs fresh-cancellation evidence: the command must arrive after the worker's first snapshot.
-  const arrivesLive = scenario.startsWith("cancel") || scenario.startsWith("cleanup-") || scenario.endsWith("-retry") || scenario.endsWith("-restart") || scenario.startsWith("restore-sibling-from-prompt") ||
+  const arrivesLive = !!expiryClock || scenario.startsWith("cancel") || scenario.startsWith("cleanup-") || scenario.endsWith("-retry") || scenario.endsWith("-restart") || scenario.startsWith("restore-sibling-from-prompt") ||
     scenario === "membership-media-group" || scenario === "membership-text-real-gate" || scenario === "forward-prompt-then-cancel";
   const appendOriginal = () => journal.appendBatch([{ update_id: 123, message: { message_id: 12,
     date: Math.floor(Date.now() / 1000) - (expired ? 7200 : 0), chat: { id: 7, type: "private" },
@@ -3315,6 +3389,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
       if (scenario === "cleanup-proof-lost" && proofLost) return undefined;
       return observed;
     },
+    inspectRoutingInputGroupExpiry(input) { return journal.routingInputs?.inspectGroupExpiry(input.updateIds); },
     inspectRestoreSourceCompletion(expected) {
       assert.equal(expected.journalBindingKey, bindingKey);
       const proof = resolve()!.journal.inspectSourceCompletion({ updateId: expected.updateId,
@@ -3350,13 +3425,17 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   const completedHints: number[] = [];
   const createWorker = (reviewHistorical = false, sourceJournal: Updates.TelegramUpdateWorkerJournalPort = journal,
     onHeldSourcesPrepared?: Updates.TelegramUpdateWorkerRuntimeDeps<TestContext>["onHeldSourcesPrepared"]) => Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
-    onHeldSourcesPrepared, journal: sourceJournal, ...(reviewHistorical ? { shouldReviewHistoricalInput: (entry, ctx, signal) => harness.routeRuntime.shouldReviewHistoricalInput(entry, ctx, signal) } : {}), getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
+    onHeldSourcesPrepared, journal: sourceJournal,
+    ...(expiryClock ? { getNowMs: expiryClock, spendHistoricalInput: true,
+      expireRoutingInput: (source, ctx, signal) => harness.routeRuntime.expireRoutingInput(source, ctx, signal) } : {}),
+    ...(reviewHistorical ? { shouldReviewHistoricalInput: (entry, ctx, signal) => harness.routeRuntime.shouldReviewHistoricalInput(entry, ctx, signal) } : {}), getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
     getQueueOwnerIdentity: queueOwnedRestore ? () => ({ instanceId: "old", processId: process.pid,
       processBirthId: `${process.pid}:temp-queue`, sessionGeneration: 1 }) : undefined,
     beforeQueueReceiptPublished: queueOwnedRestore ? harness.routeRuntime.beforeQueueReceiptPublished : undefined,
     onQueueReceiptCommitted: queueOwnedRestore ? (receipt, ctx) => harness.routeRuntime.onQueueReceiptCommitted(receipt, ctx) : undefined,
     onQueueReceiptCompleted: harness.routeRuntime.onQueueReceiptCompleted,
     onUpdateCompleted: (id, ctx, key) => { completedHints.push(id); harness.routeRuntime.onUpdateCompleted(id, ctx, key); },
+    recordRuntimeEvent: (category, error, details) => harness.events.push(`worker:${category}:${String(error)}:${JSON.stringify(details)}`),
     async defaultHandle(update, ctx, execution) { workerContext = ctx; await harness.routeRuntime.handleUpdate(update, ctx, execution); } });
   let worker = createWorker();
   let callbackId = 200;
@@ -3475,6 +3554,155 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   };
 }
 type AllCommandFixture = ReturnType<typeof createAllCommandFixture>;
+
+for (const mode of ["unselected", "restart", "cold-leader", "multiple-choosers", "partial-cohort", "metadata-before", "metadata-after", "metadata-permanent", "expiry-delete-unknown", "lost-forward", "lost-restore", "restore-queued", "independent-work"] as const) {
+  test(`Chooser expiry ends donor custody without archiving or cancelling recipient work (${mode})`,
+    { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async testContext => {
+    await fixture(async frame => {
+      let now = Date.now();
+      const scenario = mode === "lost-forward" ? "forward-sibling-follower-ipc-lost-reply" :
+        mode === "lost-restore" ? "restore-sibling-follower-ipc-lost-reply" : mode === "restore-queued" ? "restore-queue-continue" : mode === "expiry-delete-unknown" ? "cleanup-delete-fails" : "cancel";
+      const f = createAllCommandFixture(scenario, frame, `${frame.path}.expiry`, () => Math.max(now, Date.now()));
+      let metadataBlocked = mode === "metadata-permanent", metadataAttempts = 0, generation = 1;
+      let expiryStore: Threads.TelegramWorkspaceRestore | undefined;
+      const mockedCleanup = mode === "metadata-before" || mode === "metadata-permanent" || mode === "expiry-delete-unknown";
+      if (mode === "metadata-before" || mode === "metadata-after" || mode === "metadata-permanent") {
+        let fail = true;
+        const store = { ...f.store, recordTemporaryThreadInputExpiry(...args: Parameters<Threads.TelegramWorkspaceRestore["recordTemporaryThreadInputExpiry"]>) {
+          metadataAttempts++;
+          if (metadataBlocked) throw new Error("fixture persistent expiry metadata failure");
+          if (fail && mode === "metadata-before") { fail = false; throw new Error("fixture expiry metadata refused"); }
+          const result = f.store.recordTemporaryThreadInputExpiry(...args);
+          if (fail) { fail = false; throw new Error("fixture expiry metadata ACK lost"); }
+          return result;
+        } };
+        expiryStore = store;
+        f.harness = f.createHarness({ getWorkspaceRestoreStore: () => store, getSessionGeneration: () => generation }); f.worker = f.createWorker();
+      }
+      try {
+        await f.start();
+        if (mode === "multiple-choosers") await f.typeInTab(150, "unselected sibling");
+        if (mode === "partial-cohort") {
+          // Supplied grouped chooser publication and one earlier donor ACK; all mutations use native journal/Workspace ports.
+          f.journal.appendBatch([150, 151].map(id => ({ update_id: id, message: { message_id: id, message_thread_id: 55,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: `grouped member ${id}` } })));
+          const armed = f.journal.routingInputs!.arm({ entries: f.journal.read().entries.filter(entry => entry.updateId >= 150),
+            journalBindingKey: f.bindingKey, operatorUserId: 7, publishedAtMs: Math.max(now, Date.now()), isCurrent: () => true });
+          f.journal.routingInputs!.select({ entries: armed, journalBindingKey: f.bindingKey, operatorUserId: 7, isCurrent: () => true });
+          const entry = f.store.listTemporaryThreads()[0]!, group = { journalBindingKey: f.bindingKey, updateIds: [150, 151] };
+          const authority = { executor: entry.executor, operatorUserId: 7, isCurrent: () => true };
+          const member = f.store.recordTemporaryThreadInput(entry, group, authority)!;
+          assert.ok(f.store.recordTemporaryThreadForwardIssued(member, group, authority));
+          f.recipientJournal.appendBatch([{ update_id: 150, message: { message_id: 150, message_thread_id: 10,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "accepted grouped member" } }]);
+          f.journal.removeCompleted([150]);
+          f.worker.signal(); await f.worker.waitForDrain();
+        }
+        const original = f.journal.read().entries.find(entry => entry.updateId === 123)!;
+        assert.equal(original.routingInput?.phase, "waiting", JSON.stringify(f.harness.events));
+        const deadline = Math.max(...f.journal.read().entries.filter(entry => entry.routingInput).map(entry => entry.routingInput!.expiresAtMs));
+        const route = f.routeOf(0), cancel = f.cancelOf(0);
+        if (mode === "lost-forward") await f.click(route);
+        if (mode === "lost-restore" || mode === "restore-queued") {
+          const restore = f.choosers[0]!.markup.match(/reroutemenu:([a-z0-9]+)/)![1];
+          await f.click(`reroutenew:${restore}:10`);
+        }
+        const recipientBefore = structuredClone(f.recipientJournal.read().entries);
+        if (mode === "lost-forward" || mode === "lost-restore") assert.equal(recipientBefore.length, 1, JSON.stringify({ events: f.harness.events, entries: f.journal.read().entries }));
+        const queueBefore = f.harness.telegramQueueStore.getQueuedItems();
+        if (mode === "restore-queued") {
+          assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "queued", JSON.stringify({ events: f.harness.events, entries: f.journal.read().entries }));
+          assert.equal(queueBefore.length, 1);
+        }
+        if (mode === "independent-work") {
+          f.journal.appendBatch([{ update_id: 150, message: { message_id: 30, message_thread_id: 55,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "independent accepted work" } }]);
+          f.journal.markQueued({ queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [150],
+            owner: { instanceId: "independent", processId: process.pid, processBirthId: "fixture-independent", sessionGeneration: 1 } });
+        }
+        if (mode === "restart" || mode === "cold-leader") {
+          await f.worker.stop();
+          const forgotten = Promise.withResolvers<void>();
+          f.harness = f.createHarness(mode === "cold-leader" ? { instanceId: "successor", hasWorkspaceRestoreAuthority: () => true } : {});
+          f.worker = f.createWorker(true, f.journal, mode === "cold-leader" ? async input => {
+            await f.harness.routeRuntime.forgetPreviousWorld(input, () => () => true); forgotten.resolve();
+          } : undefined);
+          f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+          if (mode === "cold-leader") {
+            await forgotten.promise;
+            assert.equal(f.store.listTemporaryThreads().length, 1, "Cold forgetting preserves the acknowledged disposable tab until expiry");
+          }
+          assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.routingInput?.expiresAtMs, deadline);
+        }
+        now = deadline;
+        if (mockedCleanup) testContext.mock.timers.enable({ apis: ["setTimeout"] });
+        f.worker.signal(); await f.worker.waitForDrain();
+        if (mockedCleanup) testContext.mock.timers.tick(1000);
+        await f.harness.routeRuntime.waitForRestoreSettlement();
+        if (mode === "metadata-before" || mode === "metadata-permanent") {
+          assert.equal(f.worker.getState().deferredClaimCount, 0, "Confirmed expiry retains no worker claim despite metadata failure");
+          assert.equal(f.worker.getState().abandoningClaimCount ?? 0, 0);
+          assert.equal(f.worker.getState().journalEntryCount, 0);
+          assert.deepEqual(f.deletions(), [], "Unpublished cleanup metadata licenses no deletion");
+          const attempts = metadataAttempts;
+          f.worker.signal(); await f.worker.waitForDrain();
+          assert.equal(metadataAttempts, attempts, "Ordinary worker drains do not retry terminal prompt bodies");
+          testContext.mock.timers.tick(60_000); await f.harness.routeRuntime.waitForRestoreSettlement();
+          assert.equal(metadataAttempts, attempts + 1, "Only a bounded body-free tab timer retries metadata");
+          if (mode === "metadata-permanent") {
+            assert.equal(f.worker.getState().deferredClaimCount, 0);
+            assert.deepEqual(f.deletions(), []);
+            metadataBlocked = false; generation++;
+            f.harness = f.createHarness({ getWorkspaceRestoreStore: () => expiryStore,
+              getSessionGeneration: () => generation, hasWorkspaceRestoreAuthority: () => true });
+            await f.harness.routeRuntime.forgetPreviousWorld({ ctx: { cwd: "/repo" }, journalBindingKey: f.bindingKey,
+              signal: new AbortController().signal, isCurrent: () => true, routingSourceIds: [] });
+            testContext.mock.timers.tick(1000); await f.harness.routeRuntime.waitForRestoreSettlement();
+            assert.equal(f.deletions().length, 1, "Fresh same-instance authority recovers body-free metadata after session replacement");
+            const recovered = metadataAttempts;
+            testContext.mock.timers.tick(60_000); await f.harness.routeRuntime.waitForRestoreSettlement();
+            assert.equal(metadataAttempts, recovered, "The stale-generation retry is inert");
+          }
+        }
+        if (mode === "expiry-delete-unknown") {
+          assert.equal(f.store.listTemporaryThreads()[0]?.cleanupIssued, true);
+          const attempts = f.deletions().length;
+          testContext.mock.timers.tick(120_000); await f.harness.routeRuntime.waitForRestoreSettlement();
+          assert.equal(f.deletions().length, attempts, "An unknown issued delete is never retried by metadata recovery");
+          assert.equal(f.worker.getState().deferredClaimCount, 0);
+        }
+        if (mode === "restore-queued") {
+          assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "queued");
+          assert.deepEqual(f.harness.telegramQueueStore.getQueuedItems(), queueBefore);
+          assert.deepEqual(f.deletions(), []);
+        } else {
+          assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false,
+            JSON.stringify({ mode, events: f.harness.events, state: f.worker.getState() }));
+          assert.ok(f.journal.routingInputs!.inspectExpiry(123));
+          assert.equal(f.journal.inspectAbandonedPending(123), undefined, "Expiry writes no private retention copy");
+          assert.equal(f.completedHints.includes(123), false, "Expiry is not successful execution");
+          if (mode === "multiple-choosers") {
+            assert.ok(f.journal.routingInputs!.inspectExpiry(150));
+            assert.equal(f.completedHints.includes(150), false);
+          }
+          if (mode === "partial-cohort") {
+            assert.ok(f.journal.routingInputs!.inspectExpiry(151));
+            assert.equal(f.journal.read().entries.length, 0, "Partial prior ACK cannot leave the group's final donor pending forever");
+          }
+          assert.equal(f.deletions().length, mode === "lost-restore" || mode === "independent-work" ? 0 : 1);
+          if (mode === "lost-restore") {
+            assert.equal(f.threads.listWorkspaceBindings()[0]?.target.threadId, 55, "The restored binding is never rolled back");
+            assert.equal(f.store.list().length, 0, JSON.stringify({ events: f.harness.events, temporary: f.store.listTemporaryThreads(), operations: f.store.list() }));
+          }
+          if (mode === "independent-work") assert.equal(f.journal.read().entries.find(entry => entry.updateId === 150)?.state, "queued");
+          await f.click(route); await f.click(cancel);
+          assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false, "Old buttons never revive the expired input");
+          assert.deepEqual(f.recipientJournal.read().entries, recipientBefore, "Recipient acceptance survives donor expiry");
+        }
+      } finally { await f.stop(); }
+    }, mode === "lost-forward" || mode === "lost-restore" ? "follower" : "leader");
+  });
+}
 
 for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["empty", "missing-predecessor", "historical-command", "shared-unknown", "shared-other-target", "queued-group", "shared-offered-group", "shared-control", "corrupt", "unclassified", "reference-refusal"] as const) {
   if (mode === "last-cancel" && fault === "missing-predecessor") continue;

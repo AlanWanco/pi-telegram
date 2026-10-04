@@ -189,6 +189,7 @@ function formatTelegramTemporaryThreadChooserText(command) {
         "<b>🧵 Choose target thread:</b>",
         "",
         command ? `You used <code>/${escapeHtml(command)}</code> from the <b>All</b> tab.` : "Choose where to send your message.",
+        "Unaccepted routing expires after 60 minutes; disposable tabs are removed when clear. Accepted work and restored Threads are kept.",
         "Select the Pi thread that should handle it, or restore a Pi into this tab:",
     ].join("\n");
 }
@@ -1902,9 +1903,9 @@ export function createTelegramInboundRouteRuntime(deps) {
      * absence of chooser and journal custody, and the ordinary protection checks must all hold again. The attempt is
      * durably issued once; a skipped or unknown removal keeps the entry protecting the tab across restart.
      */
-    const runTemporaryThreadCleanup = async (token, cap) => {
-        const store = cap.store, inspect = deps.inspectRestoreSourceAbandonment;
-        if (!inspect || !deps.runWorkspaceOperation || !deps.callApi || !cap.isCurrent())
+    const runTemporaryThreadCleanup = async (token, cap, reconcileExpiry) => {
+        const store = cap.store;
+        if ((!deps.inspectRestoreSourceAbandonment && !deps.inspectRoutingInputGroupExpiry) || !deps.runWorkspaceOperation || !deps.callApi || !cap.isCurrent())
             return;
         await deps.runWorkspaceOperation({ operationId: `temporary-thread-cleanup-${randomBytes(16).toString("hex")}`,
             operationKind: "workspace.temporary-thread", scopes: [{ kind: "profile" }] }, async () => {
@@ -1912,15 +1913,48 @@ export function createTelegramInboundRouteRuntime(deps) {
                 return;
             let entry = store.listTemporaryThreads().find(value => value.token === token && value.phase === "created" && !!value.target);
             const target = entry?.target;
-            if (!entry || !target || entry.cleanupIssued || !Threads.isTelegramTemporaryThreadFullyResolved(entry) || hasPendingRerouteForTarget(target) ||
-                entry.operatorUserId !== cap.operatorUserId || entry.source.journalBindingKey !== cap.journalBindingKey)
+            if (!entry || !target || entry.cleanupIssued || entry.operatorUserId !== cap.operatorUserId ||
+                entry.source.journalBindingKey !== cap.journalBindingKey)
                 return;
-            const owner = `telegram-owner:${cap.operatorUserId}`, cancelled = entry.cancelledInputs ?? [];
-            const cancelledCurrent = () => cancelled.every(input => input.updateIds.every(updateId => {
-                const evidence = inspect(updateId, input.journalBindingKey);
-                return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId &&
-                    evidence.operatorAuthorityId === owner;
-            }));
+            const owner = `telegram-owner:${cap.operatorUserId}`;
+            if (reconcileExpiry && deps.inspectRoutingInputGroupExpiry) {
+                for (const group of Threads.getTelegramTemporaryThreadInputs(entry)) {
+                    if ([...(entry.cancelledInputs ?? []), ...(entry.completedInputs ?? [])].some(value => isDeepStrictEqual(value, group)))
+                        continue;
+                    const inspect = (id) => deps.inspectRoutingInputGroupExpiry(group)?.find(value => value.updateId === id);
+                    if (!group.updateIds.every(id => inspect(id)?.operatorAuthorityId === owner))
+                        continue;
+                    entry = cap.adopt(entry);
+                    if (!entry || !cap.isCurrent())
+                        return;
+                    let recorded, failure;
+                    try {
+                        recorded = store.recordTemporaryThreadInputExpiry(entry, group, cap.authority, inspect);
+                    }
+                    catch (error) {
+                        failure = error;
+                    }
+                    if (!cap.isCurrent())
+                        return;
+                    const retained = store.listTemporaryThreads().find(value => value.token === token);
+                    // A lost publication ACK may already have recorded the group or retired a bound tab's temporary frame.
+                    if (!retained)
+                        return;
+                    if (!recorded && !retained.cancelledInputs?.some(value => isDeepStrictEqual(value, group)))
+                        throw failure ?? new Error("Chooser expiry metadata was not confirmed.");
+                    entry = retained;
+                }
+            }
+            if (!Threads.isTelegramTemporaryThreadFullyResolved(entry) || hasPendingRerouteForTarget(target))
+                return;
+            const cancelled = entry.cancelledInputs ?? [];
+            const cancelledCurrent = () => cancelled.every(input => {
+                const expiry = deps.inspectRoutingInputGroupExpiry?.(input);
+                return input.updateIds.every(updateId => {
+                    const evidence = deps.inspectRestoreSourceAbandonment?.(updateId, input.journalBindingKey) ?? expiry?.find(value => value.updateId === updateId);
+                    return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId && evidence.operatorAuthorityId === owner;
+                });
+            });
             if (!cancelledCurrent())
                 return;
             entry = cap.adopt(entry);
@@ -1940,8 +1974,40 @@ export function createTelegramInboundRouteRuntime(deps) {
             store.retireTemporaryThread(entry, cap.authority);
         });
     };
-    /** Starts the quiet period only when every known group is resolved; a new input or authority change denies it. */
-    const scheduleTemporaryThreadCleanup = (target, ctx) => {
+    // Reuse the one timer per tab for body-free metadata retries. Future retry timers do not join settlement waits;
+    // only their running attempt does. No retry is licensed once a destructive grant may have been issued.
+    const queueTemporaryThreadCleanup = (token, cap, delay, reconcileExpiry, retry = false) => {
+        cancelTemporaryThreadCleanup(token);
+        let settle = () => undefined;
+        const task = new Promise(resolve => { settle = resolve; });
+        const timer = setTimeout(() => {
+            if (temporaryCleanupTimers.get(token)?.timer !== timer)
+                return;
+            temporaryCleanupTimers.delete(token);
+            if (retry)
+                restoreSettlementTasks.add(task);
+            runTemporaryThreadCleanup(token, cap, reconcileExpiry)
+                .catch(error => {
+                deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup" });
+                if (!reconcileExpiry || !cap.isCurrent())
+                    return;
+                try {
+                    const retained = cap.store.listTemporaryThreads().find(value => value.token === token);
+                    if (retained && !retained.cleanupIssued && cap.isCurrent())
+                        queueTemporaryThreadCleanup(token, cap, 60_000, true, true);
+                }
+                catch { /* Unknown grant state never licenses a retry. */ }
+            })
+                .finally(settle);
+        }, delay);
+        timer.unref?.();
+        temporaryCleanupTimers.set(token, { timer, settle });
+        if (!retry)
+            restoreSettlementTasks.add(task);
+        void task.finally(() => restoreSettlementTasks.delete(task));
+    };
+    /** Starts the quiet period for resolved groups or body-free expiry reconciliation; fresh input/authority revokes it. */
+    const scheduleTemporaryThreadCleanup = (target, ctx, reconcileExpiry = false) => {
         const cap = captureTemporaryThreadAuthority(ctx);
         if (!cap || !deps.runWorkspaceOperation || target.threadId === undefined || hasPendingRerouteForTarget(target))
             return;
@@ -1953,27 +2019,22 @@ export function createTelegramInboundRouteRuntime(deps) {
             deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup-schedule" });
             return;
         }
-        if (!entry || entry.cleanupIssued || !Threads.isTelegramTemporaryThreadFullyResolved(entry) ||
-            entry.operatorUserId !== cap.operatorUserId || entry.source.journalBindingKey !== cap.journalBindingKey)
+        if (!entry || entry.cleanupIssued || entry.operatorUserId !== cap.operatorUserId || entry.source.journalBindingKey !== cap.journalBindingKey)
             return;
-        const token = entry.token;
-        cancelTemporaryThreadCleanup(token);
+        if (!reconcileExpiry && !Threads.isTelegramTemporaryThreadFullyResolved(entry)) {
+            try {
+                reconcileExpiry = Threads.getTelegramTemporaryThreadInputs(entry).some(group => !!deps.inspectRoutingInputGroupExpiry?.(group));
+            }
+            catch (error) {
+                deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup-schedule" });
+                return;
+            }
+        }
+        if (!reconcileExpiry && !Threads.isTelegramTemporaryThreadFullyResolved(entry))
+            return;
         const requested = deps.temporaryThreadCleanupDelayMs;
         const delay = typeof requested === "number" && Number.isFinite(requested) ? Math.max(0, requested) : 1000;
-        let settle = () => undefined;
-        const task = new Promise(resolve => { settle = resolve; });
-        const timer = setTimeout(() => {
-            if (temporaryCleanupTimers.get(token)?.timer !== timer)
-                return;
-            temporaryCleanupTimers.delete(token);
-            runTemporaryThreadCleanup(token, cap)
-                .catch(error => { deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup" }); })
-                .finally(settle);
-        }, delay);
-        timer.unref?.();
-        temporaryCleanupTimers.set(token, { timer, settle });
-        restoreSettlementTasks.add(task);
-        void task.finally(() => restoreSettlementTasks.delete(task));
+        queueTemporaryThreadCleanup(entry.token, cap, delay, reconcileExpiry);
     };
     const recordCancelledTemporaryThreadInput = (pending, ctx, isCurrent) => {
         const store = deps.getWorkspaceRestoreStore?.(), target = pending.sourceTarget;
@@ -2056,10 +2117,15 @@ export function createTelegramInboundRouteRuntime(deps) {
                 if (!cap.isCurrent())
                     return;
                 const self = cap.authority.executor.instanceId;
-                const disposable = cap.store.listTemporaryThreads().flatMap(entry => entry.operatorUserId === cap.operatorUserId &&
+                const entries = cap.store.listTemporaryThreads();
+                const preserved = entries.filter(entry => entry.operatorUserId === cap.operatorUserId && entry.phase === "created" &&
+                    cap.store.inspectTemporaryThreadTarget(entry, cap.authority)?.kind === "temporary" &&
+                    Threads.getTelegramTemporaryThreadInputs(entry).some(source => source.journalBindingKey === journalBindingKey &&
+                        source.updateIds.some(id => input.routingSourceIds?.includes(id)))).map(entry => entry.token);
+                const disposable = entries.flatMap(entry => entry.operatorUserId === cap.operatorUserId && !preserved.includes(entry.token) &&
                     entry.executor.instanceId !== self && entry.phase === "created" && entry.target &&
                     cap.store.inspectTemporaryThreadTarget(entry, cap.authority)?.kind === "temporary" ? [entry] : []);
-                const forgotten = cap.store.forgetPreviousWorld(cap.authority);
+                const forgotten = cap.store.forgetPreviousWorld(cap.authority, preserved);
                 if (!forgotten)
                     return;
                 result.forgotten = forgotten.operations.length + forgotten.temporaryThreads.length;
@@ -2086,6 +2152,17 @@ export function createTelegramInboundRouteRuntime(deps) {
                     catch (error) {
                         deps.recordRuntimeEvent?.("routing", error, { phase: "new-world-tab-delete" });
                     }
+                }
+                // Same-instance session replacement may have lost a metadata-only timer after the source was already spent.
+                // Reconstruct from retained tab/source proof under fresh authority, never from a prompt body or an issued delete.
+                for (const entry of cap.store.listTemporaryThreads()) {
+                    if (!cap.isCurrent())
+                        break;
+                    if (entry.phase !== "created" || !entry.target || entry.cleanupIssued || entry.operatorUserId !== cap.operatorUserId ||
+                        entry.source.journalBindingKey !== journalBindingKey)
+                        continue;
+                    if (Threads.getTelegramTemporaryThreadInputs(entry).some(group => !!deps.inspectRoutingInputGroupExpiry?.(group)))
+                        scheduleTemporaryThreadCleanup(entry.target, ctx, true);
                 }
             });
         }
@@ -2172,10 +2249,11 @@ export function createTelegramInboundRouteRuntime(deps) {
     const expireRoutingInput = async (source, ctx, signal) => {
         const operator = deps.configStore.getAllowedUserId(), epoch = deps.getCurrentLeaderEpoch?.();
         const message = source.original.update.message;
-        const current = () => !signal.aborted && source.isCurrent() && operator !== undefined && epoch !== undefined &&
+        const runtimeCurrent = () => !signal.aborted && operator !== undefined && epoch !== undefined &&
             deps.isContextActive?.(ctx) === true && deps.configStore.getAllowedUserId() === operator &&
             deps.getCurrentLeaderEpoch?.() === epoch && deps.getAdmissionJournalBinding?.() === source.journalBindingKey &&
             source.original.routingInput?.operatorUserId === operator && message?.from?.id === operator && message.from.is_bot !== true && message.chat?.type === "private";
+        const current = () => runtimeCurrent() && source.isCurrent();
         if (!current() || !deps.runWorkspaceOperation)
             return;
         await deps.runWorkspaceOperation({ operationId: `routing-expiry-${randomBytes(16).toString("hex")}`,
@@ -2185,19 +2263,11 @@ export function createTelegramInboundRouteRuntime(deps) {
             const restores = deps.getWorkspaceRestoreStore?.();
             if (deps.getWorkspaceRestoreStore && !restores)
                 return;
-            if (restores?.list().some(intent => intent.request.source.journalBindingKey === source.journalBindingKey &&
-                intent.request.source.updateIds.includes(source.original.updateId)))
-                return;
-            for (const pending of pendingUnboundReroutes.values()) {
-                if (!Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages).includes(source.original.updateId))
-                    continue;
-                if (pending.selectionAttempted || pending.destinationSelected || pending.dispatching || pending.foreignForwardIssued || pending.workspaceRestore || pending.foreignRetry || pending.cleanup || pending.abandonment?.running)
-                    return;
-            }
+            const temporary = restores?.listTemporaryThreads().find(entry => Threads.getTelegramTemporaryThreadInputs(entry).some(input => input.journalBindingKey === source.journalBindingKey && input.updateIds.includes(source.original.updateId)));
             const result = source.expire();
             if (!result)
                 return;
-            // Retire local controls after the source ACK. Telegram UI failure cannot undo retention or trigger deletion.
+            // Expiry revokes the donor carrier; old controls and late ACKs cannot issue another delivery. No body is archived.
             for (const [id, pending] of pendingUnboundReroutes) {
                 if (!Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages).includes(source.original.updateId))
                     continue;
@@ -2214,6 +2284,10 @@ export function createTelegramInboundRouteRuntime(deps) {
                     }
                 }
             }
+            // The scheduled stage captures only context/epoch and a tab token. It reconstructs disposition from body-free proof,
+            // never closes over this source or asks the worker to retain a terminal prompt while metadata publication fails.
+            if (temporary?.target && runtimeCurrent())
+                scheduleTemporaryThreadCleanup(temporary.target, ctx, true);
         });
     };
     const renderCancellationReview = async (view, isCurrent) => {

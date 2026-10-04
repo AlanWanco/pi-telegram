@@ -1028,7 +1028,7 @@ export function applyTelegramQueuePromptReactionDisposition<
   let nextItems = items;
   for (const [index, item] of items.entries()) {
     if (
-      !isPendingTelegramTurn(item) ||
+      !isPendingTelegramTurn(item) || item.queueLane === "control" ||
       !isTelegramQueueItemInMessageScope(item, scope) ||
       !item.sourceMessageIds.includes(messageId)
     ) {
@@ -2405,6 +2405,7 @@ export interface TelegramQueueMutationRuntimeDeps<
   TContext,
 > extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
   ctx: TContext;
+  hasPendingDispatch?: () => boolean;
   allocateLaneOrder?: () => number;
   onItemsDiscarded?: (
     items: readonly TelegramQueueItem<TContext>[],
@@ -2416,6 +2417,7 @@ export interface TelegramQueueMutationRuntimeDeps<
 export interface TelegramQueueMutationControllerDeps<
   TContext,
 > extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
+  hasPendingDispatch?: () => boolean;
   allocateLaneOrder?: () => number;
   onItemsDiscarded?: (
     items: readonly TelegramQueueItem<TContext>[],
@@ -2739,7 +2741,14 @@ function commitReorderedTelegramQueueItemsRuntime<TContext>(
   items: TelegramQueueItem<TContext>[],
   deps: TelegramQueueMutationRuntimeDeps<TContext>,
 ): void {
-  deps.setQueuedItems([...items].sort(compareTelegramQueueItems));
+  const pendingHead = deps.hasPendingDispatch?.() ? deps.getQueuedItems()[0] : undefined;
+  const ordered = [...items].sort(compareTelegramQueueItems);
+  if (pendingHead) {
+    const index = ordered.findIndex(item => item.queueOrder === pendingHead.queueOrder && item.kind === pendingHead.kind &&
+      item.chatId === pendingHead.chatId && item.replyToMessageId === pendingHead.replyToMessageId);
+    if (index > 0) ordered.unshift(ordered.splice(index, 1)[0]!);
+  }
+  deps.setQueuedItems(ordered);
   updateTelegramQueueStatusRuntime(deps);
 }
 
@@ -2817,9 +2826,23 @@ export function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(
   scope?: TelegramQueueMessageScope,
 ): boolean {
   const queuedItems = deps.getQueuedItems();
+  const suppression = disposition.kind === "reaction-transition" ? disposition.suppressionEmoji :
+    disposition.kind === "suppressed" ? disposition.emoji : disposition.kind === "priority-suppressed" ? disposition.suppressionEmoji : undefined;
+  // Source-addressed control-lane prompts are explicit continuations. Synthetic model-switch turns have no source IDs.
+  // A Pi-owned dispatched head cannot be removed: agent_start must consume that exact item, not its successor.
+  const cancelled = suppression && deps.hasPendingDispatch ? queuedItems.filter((item, index) =>
+    isPendingTelegramTurn(item) && item.queueLane === "control" && isTelegramQueueItemInMessageScope(item, scope) &&
+    item.sourceMessageIds.includes(messageId) && !(index === 0 && deps.hasPendingDispatch!())) : [];
+  if (cancelled.length) {
+    if (cancelled.some(item => (item.admissionReceipts?.length ?? 0) > 0) && !deps.onItemsDiscarded) return false;
+    deps.onItemsDiscarded?.(cancelled, deps.ctx);
+    deps.setQueuedItems(queuedItems.filter(item => !cancelled.includes(item)));
+    updateTelegramQueueStatusRuntime(deps);
+    return true;
+  }
   const changesLane = queuedItems.some((item) => {
     if (
-      !isPendingTelegramTurn(item) ||
+      !isPendingTelegramTurn(item) || item.queueLane === "control" ||
       !isTelegramQueueItemInMessageScope(item, scope) ||
       !item.sourceMessageIds.includes(messageId)
     ) {

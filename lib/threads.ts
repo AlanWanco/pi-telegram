@@ -332,7 +332,7 @@ export interface TelegramTemporaryThreadInput {
   journalBindingKey: string;
   updateIds: number[];
 }
-/** A strict journal observation of committed cancellation plus matching private retention. */
+/** Journal-owned donor discard evidence: retained manual cancellation or body-free chooser expiry, never recipient cancellation. */
 export interface TelegramTemporaryThreadCancellationEvidence {
   journalBindingKey: string;
   updateId: number;
@@ -343,7 +343,7 @@ export interface TelegramTemporaryThreadEntry {
   source: { journalBindingKey: string; updateId: number };
   /** Append-only known source groups. Missing legacy metadata never proves that the creation source was alone. */
   inputs?: TelegramTemporaryThreadInput[];
-  /** Whole known groups with positively observed cancellation; never proof that deletion may be issued. */
+  /** Whole known groups with positively observed donor cancellation or expiry; never recipient cancellation or deletion authority. */
   cancelledInputs?: TelegramTemporaryThreadInput[];
   /** Whole known groups whose Forward was positively completed by the journal owner; never deletion authority alone. */
   completedInputs?: TelegramTemporaryThreadInput[];
@@ -415,6 +415,10 @@ export interface TelegramWorkspaceRestore {
   recordTemporaryThreadInputCancellation(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput,
     authority: TelegramWorkspaceRestoreAuthority,
     inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
+  /** Body-free chooser expiry may terminate an uncertain donor Forward/Restore, never accepted recipient work or a bound target. */
+  recordTemporaryThreadInputExpiry(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput,
+    authority: TelegramWorkspaceRestoreAuthority,
+    inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
   /** Caller holds profile admission and proves fresh source/protection clearance; publication grants one attempt, never retry. */
   issueTemporaryThreadCleanup(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority):
     { issued: true; entry: TelegramTemporaryThreadEntry } | undefined;
@@ -423,8 +427,8 @@ export interface TelegramWorkspaceRestore {
   retireTemporaryThread(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority,
     completed?: TelegramTemporaryThreadInput): TelegramTemporaryThreadEntry | undefined;
   /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances.
-   * Committed bindings stay; nothing is rolled back, replayed or deleted here. */
-  forgetPreviousWorld(authority: TelegramWorkspaceRestoreAuthority):
+   * Caller may preserve exact unbound temporary tokens for clock-bearing sources. Committed bindings stay; nothing is rolled back, replayed or deleted here. */
+  forgetPreviousWorld(authority: TelegramWorkspaceRestoreAuthority, preserveTemporaryTokens?: readonly string[]):
     { operations: TelegramWorkspaceRestoreIntent[]; temporaryThreads: TelegramTemporaryThreadEntry[] } | undefined;
 }
 export interface TelegramWorkspaceRestoreOptions {
@@ -3595,6 +3599,40 @@ export function createTelegramTopicTargetStore(
           });
           return recorded && current() ? recorded : undefined;
         },
+        recordTemporaryThreadInputExpiry(expected, inputValue, authority, inspect) {
+          const input = structuredClone(inputValue);
+          if (!isTemporaryThreadInput(input) || typeof inspect !== "function") return undefined;
+          const operator = authority.operatorUserId, executor = structuredClone(authority.executor);
+          const bound = classifyTemporaryTarget(read(), expected).kind === "bound";
+          const current = () => authority.isCurrent() && authority.operatorUserId === operator &&
+            isDeepStrictEqual(authority.executor, executor) && input.updateIds.every(updateId => {
+              const evidence = inspect(updateId);
+              return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId &&
+                evidence.operatorAuthorityId === `telegram-owner:${operator}`;
+            }) && authority.isCurrent();
+          return advanceTemporary(expected, { ...authority, isCurrent: current }, (entry, file) => {
+            if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(value => isDeepStrictEqual(value, input)) ||
+                entry.completedInputs?.some(value => isDeepStrictEqual(value, input))) return false;
+            const cancelled = entry.cancelledInputs ?? [];
+            if (cancelled.some(value => isDeepStrictEqual(value, input))) return "unchanged";
+            const operations = file.operations.filter(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+              request.source.updateIds.some(id => input.updateIds.includes(id)));
+            if (operations.some(({ request }) => !request.source.updateIds.every(id => input.updateIds.includes(id)))) return false;
+            // Forget only expired donor intent; canonical binding, recipient queue and immutable settlement proofs are untouched.
+            file.operations = file.operations.filter(value => !operations.includes(value));
+            // Once bound, this is no longer a disposable tab. Forget its temporary frame, not the binding or other journal sources.
+            if (bound) {
+              file.temporaryThreads = file.temporaryThreads?.filter(value => value !== entry);
+              if (!file.temporaryThreads?.length) delete file.temporaryThreads;
+              return true;
+            }
+            const forwarded = entry.forwardedInputs?.filter(value => !isDeepStrictEqual(value, input));
+            if (forwarded?.length) entry.forwardedInputs = forwarded;
+            else delete entry.forwardedInputs;
+            entry.cancelledInputs = [...cancelled, input];
+            return true;
+          });
+        },
         recordTemporaryThreadForwardIssued(expected, inputValue, authority) {
           const input = structuredClone(inputValue);
           if (!isTemporaryThreadInput(input)) return undefined;
@@ -3644,7 +3682,7 @@ export function createTelegramTopicTargetStore(
             return entry;
           });
         },
-        forgetPreviousWorld(authority) {
+        forgetPreviousWorld(authority, preserveTemporaryTokens = []) {
           if (!authority.isCurrent()) return undefined;
           const executor = structuredClone(authority.executor), operator = authority.operatorUserId;
           if (!isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator)) return undefined;
@@ -3652,11 +3690,12 @@ export function createTelegramTopicTargetStore(
           const previous = (value: { operatorUserId: number; executor: TelegramWorkspaceRestoreExecutor }) =>
             value.operatorUserId === operator && value.executor.instanceId !== executor.instanceId;
           const before = storage.read(), file = structuredClone(before);
-          const operations = file.operations.filter(previous), temporaryThreads = (file.temporaryThreads ?? []).filter(previous);
+          const forgetTemporary = (value: TelegramTemporaryThreadEntry) => previous(value) && !preserveTemporaryTokens.includes(value.token);
+          const operations = file.operations.filter(previous), temporaryThreads = (file.temporaryThreads ?? []).filter(forgetTemporary);
           if (!current()) return undefined;
           if (!operations.length && !temporaryThreads.length) return { operations, temporaryThreads };
           file.operations = file.operations.filter(value => !previous(value));
-          const remaining = (file.temporaryThreads ?? []).filter(value => !previous(value));
+          const remaining = (file.temporaryThreads ?? []).filter(value => !forgetTemporary(value));
           if (remaining.length) file.temporaryThreads = remaining;
           else delete file.temporaryThreads;
           if (file.revision === Number.MAX_SAFE_INTEGER) throw new Error("Workspace Restore revision exhausted.");

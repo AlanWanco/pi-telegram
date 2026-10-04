@@ -10,6 +10,7 @@ import {
 } from "./bus.ts";
 import {
   buildTelegramAnswerGuestQueryBody,
+  formatTelegramCallbackAnswerText,
   isTelegramMessageNotModifiedError,
 } from "./telegram-api.ts";
 import type { TelegramAttachmentSource } from "./media.ts";
@@ -321,15 +322,16 @@ export function createTelegramBusAwareApiRuntime(
       callbackQueryId: string,
       text?: string,
     ): Promise<void> {
+      const answer = formatTelegramCallbackAnswerText(text);
       if (deps.ownsDirect()) {
-        await deps.directRuntime.answerCallbackQuery(callbackQueryId, text);
+        await deps.directRuntime.answerCallbackQuery(callbackQueryId, answer);
         return;
       }
       await deps.callFollowerApi("call", [
         "answerCallbackQuery",
         {
           callback_query_id: callbackQueryId,
-          ...(text !== undefined ? { text } : {}),
+          ...(answer !== undefined ? { text: answer } : {}),
         },
       ]);
     },

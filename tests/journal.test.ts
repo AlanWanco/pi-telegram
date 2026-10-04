@@ -4593,7 +4593,7 @@ for (const liveSource of [false, true]) test(`Real config contention excludes ev
       const result = JSON.parse(child.stdout);
       assert.ok(result.contentions > 0, "Actual failed acquisitions, not a pre-attempt marker");
       assert.deepEqual(result.methods.sort(), ["read", "appendBatch", "abandonPending", "inspectAbandonedPending", "inspectPendingRetention", "markQueued", "markExecutionFailure", "applyOperatorDisposition",
-        "applyLegacyCustodyDisposition", "offerQueuedHandoff", "acceptQueuedHandoff", "cancelQueuedHandoff", "completeQueued", "completeQueuedExact", "discardQueued", "recoverDeadQueueOwner", "removeCompleted", "removeCompletedExact", "inspectSourceCompletion", "inspectQueuedReceipt", "routingInputs.arm", "routingInputs.select", "routingInputs.expire"].sort());
+        "applyLegacyCustodyDisposition", "offerQueuedHandoff", "acceptQueuedHandoff", "cancelQueuedHandoff", "completeQueued", "completeQueuedExact", "discardQueued", "recoverDeadQueueOwner", "removeCompleted", "removeCompletedExact", "inspectSourceCompletion", "inspectQueuedReceipt", "routingInputs.arm", "routingInputs.select", "routingInputs.expire", "routingInputs.inspectExpiry", "routingInputs.inspectGroupExpiry"].sort());
       assert.equal(fs.readFileSync(path, "utf8"), evidence);
       assert.equal(existsSync(`${path}.transaction`), false);
       assert.equal(existsSync(join(dir, "recovery")), false);
@@ -5221,6 +5221,48 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
     });
   });
 }
+
+test("Historical chooser expiry proof is body-free, exact-scope and read-only", async context => {
+  await withJournalTempDir(async ({ dir }) => {
+    let session = "before", now = Date.now();
+    const token = "fixture:expiry-proof", profile = "work";
+    const identity = createTelegramUpdateJournalBotIdentity({ botToken: token });
+    const runtime = createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => profile, getBotToken: () => token, getBotId: () => undefined },
+      getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
+      getFollowerJournalPath: (key, p, sid) => resolveTelegramSessionJournalPath(sid!, key, dir, p),
+      getActiveFollowerBindingKey: () => "manual:fixture", getActiveFollowerSessionId: () => session,
+      isFollowerRegistered: () => true,
+    });
+    const binding = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(binding.recoveryKey)!;
+    if (assertUnsupportedStrictInspection({ directory: dir, path, profile, botIdentity: identity,
+      limits: { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 } }, context)) return;
+    const journal = createTelegramUpdateJournalStore({ path, profileName: profile, botIdentity: identity, getNowMs: () => now });
+    journal.appendBatch([{ update_id: 1, message: { text: "expires without archive" } },
+      { update_id: 2, message: { text: "independent accepted sibling" } }]);
+    const armed = journal.routingInputs!.arm({ entries: journal.read().entries, journalBindingKey: binding.recoveryKey,
+      operatorUserId: 7, publishedAtMs: now, isCurrent: () => true });
+    now = armed[0]!.routingInput!.expiresAtMs;
+    journal.routingInputs!.expire({ entry: armed[0]!, journalBindingKey: binding.recoveryKey, operatorUserId: 7, isCurrent: () => true });
+    assert.equal(journal.routingInputs!.inspectGroupExpiry([1, 2]), undefined, "Any live donor source protects the whole cohort");
+    // Supplied prior donor disposition; group proof deliberately does not claim recipient completion.
+    journal.removeCompleted([2]);
+    session = "after";
+    const successor = runtime.resolveActive()!;
+    successor.journal.appendBatch([{ update_id: 1, message: { text: "independent same-ID source" } }]);
+    const before = await readJournalFixtureTree(dir);
+    assert.deepEqual(runtime.inspectSourceGroupExpiry(binding.recoveryKey, [1])?.[0], {
+      journalBindingKey: binding.recoveryKey, updateId: 1, operatorAuthorityId: "telegram-owner:7",
+    });
+    assert.equal(runtime.inspectSourceGroupExpiry(successor.recoveryKey, [1]), undefined);
+    assert.deepEqual(runtime.inspectSourceGroupExpiry(binding.recoveryKey, [1, 2]), [1, 2].map(updateId => ({
+      journalBindingKey: binding.recoveryKey, updateId, operatorAuthorityId: "telegram-owner:7",
+    })), "An absent earlier member does not leave a partially acknowledged donor cohort pending forever");
+    assert.equal(runtime.inspectSourceGroupExpiry(successor.recoveryKey, [1, 2]), undefined);
+    assert.equal(runtime.inspectSourceAbandonment(binding.recoveryKey, 1), undefined, "There is no retained prompt body");
+    assert.deepEqual(await readJournalFixtureTree(dir), before, "Proof lookup neither prepares nor repairs storage");
+  });
+});
 
 test("Session-aware journal bindings keep the same recipient's sessions separate and refuse missing preparation", async () => {
   await withJournalTempDir(async ({ dir }) => {
@@ -8479,14 +8521,14 @@ test("Update journal serializes concurrent rebind and old-identity append", asyn
   });
 });
 
-for (const scenario of ["expire", "half-hour", "selected", "cancel", "restart", "duplicate", "foreign", "changed", "authority", "before-copy", "after-copy", "batch", "delayed-write"] as const) {
+for (const scenario of ["expire", "half-hour", "selected", "cancel", "restart", "duplicate", "foreign", "changed", "authority", "before-publication", "after-publication", "batch", "delayed-write"] as const) {
   test(`Routing input lifetime preserves one hour, exact source custody and no delivery inference (${scenario})`, async () => {
     await withJournalTempDir(async ({ path }) => {
       let now = 1000, active = true, fault: string | undefined;
       const options = { path, botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture:routing-lifetime" }), getNowMs: () => now,
-        onPublicationBoundary(point: string, target: string) {
-          if (point === "before-write" && fault && (fault === "before-copy" ? target.startsWith(`${path}.retained`) : !target.startsWith(`${path}.retained`))) {
-            throw new Error("fixture routing retention interrupted");
+        onPublicationBoundary(point: string) {
+          if (fault && point === (fault === "before-publication" ? "before-write" : "after-write-before-rename")) {
+            throw new Error("fixture routing expiry interrupted");
           }
         } };
       let journal = createTelegramUpdateJournalStore(options);
@@ -8505,10 +8547,13 @@ for (const scenario of ["expire", "half-hour", "selected", "cancel", "restart", 
         assert.equal(choice.issued, true);
         assert.equal(choice.entries[0]!.routingInput?.phase, "selected");
         now += 60 * 60_000;
-        assert.throws(() => journal.routingInputs!.expire(expiry), /changed before abandonment/);
-        assert.equal(journal.read().entries.length, 1);
+        assert.throws(() => journal.routingInputs!.expire(expiry), /changed before expiry/);
         assert.equal(journal.routingInputs!.select({ ...input, entries: choice.entries }).issued, false, "A retained selection is not another issuance");
         assert.throws(() => journal.routingInputs!.arm({ ...input, entries: choice.entries }), /cannot renew/);
+        if (scenario === "selected") {
+          journal.routingInputs!.expire({ ...expiry, entry: choice.entries[0]! });
+          assert.equal(journal.read().entries.length, 0, "An unacknowledged selected donor expires without replay or recipient cancellation");
+        } else assert.equal(journal.read().entries.length, 1);
         return;
       }
       if (scenario === "cancel") {
@@ -8534,17 +8579,18 @@ for (const scenario of ["expire", "half-hour", "selected", "cancel", "restart", 
       assert.throws(() => journal.routingInputs!.expire(expiry), /not expired/);
       now = armed.routingInput!.expiresAtMs;
       assert.throws(() => journal.routingInputs!.select({ ...input, entries: [armed] }), /expired/);
-      if (scenario === "before-copy" || scenario === "after-copy") {
+      if (scenario === "before-publication" || scenario === "after-publication") {
         fault = scenario;
         assert.throws(() => journal.routingInputs!.expire(expiry));
         assert.deepEqual(journal.read().entries, [armed]);
         fault = undefined;
-        if (scenario === "after-copy") assert.throws(() => journal.routingInputs!.select({ ...input, entries: [armed] }), /protected retention/);
       }
       const ack = journal.routingInputs!.expire(expiry);
       assert.equal(journal.read().entries.length, 0);
-      assert.deepEqual(JSON.parse(await readFile(ack.retainedPath, "utf8")).entry, armed);
-      assert.equal(journal.inspectAbandonedPending(1)?.operatorAuthorityId, "telegram-owner:7");
+      assert.equal("retainedPath" in ack, false);
+      assert.equal((await readdir(dirname(path))).some(name => name.startsWith(`${basename(path)}.retained`)), false, "Expiry never archives a prompt body");
+      assert.equal(journal.inspectAbandonedPending(1), undefined, "Expiry is not retained cancellation");
+      assert.equal(journal.routingInputs!.inspectExpiry(1)?.operatorAuthorityId, "telegram-owner:7");
       assert.deepEqual(journal.appendBatch([original.update]).duplicateUpdateIds, [1]);
       if (scenario === "duplicate") assert.equal(journal.routingInputs!.expire(expiry).duplicate, true);
     });

@@ -92,10 +92,12 @@ export interface RouteHarnessOptions {
   getWorkspaceRestoreStore?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["getWorkspaceRestoreStore"];
   captureWorkspaceExternalProtection?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["captureWorkspaceExternalProtection"];
   inspectRestoreSourceAbandonment?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreSourceAbandonment"];
+  inspectRoutingInputGroupExpiry?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRoutingInputGroupExpiry"];
   inspectRestoreSourceCompletion?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreSourceCompletion"];
   inspectRestoreQueuedReceipt?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreQueuedReceipt"];
   hasWorkspaceRestoreAuthority?: () => boolean;
   inspectTemporaryThreadSources?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectTemporaryThreadSources"];
+  onItemsDiscarded?: Queue.TelegramQueueMutationControllerDeps<TestContext>["onItemsDiscarded"];
   temporaryThreadCleanupDelayMs?: number;
   getSessionGeneration?: () => number;
   foreignOwnedUpdateForwarder?: Routing.TelegramInboundRouteRuntimeDeps<
@@ -169,6 +171,8 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
   const buttonActionStore = Outbound.createTelegramButtonActionStore();
   const queueMutationRuntime = Queue.createTelegramQueueMutationController({
     ...telegramQueueStore,
+    hasPendingDispatch: bridgeRuntime.lifecycle.hasDispatchPending,
+    onItemsDiscarded: options.onItemsDiscarded,
     updateStatus: () => events.push("status"),
   });
   const pendingModelSwitchStore =
@@ -226,6 +230,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     getWorkspaceRestoreStore: options.getWorkspaceRestoreStore,
     captureWorkspaceExternalProtection: options.captureWorkspaceExternalProtection,
     inspectRestoreSourceAbandonment: options.inspectRestoreSourceAbandonment,
+    inspectRoutingInputGroupExpiry: options.inspectRoutingInputGroupExpiry,
     inspectRestoreSourceCompletion: options.inspectRestoreSourceCompletion,
     inspectRestoreQueuedReceipt: options.inspectRestoreQueuedReceipt,
     hasWorkspaceRestoreAuthority: options.hasWorkspaceRestoreAuthority,
@@ -327,5 +332,5 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       events.push(`event:${category}:${String(error)}`);
     },
   });
-  return { buttonActionStore, events, routeRuntime, telegramQueueStore, activeTurnRuntime };
+  return { buttonActionStore, bridgeRuntime, events, routeRuntime, telegramQueueStore, activeTurnRuntime };
 }

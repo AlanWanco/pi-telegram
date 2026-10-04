@@ -1701,24 +1701,34 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             return false;
         let nextAtMs, changed = false;
         const binding = deps.getJournalBindingKey?.(), snapshotIds = new Set(snapshot.entries.map(entry => entry.updateId));
-        // Lost removal ACKs reconcile only the exact held original through the retained copy/tombstone.
+        // Lost expiry ACKs reconcile the exact held original against its body-free discard tombstone.
         const candidates = [...snapshot.entries, ...[...deferredSources.values()]
                 .filter(source => source.journalBindingKey === binding && !snapshotIds.has(source.entry.updateId))
                 .map(source => source.entry)];
         for (const entry of candidates) {
             const lifetime = entry.routingInput;
-            if (claims.get(entry.updateId) === "retained" || (expectedOwner.startupUpdateIds?.has(entry.updateId) &&
-                !claims.has(entry.updateId) && deps.shouldReviewHistoricalInput))
+            if (!lifetime || entry.state !== "pending" || !binding || claims.get(entry.updateId) === "queued" ||
+                unsettledExecutionsByUpdateId.get(entry.updateId)?.size)
                 continue;
-            if (!lifetime || lifetime.phase !== "waiting" || entry.state !== "pending" || !binding || unsettledExecutionsByUpdateId.get(entry.updateId)?.size)
+            // Classify the first startup snapshot before constructing any historical expiry carrier.
+            if (expectedOwner.startupUpdateIds?.has(entry.updateId) && !claims.has(entry.updateId) && deps.shouldReviewHistoricalInput) {
+                nextAtMs = Math.min(nextAtMs ?? Infinity, Math.max(getNowMs() + 1, lifetime.expiresAtMs));
                 continue;
+            }
             if (getNowMs() < lifetime.expiresAtMs) {
                 nextAtMs = Math.min(nextAtMs ?? Infinity, lifetime.expiresAtMs);
                 continue;
             }
             const existing = deferredSources.get(entry.updateId);
-            if (existing && !isDeepStrictEqual(existing.entry, entry))
-                continue;
+            if (existing && !isDeepStrictEqual(existing.entry, entry)) {
+                // Lost clock/selection ACKs may leave only this immutable metadata behind its exact source; reconciliation grants expiry, never another dispatch.
+                const previous = existing.entry.routingInput;
+                if (!isDeepStrictEqual({ ...existing.entry, routingInput: lifetime }, entry) ||
+                    (previous && (!isDeepStrictEqual({ ...previous, phase: lifetime.phase }, lifetime) ||
+                        (previous.phase === "selected" && lifetime.phase !== "selected"))))
+                    continue;
+                existing.entry = structuredClone(entry);
+            }
             const source = existing ?? { entry: structuredClone(entry), journalBindingKey: binding, historical: true };
             deferredSources.set(entry.updateId, source);
             if (!claims.has(entry.updateId))
@@ -1738,13 +1748,14 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                                 return { ...committed, duplicate: true };
                             claims.set(entry.updateId, "abandoning");
                             committed = expireRouting({ entry: source.entry, journalBindingKey: binding, operatorUserId: lifetime.operatorUserId, isCurrent: current });
+                            // Source expiry is terminal before chooser/cleanup awaits; later failures must not retain a deferred/retry source.
                             claims.delete(entry.updateId);
                             deferredSources.delete(entry.updateId);
                             state.journalEntryCount = committed.entryCount;
                             state.journalSerializedBytes = committed.serializedBytes;
                             updateClaimCounts();
                             notifyStateChange();
-                            changed = true;
+                            changed ||= !committed.duplicate;
                             return committed;
                         } }, expectedOwner.ctx, expectedOwner.controller.signal);
             }
@@ -1964,7 +1975,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                             transition("deferred", entry.updateId);
                             continue;
                         }
-                        if (review && historical && spendHistorical && classifyPending === deps.shouldReviewHistoricalInput) {
+                        if (review && historical && spendHistorical && !entry.routingInput && classifyPending === deps.shouldReviewHistoricalInput) {
                             completedUpdateIds.push({ updateId: entry.updateId, spent: true });
                             continue;
                         }
@@ -1975,10 +1986,6 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         }
                     }
                     if (entry.state === "pending" && entry.routingInput) {
-                        if (historical && spendHistorical) {
-                            completedUpdateIds.push({ updateId: entry.updateId, spent: true });
-                            continue;
-                        }
                         claims.set(entry.updateId, "historical");
                         transition("deferred", entry.updateId);
                         continue;
@@ -2123,7 +2130,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         expectedOwner.heldSourcesPreparedIssued = true;
                         // Do not couple lifecycle/stop or the worker drain to a held controller/API reply.
                         void Promise.resolve().then(() => isCurrent() ? onHeldSourcesPrepared({ ctx,
-                            journalBindingKey: key, signal: expectedOwner.controller.signal, isCurrent }) : undefined).catch(error => {
+                            journalBindingKey: key, signal: expectedOwner.controller.signal, isCurrent,
+                            routingSourceIds: [...deferredSources].filter(([, source]) => source.journalBindingKey === key && !!source.entry.routingInput)
+                                .map(([id]) => id) }) : undefined).catch(error => {
                             try {
                                 deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "held-source-preparation" });
                             }
@@ -2286,6 +2295,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         },
         armRoutingInput(input) { return mutateRoutingSource(input, false)?.lifetime; },
         selectRoutingInput(input) { return mutateRoutingSource(input, true)?.issued === true; },
+        isRoutingInputCurrent(input) {
+            return owner?.controller.signal === input.signal && !input.signal.aborted &&
+                deferredSources.has(input.updateId) && claims.get(input.updateId) !== "abandoning";
+        },
         inspectDeferredSource(input) {
             const expectedOwner = owner;
             const source = deferredSources.get(input.updateId);
@@ -2346,7 +2359,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 return;
             }
             const claim = claims.get(input.updateId);
-            if (claim === "abandoning" || claim === "historical" || claim === "retained")
+            if (claim === "abandoning" || claim === "historical" || claim === "retained" ||
+                (!claim && routingJournal?.inspectExpiry(input.updateId)))
                 return;
             if (input.outcome.kind === "complete") {
                 // Expiry may retire only a still-deferred source, never accepted queue work.
@@ -3551,9 +3565,10 @@ export function createTelegramUpdateAdmissionHandle(deps) {
             generation,
             updateId: update.update_id,
             signal,
-            isCurrent: () => !signal.aborted && !suspended,
+            isCurrent: () => !signal.aborted && !suspended && ((!routingLifetime && !routingClockUnknown) || immediate || settlementReported ||
+                deps.isRoutingInputCurrent?.({ updateId: update.update_id, signal }) !== false),
             assertCurrent() {
-                if (signal.aborted || suspended) {
+                if (!execution.isCurrent()) {
                     throw signal.reason ?? new DOMException("Aborted", "AbortError");
                 }
             },
@@ -3567,7 +3582,7 @@ export function createTelegramUpdateAdmissionHandle(deps) {
         let settlementReported = false;
         let outcome;
         const boundUpdate = bindTelegramUpdateExecutionFence(bindTelegramUpdateAdmissionSource(update, (next) => {
-            if (suspended || signal.aborted)
+            if (!execution.isCurrent())
                 return;
             if (next.kind === "deferred" && next.routingReview) {
                 if (!immediate || settlementReported || routingClaims > 0 || !deps.isHistoricalSource?.({ updateId: update.update_id, signal })) {
@@ -3586,7 +3601,7 @@ export function createTelegramUpdateAdmissionHandle(deps) {
             }
             void Promise.resolve()
                 .then(() => {
-                if (suspended || signal.aborted)
+                if (!execution.isCurrent())
                     return;
                 return deps.onLateOutcome(next, {
                     updateId: update.update_id,
@@ -4487,6 +4502,7 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
         abandonDeferred: input => worker?.abandonDeferred?.(input),
         armRoutingInput: input => worker?.armRoutingInput?.(input),
         selectRoutingInput: input => worker?.selectRoutingInput?.(input) === true,
+        isRoutingInputCurrent: input => worker?.isRoutingInputCurrent?.(input) !== false,
         supportsDeferredAbandonment: input => worker?.supportsDeferredAbandonment?.(input) === true,
         inspectAbandoning: input => worker?.inspectAbandoning?.(input),
         inspectHistorical: input => worker?.inspectHistorical?.(input),

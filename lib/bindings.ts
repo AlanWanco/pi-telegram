@@ -116,6 +116,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   };
   const mutation = Queue.createTelegramQueueMutationController({
     ...deps.store,
+    hasPendingDispatch: deps.lifecycle.hasDispatchPending,
     allocateLaneOrder: deps.queue.allocateItemOrder,
     onItemsDiscarded(items, ctx) {
       if (!settleDiscardedItems(items, ctx)) {

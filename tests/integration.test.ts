@@ -3245,7 +3245,7 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
       assert.ok(releaseReview);
       releaseReview();
       try {
-        await waitForAsyncCondition(async () => fs.existsSync(cleanupStorage.path) && reviewAnswers.includes("Review prepared. No tabs were deleted."));
+        await waitForAsyncCondition(async () => fs.existsSync(cleanupStorage.path) && reviewAnswers.includes("Review prepared. No tabs were deleted"));
       } catch (error) {
         throw new Error(`${String(error)}\n${JSON.stringify({ reviewAnswers, methods })}\n${await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")}`);
       }
@@ -3287,7 +3287,7 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
       assert.deepEqual(ThreadCleanupManager.createTelegramThreadCleanupWorkStore(cleanupOptions).list(), work);
       assert.ok(releaseReview);
       releaseReview();
-      await waitForCondition(() => reviewAnswers.filter(answer => answer === "Review prepared. No tabs were deleted.").length === 2 &&
+      await waitForCondition(() => reviewAnswers.filter(answer => answer === "Review prepared. No tabs were deleted").length === 2 &&
         pollingJournal.read().acceptedThroughUpdateId === 101 && pollingJournal.read().entries.length === 0);
       assert.deepEqual(await readFile(cleanupStorage.path), cleanupBeforeRestart, "Repeated production review reuses the same work set without issuance or rewriting");
       assert.deepEqual(ThreadCleanupManager.createTelegramThreadCleanupWorkStore(cleanupOptions).list(), work);
@@ -8754,6 +8754,7 @@ test("Extension runtime applies reaction priority and removal before the next di
     const idleCtx = createRuntimeExtensionContext();
     const activeCtx = createRuntimeExtensionContext({
       isIdle: () => false,
+      sessionManager: idleCtx.sessionManager,
     });
     await handlers.get("session_start")?.({}, idleCtx);
     await commands.get("telegram-connect")?.handler("", idleCtx);

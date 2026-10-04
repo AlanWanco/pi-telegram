@@ -1701,6 +1701,11 @@ export async function downloadTelegramFile(
   return targetPath;
 }
 
+/** Tooltip-like callback answers omit a terminal sentence period; ellipses and other punctuation stay literal. */
+export function formatTelegramCallbackAnswerText(text: string | undefined): string | undefined {
+  return text?.replace(/(?<!\.)\.\s*$/u, "");
+}
+
 export async function answerTelegramCallbackQuery(
   botToken: string | undefined,
   callbackQueryId: string,

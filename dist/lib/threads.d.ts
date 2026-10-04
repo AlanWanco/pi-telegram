@@ -252,7 +252,7 @@ export interface TelegramTemporaryThreadInput {
     journalBindingKey: string;
     updateIds: number[];
 }
-/** A strict journal observation of committed cancellation plus matching private retention. */
+/** Journal-owned donor discard evidence: retained manual cancellation or body-free chooser expiry, never recipient cancellation. */
 export interface TelegramTemporaryThreadCancellationEvidence {
     journalBindingKey: string;
     updateId: number;
@@ -266,7 +266,7 @@ export interface TelegramTemporaryThreadEntry {
     };
     /** Append-only known source groups. Missing legacy metadata never proves that the creation source was alone. */
     inputs?: TelegramTemporaryThreadInput[];
-    /** Whole known groups with positively observed cancellation; never proof that deletion may be issued. */
+    /** Whole known groups with positively observed donor cancellation or expiry; never recipient cancellation or deletion authority. */
     cancelledInputs?: TelegramTemporaryThreadInput[];
     /** Whole known groups whose Forward was positively completed by the journal owner; never deletion authority alone. */
     completedInputs?: TelegramTemporaryThreadInput[];
@@ -361,6 +361,8 @@ export interface TelegramWorkspaceRestore {
     recordTemporaryThreadForwardIssued(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority): TelegramTemporaryThreadEntry | undefined;
     recordTemporaryThreadInputCompletion(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority): TelegramTemporaryThreadEntry | undefined;
     recordTemporaryThreadInputCancellation(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority, inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
+    /** Body-free chooser expiry may terminate an uncertain donor Forward/Restore, never accepted recipient work or a bound target. */
+    recordTemporaryThreadInputExpiry(expected: TelegramTemporaryThreadEntry, input: TelegramTemporaryThreadInput, authority: TelegramWorkspaceRestoreAuthority, inspect: (updateId: number) => TelegramTemporaryThreadCancellationEvidence | undefined): TelegramTemporaryThreadEntry | undefined;
     /** Caller holds profile admission and proves fresh source/protection clearance; publication grants one attempt, never retry. */
     issueTemporaryThreadCleanup(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): {
         issued: true;
@@ -370,8 +372,8 @@ export interface TelegramWorkspaceRestore {
     /** `completed` names one newly completed group; every other known group must already be cancelled or completed. */
     retireTemporaryThread(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority, completed?: TelegramTemporaryThreadInput): TelegramTemporaryThreadEntry | undefined;
     /** New-world restart: atomically forgets this operator's Restore intents and temporary entries from previous runtime instances.
-     * Committed bindings stay; nothing is rolled back, replayed or deleted here. */
-    forgetPreviousWorld(authority: TelegramWorkspaceRestoreAuthority): {
+     * Caller may preserve exact unbound temporary tokens for clock-bearing sources. Committed bindings stay; nothing is rolled back, replayed or deleted here. */
+    forgetPreviousWorld(authority: TelegramWorkspaceRestoreAuthority, preserveTemporaryTokens?: readonly string[]): {
         operations: TelegramWorkspaceRestoreIntent[];
         temporaryThreads: TelegramTemporaryThreadEntry[];
     } | undefined;

@@ -750,11 +750,36 @@ export interface TelegramRoutingInputAuthority {
   isCurrent(): boolean;
 }
 
+/** Expiry drops a donor attempt without retaining its body or claiming recipient execution/cancellation. */
+export type TelegramRoutingInputExpiryResult = Omit<TelegramUpdateJournalPendingAbandonmentResult, "retainedPath">;
+export type TelegramRoutingInputExpiryEvidence = Omit<TelegramUpdateJournalAbandonedPendingEvidence, "retainedPath">;
+
+function inspectRoutingInputExpiry(file: TelegramUpdateJournalFile, journalBindingKey: string, updateId: number): TelegramRoutingInputExpiryEvidence | undefined {
+  const disposition = file.operatorDispositions?.find(value => value.updateId === updateId &&
+    "dispositionKind" in value && value.dispositionKind === "legacy-custody" && value.action === "discard" &&
+    value.failureId === `routing-expiry:${value.evidenceSha256}`);
+  if (!disposition || !("operatorAuthorityId" in disposition) || file.entries.some(entry => entry.updateId === updateId)) return undefined;
+  return { journalBindingKey, updateId, operatorAuthorityId: disposition.operatorAuthorityId };
+}
+
+function inspectRoutingGroupExpiry(file: TelegramUpdateJournalFile, journalBindingKey: string, updateIds: readonly number[]): TelegramRoutingInputExpiryEvidence[] | undefined {
+  if (!Array.isArray(updateIds) || !updateIds.length || updateIds.length > TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES ||
+      updateIds.some((id, index) => !isSafeNonNegativeInteger(id) || (index > 0 && id <= updateIds[index - 1]!))) return undefined;
+  if (file.entries.some(entry => updateIds.includes(entry.updateId))) return undefined;
+  const expired = updateIds.map(id => inspectRoutingInputExpiry(file, journalBindingKey, id)).filter(value => value !== undefined);
+  if (!expired.length || expired.some(value => value.operatorAuthorityId !== expired[0]!.operatorAuthorityId)) return undefined;
+  // Some members may have been acknowledged earlier. Whole donor absence plus one exact expiry ends this known cohort,
+  // not recipient custody; fresh Thread protection still independently gates deletion.
+  return updateIds.map(updateId => ({ journalBindingKey, updateId, operatorAuthorityId: expired[0]!.operatorAuthorityId }));
+}
+
 /** Package-private v1 capability; raw input custody does not expose it. */
 export interface TelegramRoutingInputJournal {
   arm(input: TelegramRoutingInputAuthority & { publishedAtMs: number }): TelegramUpdateJournalEntry[];
   select(input: TelegramRoutingInputAuthority): { issued: boolean; entries: TelegramUpdateJournalEntry[] };
-  expire(input: Omit<TelegramRoutingInputAuthority, "entries"> & { entry: TelegramUpdateJournalEntry }): TelegramUpdateJournalPendingAbandonmentResult;
+  expire(input: Omit<TelegramRoutingInputAuthority, "entries"> & { entry: TelegramUpdateJournalEntry }): TelegramRoutingInputExpiryResult;
+  inspectExpiry(updateId: number): TelegramRoutingInputExpiryEvidence | undefined;
+  inspectGroupExpiry(updateIds: readonly number[]): TelegramRoutingInputExpiryEvidence[] | undefined;
 }
 
 export interface TelegramUpdateJournalStore {
@@ -3133,6 +3158,7 @@ export interface TelegramUpdateJournalBindingRuntime {
   getActiveRecoveryKey: () => string | undefined;
   /** Exact historical proof lookup; no store, admission, execution, recovery or mutation port. */
   inspectSourceAbandonment: (journalBindingKey: string, updateId: number) => TelegramUpdateJournalAbandonedPendingEvidence | undefined;
+  inspectSourceGroupExpiry: (journalBindingKey: string, updateIds: readonly number[]) => TelegramRoutingInputExpiryEvidence[] | undefined;
   inspectSourceCompletion: (journalBindingKey: string, expected: TelegramUpdateJournalSourceCompletion) => TelegramUpdateJournalSourceCompletion | undefined;
   inspectQueuedReceipt: (journalBindingKey: string, expected: TelegramUpdateJournalQueuedCompletion) => TelegramUpdateJournalQueuedReceiptEvidence | undefined;
   /** In-process `/new` succession: move unclaimed predecessor pending inputs into the successor session journal. */
@@ -3263,6 +3289,9 @@ export function createTelegramUpdateJournalBindingRuntime(deps: {
         if (!disposition || !("dispositionKind" in disposition) || disposition.dispositionKind !== "legacy-custody") return undefined;
         return { journalBindingKey, updateId, retainedPath: original.path, operatorAuthorityId: disposition.operatorAuthorityId };
       });
+    },
+    inspectSourceGroupExpiry(journalBindingKey, updateIds) {
+      return inspectHistoricalSource(journalBindingKey, file => inspectRoutingGroupExpiry(file, journalBindingKey, updateIds));
     },
     inspectSourceCompletion(journalBindingKey, expected) {
       const completion = validateJournalSourceCompletion(expected, getTelegramUpdateJournalBindingPath(journalBindingKey) ?? "journal");
@@ -4899,6 +4928,7 @@ function createJournalStoreCore(
             update: entry.update,
             admittedAtMs: entry.admittedAtMs,
             ...(entry.preApprovalExcluded !== undefined ? { preApprovalExcluded: entry.preApprovalExcluded } : {}),
+            ...(entry.routingInput ? { routingInput: { ...entry.routingInput } } : {}),
             state: "queued",
             queueKind: receipt.queueKind,
             queueReceiptId: receipt.receiptId,
@@ -5844,20 +5874,59 @@ function createJournalStoreCore(
       });
     },
   };
-  const abandonRoutingPending = journal.abandonPending.bind(journal);
   if (isTelegramUpdateJournalLegacyFamilyVersion(version)) journal.routingInputs = {
     arm(input) { return mutateRoutingInputs(input, false, input.publishedAtMs).entries; },
     select(input) { return mutateRoutingInputs(input, true); },
+    inspectExpiry(updateId) {
+      return runMutation(readCurrent => {
+        if (!isSafeNonNegativeInteger(updateId)) throw createJournalError("invalid", path, "invalid routing expiry update ID");
+        return inspectRoutingInputExpiry(readCurrent().file,
+          createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity }), updateId);
+      });
+    },
+    inspectGroupExpiry(updateIds) {
+      return runMutation(readCurrent => inspectRoutingGroupExpiry(readCurrent().file,
+        createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity }), updateIds));
+    },
     expire(input) {
-      const original = validateJournalEntry(input.entry, path, version), lifetime = original.routingInput;
-      if (!lifetime || lifetime.phase !== "waiting" || lifetime.operatorUserId !== input.operatorUserId ||
-          !isSafePositiveInteger(input.operatorUserId) || typeof input.isCurrent !== "function") {
-        throw createJournalError("conflict", path, "routing input expiry lacks exact waiting authority");
-      }
-      const current = () => { const now = getNowMs(); return isSafeNonNegativeInteger(now) && now >= lifetime.expiresAtMs && input.isCurrent(); };
-      if (!current()) throw createJournalError("conflict", path, "routing input has not expired under current authority");
-      return abandonRoutingPending({ journalBindingKey: input.journalBindingKey, entry: original,
-        operatorAuthorityId: `telegram-owner:${input.operatorUserId}`, isCurrent: current });
+      return runMutation(readCurrent => {
+        const original = validateJournalEntry(input.entry, path, version), lifetime = original.routingInput;
+        const binding = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+        if (!lifetime || original.state !== "pending" || original.inputClaim || original.inputProvenance || original.queueOwner ||
+            original.queueReceiptId || original.queueHandoff || original.failure || input.journalBindingKey !== binding ||
+            lifetime.operatorUserId !== input.operatorUserId || !isSafePositiveInteger(input.operatorUserId) || typeof input.isCurrent !== "function") {
+          throw createJournalError("conflict", path, "routing expiry requires an exact unclaimed chooser source");
+        }
+        const assertCurrent = () => {
+          const now = getNowMs();
+          if (!isSafeNonNegativeInteger(now) || now < lifetime.expiresAtMs || !input.isCurrent())
+            throw createJournalError("conflict", path, "routing source has not expired under current authority");
+        };
+        assertCurrent();
+        const current = sourceAccess ? readCurrent() : readCurrentStrict(false);
+        const evidenceSha256 = createHash("sha256").update(JSON.stringify(original)).digest("hex");
+        const failureId = `routing-expiry:${evidenceSha256}`;
+        const existing = current.file.operatorDispositions?.find(value => value.updateId === original.updateId);
+        const entry = current.file.entries.find(value => value.updateId === original.updateId);
+        if (existing) {
+          if (entry || !("dispositionKind" in existing) || existing.dispositionKind !== "legacy-custody" || existing.action !== "discard" ||
+              existing.failureId !== failureId || existing.evidenceSha256 !== evidenceSha256 || existing.operatorAuthorityId !== `telegram-owner:${input.operatorUserId}`)
+            throw createJournalError("conflict", path, "routing source has contradictory expiry evidence");
+          assertCurrent();
+          return { disposition: existing, duplicate: true, entryCount: current.file.entries.length, serializedBytes: current.serializedBytes };
+        }
+        if (!entry || !isDeepStrictEqual(entry, original)) throw createJournalError("conflict", path, "routing source changed before expiry");
+        // A discard tombstone prevents old readers and delayed reports from replaying; no prompt-body archive is written.
+        const now = getNowMs();
+        const disposition: TelegramUpdateJournalLegacyCustodyDisposition = { dispositionKind: "legacy-custody", failureId,
+          updateId: original.updateId, action: "discard", committedAtMs: now, authorizedAtMs: now, evidenceSha256,
+          operatorAuthorityId: `telegram-owner:${input.operatorUserId}` };
+        const published = publishMutation(current, current.file.entries.filter(value => value.updateId !== original.updateId), true,
+          [...(current.file.operatorDispositions ?? []), disposition], current.file.acceptedThroughUpdateId,
+          (boundary, target) => { onPublicationBoundary?.(boundary, target); assertCurrent(); });
+        assertCurrent();
+        return { disposition, duplicate: false, entryCount: published.file.entries.length, serializedBytes: published.serializedBytes };
+      });
     },
   };
   if (!getInputContext) return { journal };
