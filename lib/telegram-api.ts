@@ -38,6 +38,7 @@ function getTelegramApiTempDir(): string {
   return resolveTelegramAttachmentsDir();
 }
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS = 6;
 const activeTelegramApiWorkspaceAdmissionOperationIds = new Set<string>();
 const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(
   process.env,
@@ -1106,6 +1107,25 @@ async function writeTelegramDownloadResponse(
   );
 }
 
+async function publishTelegramDownload(
+  partPath: string,
+  targetPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    throwIfTelegramApiCallAborted(signal);
+    try {
+      await rename(partPath, targetPath);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      // Windows may briefly deny replacement while another publisher/scanner holds the file.
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES") || attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS) throw error;
+      await sleepTelegramRetry(50 * 2 ** attempt, signal);
+    }
+  }
+}
+
 async function removeTelegramPartialDownload(path: string): Promise<void> {
   try {
     await unlink(path);
@@ -1693,7 +1713,7 @@ export async function downloadTelegramFile(
       partPath,
       options?.maxFileSizeBytes,
     );
-    await rename(partPath, targetPath);
+    await publishTelegramDownload(partPath, targetPath, options?.signal);
   } catch (error) {
     await removeTelegramPartialDownload(partPath);
     throw error;

@@ -30,6 +30,7 @@ function getTelegramApiTempDir() {
     return resolveTelegramAttachmentsDir();
 }
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS = 6;
 const activeTelegramApiWorkspaceAdmissionOperationIds = new Set();
 const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(process.env, ["PI_TELEGRAM_INBOUND_FILE_MAX_BYTES", "TELEGRAM_MAX_FILE_SIZE_BYTES"], TELEGRAM_FILE_MAX_BYTES);
 const TELEGRAM_NETWORK_FAMILY_ENV = "PI_TELEGRAM_NETWORK_FAMILY";
@@ -390,6 +391,22 @@ async function writeTelegramDownloadResponse(response, targetPath, maxFileSizeBy
         return;
     }
     await pipeline(Readable.from(response.body, { objectMode: false }), createTelegramDownloadLimitTransform(maxFileSizeBytes), createWriteStream(targetPath, { mode: 0o600 }));
+}
+async function publishTelegramDownload(partPath, targetPath, signal) {
+    for (let attempt = 0;; attempt++) {
+        throwIfTelegramApiCallAborted(signal);
+        try {
+            await rename(partPath, targetPath);
+            return;
+        }
+        catch (error) {
+            const code = error?.code;
+            // Windows may briefly deny replacement while another publisher/scanner holds the file.
+            if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES") || attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS)
+                throw error;
+            await sleepTelegramRetry(50 * 2 ** attempt, signal);
+        }
+    }
 }
 async function removeTelegramPartialDownload(path) {
     try {
@@ -787,7 +804,7 @@ export async function downloadTelegramFile(botToken, fileId, suggestedName, temp
     assertTelegramFileSizeWithinLimit(contentLength ? Number.parseInt(contentLength, 10) : undefined, options?.maxFileSizeBytes);
     try {
         await writeTelegramDownloadResponse(response, partPath, options?.maxFileSizeBytes);
-        await rename(partPath, targetPath);
+        await publishTelegramDownload(partPath, targetPath, options?.signal);
     }
     catch (error) {
         await removeTelegramPartialDownload(partPath);

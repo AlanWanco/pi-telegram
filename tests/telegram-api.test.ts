@@ -14,6 +14,8 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import fileSystem from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -1952,6 +1954,66 @@ test("Telegram bridge API runtime names attachments from their source and the li
   assert.deepEqual(names, ["voice-my_bot-1.ogg", "voice-8502475096-1.ogg", "voice-team-1.ogg", "legacy.bin"]);
 });
 
+test("Download publication bounds Windows sharing retries without refetching or hiding failure", async (t) => {
+  const scenarios = [
+    { platform: "win32", code: "EPERM", mode: "transient", attempts: 3 },
+    { platform: "win32", code: "EACCES", mode: "transient", attempts: 3 },
+    { platform: "win32", code: "EPERM", mode: "permanent", attempts: 6 },
+    { platform: "linux", code: "EPERM", mode: "permanent", attempts: 1 },
+    { platform: "win32", code: "ENOENT", mode: "permanent", attempts: 1 },
+    { platform: "win32", code: "EPERM", mode: "cancel", attempts: 1 },
+  ] as const;
+  for (const scenario of scenarios) {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-sharing-"));
+    const targetPath = join(tempDir, "voice-bot-9.ogg");
+    await writeFile(targetPath, "previous complete payload");
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const realRename = fileSystem.rename;
+    const controller = new AbortController();
+    const cancellation = new Error("Download cancelled during publication retry");
+    const failure = Object.assign(new Error("File publication denied"), { code: scenario.code });
+    let renameCalls = 0;
+    const requests: string[] = [];
+    const restoreFetch = setApiTestFetch(async (input) => {
+      const url = getApiTestFetchUrl(input);
+      requests.push(url.includes("/getFile") ? "metadata" : "content");
+      if (url.includes("/getFile")) return createApiJsonResponse({ file_path: "files/demo" });
+      return new Response("new complete payload", { status: 200 });
+    });
+    const renameMock = t.mock.method(fileSystem, "rename", async (...[source, target]: Parameters<typeof realRename>) => {
+      renameCalls++;
+      assert.equal(target, targetPath);
+      assert.equal(await readFile(source, "utf8"), "new complete payload", "Only a complete part may be republished");
+      if (scenario.mode === "transient" && renameCalls > 2) return realRename(source, target);
+      if (scenario.mode === "cancel") setImmediate(() => controller.abort(cancellation));
+      throw failure;
+    });
+    Object.defineProperty(process, "platform", { ...platform, value: scenario.platform });
+    syncBuiltinESMExports();
+    try {
+      const operation = downloadTelegramFile("123:abc", "file-id", "voice-bot-9.ogg", tempDir,
+        { signal: controller.signal });
+      if (scenario.mode === "transient") {
+        assert.equal(await operation, targetPath);
+        assert.equal(await readFile(targetPath, "utf8"), "new complete payload");
+      } else {
+        await assert.rejects(operation, (error) => error === (scenario.mode === "cancel" ? cancellation : failure));
+        assert.equal(await readFile(targetPath, "utf8"), "previous complete payload");
+      }
+      if (scenario.mode === "transient") assert.ok(renameCalls >= scenario.attempts && renameCalls <= 6);
+      else assert.equal(renameCalls, scenario.attempts);
+      assert.deepEqual(requests, ["metadata", "content"], "Publication retry must not replay HTTP");
+      assert.deepEqual(await readdir(tempDir), ["voice-bot-9.ogg"], "Part cleanup also runs after exhaustion/cancellation");
+    } finally {
+      renameMock.mock.restore();
+      syncBuiltinESMExports();
+      Object.defineProperty(process, "platform", platform);
+      restoreFetch();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Concurrent downloads of one message publish one complete file", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-race-"));
   const restoreFetch = setApiTestFetch(async (input) => {
@@ -1966,6 +2028,7 @@ test("Concurrent downloads of one message publish one complete file", async () =
     assert.deepEqual(await readdir(tempDir), ["voice-bot-9.ogg"], "no partial file remains");
   } finally {
     restoreFetch();
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 

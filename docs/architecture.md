@@ -523,6 +523,8 @@ All inbound updates are gated by the configured authorized user id.
 8. Remove local prompt journal authority synchronously immediately before `sendUserMessage`, so session/process replacement can lose an unstarted prompt at that narrow crash boundary but can never replay a prompt already admitted to Pi; controls and foreign forwarding retain their explicit settlement boundaries.
 9. Handle `edited_message` updates separately while the original turn is still queued and dispatch only when all safety gates are clear.
 
+Attachments stream into private unique `.part` files and publish by rename only after complete, size-checked download. Windows `EPERM`/`EACCES` sharing failures allow at most six rename attempts, with abortable `50/100/200/400/800 ms` waits; no metadata/content HTTP request is replayed. Non-Windows, non-sharing and exhausted errors propagate, cancellation stops retries, and failure removes the partial file without deleting the existing target. This is attachment publication policy, not a journal/state recovery rule or strict Windows evidence.
+
 #### Durable Admission And Recovery
 
 Here, **durable** means recovery across ordinary process exit, crash, kill, and replacement after a successful atomic rename is visible to the filesystem. It does not promise survival across host, kernel, filesystem, storage-device, or power failure: journal and offset publication do not call `fsync`/`fdatasync`, and parent directories are not flushed. A host-level failure may therefore lose a recently acknowledged rename despite correct process-level ordering. Operators requiring that stronger boundary must place the agent directory on storage with an independently managed durability/backup policy; `0.28.0` must not be described as power-loss durable.
