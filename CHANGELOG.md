@@ -4,8 +4,10 @@
 
 ## Unreleased
 
+## 0.52.2: Polling recovery and safe disconnect
+
 - `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.
-- `Disconnect safety`: Failed or unavailable Thread cleanup still attempts one captured local transport stop without bypassing Workspace fences. Reconnect revokes stale cleanup/stop continuations; delayed teardown cannot release replacement ownership. Unconfirmed cleanup is reported without claiming it was skipped, while uncertain stop/release outcomes remain incomplete and are never blindly retried.
+- `Disconnect safety`: Failed or unavailable Thread cleanup still attempts one captured local transport stop without bypassing Workspace fences. Reconnect revokes stale cleanup/stop continuations; delayed teardown cannot release replacement ownership. Unconfirmed cleanup is reported without claiming it was skipped, while uncertain stop/release outcomes remain incomplete and are never blindly retried ([#310](https://github.com/llblab/pi-telegram/pull/310)).
 
 ## 0.52.1: Finite chooser lifetime, continue cancellation and callback copy
 
