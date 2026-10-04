@@ -12,6 +12,35 @@ import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, 
 import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } from "../lib/sync.ts";
 import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
 
+for (const direct of [true, false]) {
+  test(`Typed callback answers omit terminal sentence periods without rewriting messages (direct=${direct})`, async () => {
+    const calls: unknown[] = [];
+    const runtime = createTelegramBusAwareApiRuntime({ directRuntime: createDirectRuntime(calls), ownsDirect: () => direct,
+      async callFollowerApi(method, args) { calls.push({ method, args }); return { message_id: 1 }; } });
+    const cases: Array<[string | undefined, string | undefined]> = [
+      [undefined, undefined], ["", ""], ["Done.", "Done"], ["✅ Saved.", "✅ Saved"],
+      ["First sentence. Try again.", "First sentence. Try again"], ["Done. \n", "Done"],
+      ["Continue?", "Continue?"], ["Failed!", "Failed!"], ["Working...", "Working..."],
+      ["Working…", "Working…"], ["file.txt", "file.txt"], ["v1.2.3", "v1.2.3"],
+    ];
+    for (const [text, expected] of cases) {
+      calls.length = 0;
+      await runtime.answerCallbackQuery("callback", text);
+      assert.deepEqual(calls, direct ? [{ kind: "answer-callback", callbackQueryId: "callback", text: expected }] :
+        [{ method: "call", args: ["answerCallbackQuery", { callback_query_id: "callback", ...(expected !== undefined ? { text: expected } : {}) }] }]);
+    }
+    calls.length = 0;
+    const body = { chat_id: 100, text: "An in-chat notice." };
+    await runtime.sendMessage(body);
+    assert.deepEqual(calls, direct ? [{ kind: "message", body }] : [{ method: "call", args: ["sendMessage", body] }]);
+    calls.length = 0;
+    const raw = { callback_query_id: "raw", text: "Explicit raw API payload." };
+    await runtime.call("answerCallbackQuery", raw);
+    assert.deepEqual(calls, direct ? [{ kind: "call", method: "answerCallbackQuery", body: raw }] :
+      [{ method: "call", args: ["answerCallbackQuery", raw, undefined] }]);
+  });
+}
+
 test("Direct bus delivery invalidates only exact still-current stale request targets without replay", async () => {
   const originalFetch = globalThis.fetch;
   try {

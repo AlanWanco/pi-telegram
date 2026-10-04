@@ -795,6 +795,10 @@ export async function downloadTelegramFile(botToken, fileId, suggestedName, temp
     }
     return targetPath;
 }
+/** Tooltip-like callback answers omit a terminal sentence period; ellipses and other punctuation stay literal. */
+export function formatTelegramCallbackAnswerText(text) {
+    return text?.replace(/(?<!\.)\.\s*$/u, "");
+}
 export async function answerTelegramCallbackQuery(botToken, callbackQueryId, text, options = {}) {
     try {
         await callTelegram(botToken, "answerCallbackQuery", text

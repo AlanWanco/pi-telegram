@@ -613,11 +613,13 @@ export type TelegramSessionLifecycleHookEvent = unknown;
 export declare function createTelegramSessionStateApplier<TQueueItem, TModel>(deps: TelegramSessionStateApplierDeps<TQueueItem, TModel>): TelegramSessionStateApplier<TQueueItem, TModel>;
 export interface TelegramQueueMutationRuntimeDeps<TContext> extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
     ctx: TContext;
+    hasPendingDispatch?: () => boolean;
     allocateLaneOrder?: () => number;
     onItemsDiscarded?: (items: readonly TelegramQueueItem<TContext>[], ctx: TContext) => void;
     updateStatus: (ctx: TContext) => void;
 }
 export interface TelegramQueueMutationControllerDeps<TContext> extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
+    hasPendingDispatch?: () => boolean;
     allocateLaneOrder?: () => number;
     onItemsDiscarded?: (items: readonly TelegramQueueItem<TContext>[], ctx: TContext) => void;
     updateStatus: (ctx: TContext) => void;

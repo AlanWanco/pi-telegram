@@ -6,7 +6,7 @@
 import { type TelegramTarget } from "./target.ts";
 import type { TelegramBusEnvelope, TelegramBusFollowerView, TelegramBusForwardOwnership, TelegramBusForeignUpdateSettlement, TelegramProcessLiveness } from "./bus.ts";
 import type { TelegramMessageOwnershipStore } from "./ownership.ts";
-import { TELEGRAM_UPDATE_JOURNAL_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, type TelegramUpdateJournalEntryDigest, type TelegramUpdateJournalSourceCompletion, type TelegramUpdateJournalQueuedCompletion, type TelegramUpdateJournalQueuedReceiptEvidence, type TelegramInputJournalReceipt, type TelegramInputJournalSourceReference, type TelegramInputJournalStore, type TelegramJournaledUpdate, type TelegramUpdateJournalDeadQueueOwnerRecoveryResult, type TelegramUpdateJournalAppendResult, type TelegramUpdateJournalInputClaim, type TelegramUpdateJournalOperatorDispositionInput, type TelegramUpdateJournalOperatorDispositionResult, type TelegramUpdateJournalPendingAbandonmentInput, type TelegramUpdateJournalPendingAbandonmentResult, type TelegramUpdateJournalPendingRetentionEvidence, type TelegramUpdateJournalEntry, type TelegramUpdateJournalRoutingInput, type TelegramRoutingInputJournal, type TelegramUpdateJournalQueueDiscardResult, type TelegramUpdateJournalQueueHandoffAcceptResult, type TelegramUpdateJournalQueueHandoffCancelResult, type TelegramUpdateJournalQueueHandoffInput, type TelegramUpdateJournalQueueHandoffOfferResult, type TelegramUpdateJournalQueueOwner, type TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
+import { TELEGRAM_UPDATE_JOURNAL_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, type TelegramUpdateJournalEntryDigest, type TelegramUpdateJournalSourceCompletion, type TelegramUpdateJournalQueuedCompletion, type TelegramUpdateJournalQueuedReceiptEvidence, type TelegramInputJournalReceipt, type TelegramInputJournalSourceReference, type TelegramInputJournalStore, type TelegramJournaledUpdate, type TelegramUpdateJournalDeadQueueOwnerRecoveryResult, type TelegramUpdateJournalAppendResult, type TelegramUpdateJournalInputClaim, type TelegramUpdateJournalOperatorDispositionInput, type TelegramUpdateJournalOperatorDispositionResult, type TelegramUpdateJournalPendingAbandonmentInput, type TelegramUpdateJournalPendingAbandonmentResult, type TelegramUpdateJournalPendingRetentionEvidence, type TelegramUpdateJournalEntry, type TelegramUpdateJournalRoutingInput, type TelegramRoutingInputJournal, type TelegramRoutingInputExpiryResult, type TelegramUpdateJournalQueueDiscardResult, type TelegramUpdateJournalQueueHandoffAcceptResult, type TelegramUpdateJournalQueueHandoffCancelResult, type TelegramUpdateJournalQueueHandoffInput, type TelegramUpdateJournalQueueHandoffOfferResult, type TelegramUpdateJournalQueueOwner, type TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
 import { type PendingTelegramControlItem, type TelegramControlQueueHandoffPayload, type TelegramQueueAdmissionReceipt, type TelegramQueueHandoffPayload, type TelegramQueueHandoffStageResult, type TelegramQueueReactionDisposition, type TelegramQueueHandoffStagingRuntime, type TelegramQueueItem } from "./queue.ts";
 import { type TelegramAuthorizationState, type TelegramUserPairingRuntimeDeps } from "./config.ts";
 export interface TelegramReactionTypeEmoji {
@@ -189,6 +189,8 @@ export interface TelegramHeldSourcePreparation<TContext> {
     /** Exact prepared worker owner, context, key and authority; the consumer adds its own domain fences. */
     isCurrent: () => boolean;
     signal: AbortSignal;
+    /** Chooser-clock sources that must survive cold spending until their fixed expiry. */
+    routingSourceIds?: readonly number[];
 }
 export interface TelegramDeferredAbandonmentRecoveryPage {
     sources: {
@@ -504,7 +506,7 @@ export interface TelegramRoutingInputExpirySource {
     original: TelegramUpdateJournalEntry;
     journalBindingKey: string;
     isCurrent(): boolean;
-    expire(): TelegramUpdateJournalPendingAbandonmentResult | undefined;
+    expire(): TelegramRoutingInputExpiryResult | undefined;
 }
 export interface TelegramUpdateWorkerJournalPort {
     routingInputs?: TelegramRoutingInputJournal;
@@ -585,7 +587,7 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     getRecipientBindingKey?: () => string | undefined;
     /** True selects legacy historical review/spending; retain protects unsupported originals without disposition authority. */
     shouldReviewHistoricalInput?: (entry: TelegramUpdateJournalEntry, ctx: TContext, signal: AbortSignal) => boolean | "retain" | Promise<boolean | "retain">;
-    /** New-world restart: spend previous-process routing inputs (classified or armed) without delivery, copy or completion observers. Interrupted private abandonment keeps its own exact recovery. */
+    /** New-world restart: spend unclocked classified routing input without delivery, copy or completion. Chooser clocks wait for expiry; interrupted private abandonment keeps exact recovery. */
     spendHistoricalInput?: boolean;
     /** Holds protected live or retry sources before execution; never cancels or disposes them. */
     shouldHoldPendingInput?: (entry: TelegramUpdateJournalEntry, ctx: TContext, signal: AbortSignal) => boolean | Promise<boolean>;
@@ -632,6 +634,10 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
         signal: AbortSignal;
         operatorUserId: number;
         sourceUpdateIds: readonly number[];
+    }) => boolean;
+    isRoutingInputCurrent?: (input: {
+        updateId: number;
+        signal: AbortSignal;
     }) => boolean;
     supportsDeferredAbandonment?: (input: {
         updateId: number;
@@ -744,6 +750,7 @@ export interface TelegramUpdateAdmissionHandleDeps<TUpdate extends TelegramUpdat
     abandonDeferred?: TelegramUpdateWorkerRuntime<TContext>["abandonDeferred"];
     armRoutingInput?: TelegramUpdateWorkerRuntime<TContext>["armRoutingInput"];
     selectRoutingInput?: TelegramUpdateWorkerRuntime<TContext>["selectRoutingInput"];
+    isRoutingInputCurrent?: TelegramUpdateWorkerRuntime<TContext>["isRoutingInputCurrent"];
     supportsDeferredAbandonment?: TelegramUpdateWorkerRuntime<TContext>["supportsDeferredAbandonment"];
     inspectAbandoning?: TelegramUpdateWorkerRuntime<TContext>["inspectAbandoning"];
     inspectHistorical?: TelegramUpdateWorkerRuntime<TContext>["inspectHistorical"];
@@ -1135,7 +1142,7 @@ export declare function executeTelegramCustodiedInput(input: {
 export declare function createTelegramUpdateAdmissionHandle<TUpdate extends TelegramUpdateFlow & {
     update_id: number;
 }, TContext>(deps: TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>): (update: TUpdate, ctx: TContext, signal: AbortSignal) => Promise<TelegramUpdateAdmissionOutcome>;
-export declare function createTelegramCustodiedUpdateAdmissionHandle<TUpdate extends TelegramJournaledUpdate & TelegramUpdateFlow, TContext>(deps: Omit<TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>, "onLateOutcome" | "onLateOutcomeError" | "abandonDeferred" | "armRoutingInput" | "selectRoutingInput" | "supportsDeferredAbandonment" | "inspectAbandoning" | "inspectHistorical" | "inspectDeferredSource" | "isHistoricalSource"> & {
+export declare function createTelegramCustodiedUpdateAdmissionHandle<TUpdate extends TelegramJournaledUpdate & TelegramUpdateFlow, TContext>(deps: Omit<TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>, "onLateOutcome" | "onLateOutcomeError" | "abandonDeferred" | "armRoutingInput" | "selectRoutingInput" | "isRoutingInputCurrent" | "supportsDeferredAbandonment" | "inspectAbandoning" | "inspectHistorical" | "inspectDeferredSource" | "isHistoricalSource"> & {
     journal: TelegramCustodyExecutionJournal;
     recipientBindingKey: string;
     onLateOutcomeError(error: unknown, updateId: number): void;

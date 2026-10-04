@@ -490,6 +490,14 @@ test("Queue binding composes mutation, admission, dispatch, and watchdog ports",
     "discard:1",
     "status",
   ]);
+  runtime.mutation.append({ kind: "prompt", chatId: 7, replyToMessageId: 12, sourceMessageIds: [12],
+    queueOrder: 2, queueLane: "control", laneOrder: 2, statusSummary: "continue", queuedAttachments: [],
+    content: [{ type: "text", text: "continue" }], historyText: "continue",
+    admissionReceipts: [{ queueKind: "prompt", receiptId: "continue-12", sourceUpdateIds: [12] }] }, "ctx");
+  assert.equal(runtime.mutation.applyReactionByMessageId(12, { kind: "suppressed", emoji: "👎" }, "ctx", { chatId: 7 }), true,
+    "Production composition passes the dispatched-head guard to source-owned continuation cancellation");
+  assert.equal(store.getQueuedItems().length, 0);
+  assert.deepEqual(events.slice(-3), ["status", "discard:1", "status"]);
 });
 
 for (const preparation of ["text", "voice", "attachment"] as const) {

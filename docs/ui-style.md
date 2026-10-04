@@ -247,7 +247,7 @@ Rules:
 - Keep the emoji and complete sentence or heading inside the single bold span; do not bold only a fragment. A material name or phrase may receive nested italic emphasis without breaking the outer bold hierarchy—for example `<b>📡 Instance <i>Cedar</i> connected.</b>`.
 - Apply the same hierarchy to success, progress, empty, busy, unavailable, cancellation, and failure notices.
 - Once an action has settled, describe only the completed result in completed-state language. Do not append transitional copy such as “returning” or “starting”; use a separate progress surface only while work is genuinely still pending.
-- Callback alerts remain plain text because Telegram does not support rich text there, but still keep the relevant emoji and concise sentence.
+- Transient callback toasts remain plain text with the relevant emoji and concise wording, without a terminal sentence period. The shared typed callback-answer boundary applies this on direct and follower delivery while preserving question/exclamation marks and ellipses. In-chat notices, headings, blocking alerts and explicit raw API payloads retain their own punctuation contracts.
 - Setting detail cards may include an emoji in the heading, then a colon and the current value in `<code>`.
 - Explain what the setting does and what the options mean only as much as needed.
 - Order setting value descriptions exactly like the chooser: rows top-to-bottom and values in a shared row left-to-right. Keep `(default)` on the actual default wherever it falls; default status never changes order.

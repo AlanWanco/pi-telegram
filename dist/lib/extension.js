@@ -943,6 +943,9 @@ export default function (pi) {
                 return telegramJournalBindingRuntime.inspectSourceAbandonment(journalBindingKey, updateId);
             });
         },
+        inspectRoutingInputGroupExpiry(input) {
+            return telegramJournalReferenceRegistry.withReference({ referenceClass: "operator-disposition", recoveryKey: input.journalBindingKey }, function () { return telegramJournalBindingRuntime.inspectSourceGroupExpiry(input.journalBindingKey, input.updateIds); });
+        },
         inspectTemporaryThreadSources(_target, requiredJournalBindingKeys) {
             const binding = resolveTelegramUpdateJournalBinding();
             const botToken = configStore.getBotToken();
