@@ -142,7 +142,7 @@ await test("resolveTelegramTempDir", () => {
   );
 });
 
-await test("resolveTelegramTempDir canonicalizes a symlinked agent directory for strict journal anchors", () => {
+await test("resolveTelegramTempDir canonicalizes a symlinked agent directory for strict journal anchors", { skip: process.platform === "win32" }, () => {
   const real = realpathSync(mkdtempSync(join(tmpdir(), "pi-telegram-paths-real-")));
   const link = `${real}-link`;
   try {

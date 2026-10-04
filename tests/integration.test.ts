@@ -21,7 +21,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import testRoot, { mock, type TestContext } from "node:test";
+import testRoot, { after, mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
@@ -60,6 +60,11 @@ import {
   type TelegramApiClient,
   type TelegramBridgeApiRuntime,
 } from "../lib/telegram-api.ts";
+
+// Production timers are unref'd so they never hold Pi open; a live Pi process keeps the loop alive. Mirror that so
+// Node 22's runner does not abort runtime tests that await those timers.
+const eventLoopKeepAlive = setInterval(() => {}, 60_000);
+after(() => { clearInterval(eventLoopKeepAlive); });
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];

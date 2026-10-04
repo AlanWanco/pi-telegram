@@ -55,10 +55,11 @@ export function resolveTelegramConfigPath() {
 /**
  * Resolve symlinks in the longest existing prefix of `path` and keep the missing suffix. Strict journal reads require
  * canonical anchors, so a symlinked agent directory (for example macOS `/var` → `/private/var`) must not leak in.
- * Relative input is returned unchanged so callers' exact-absolute-path guards still reject it.
+ * Relative input is returned unchanged so callers' exact-absolute-path guards still reject it. Windows keeps its
+ * spelling: strict journal reads are POSIX-only there, and resolving a drive-less root would add a drive letter.
  */
 function canonicalizeExistingPrefix(path) {
-    if (!isAbsolute(path))
+    if (!isAbsolute(path) || process.platform === "win32")
         return path;
     const absolute = resolve(path);
     const missing = [];
