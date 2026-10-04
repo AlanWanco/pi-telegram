@@ -9,7 +9,7 @@ _This file owns unresolved project work only. Completed behavior belongs in `CHA
 
 ## Transport Recovery Acceptance
 
-- [ ] Verify native Linux/macOS/Windows CI for capped poll/admission backoff, preserved persistent-conflict stand-down and generation-fenced manual disconnect. Existing skipped strict journal witnesses remain a separate Windows boundary.
+- CI boundary: Native Linux/macOS/Windows checks exercise capped poll/admission backoff, preserved persistent-conflict stand-down and generation-fenced manual disconnect. Existing skipped strict journal witnesses remain a separate Windows boundary; green CI does not replace operator acceptance.
 - [ ] Obtain operator acceptance for ordinary disconnect, unconfirmed-cleanup reporting and outage recovery without manual reconnect on a disposable setup. Local fake-transport/storage regressions do not certify real Telegram or platform fault behavior; installation/reload and live fault injection require separate authorization.
 - Acceptance: Captured manual stop never affects a replacement connection or bypasses Thread deletion fences, uncertain stop is not retried, and accepted local work is preserved. Session-restart cleanup remains admission-required.
 
