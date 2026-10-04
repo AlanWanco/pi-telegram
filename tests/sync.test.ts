@@ -1758,7 +1758,7 @@ test("Thread disconnect and restart cleanup stop before mutation behind every re
         if (testCase.entrypoint === "disconnect") {
           // A blocked Workspace admission must never leave the local transport running.
           const message = await assembly.disconnect();
-          assert.match(message, /^stopped\. Thread cleanup was skipped: /u);
+          assert.equal(message, "stopped. Thread cleanup was not confirmed. Check /telegram-status --debug.");
           assert.deepEqual(mutations, ["stop-polling"]);
         } else {
           await assert.rejects(
@@ -1821,12 +1821,128 @@ test("Manual disconnect stops the transport when Workspace admission reports cor
 
   assert.equal(
     await assembly.disconnect(),
-    "Telegram bridge disconnected. Thread cleanup was skipped: Telegram Workspace admission state is malformed.",
+    "Telegram bridge disconnected. Thread cleanup was not confirmed. Check /telegram-status --debug.",
   );
   assert.deepEqual(events, [
     "event:connection:Telegram Workspace admission state is malformed.:disconnect-cleanup",
     "stop-polling",
   ]);
+});
+
+test("Manual disconnect fences cleanup and fallback stop across connection replacement", async () => {
+  for (const replaceAt of ["admission", "intent-persist", "api-reply"] as const) {
+    let generation = 1;
+    let captures = 0;
+    let stops = 0;
+    let reads = 0;
+    const apiCalls: string[] = [];
+    const mutations: string[] = [];
+    const assembly = createTelegramThreadDisconnectAssembly({
+      instanceId: "leader-runtime:1",
+      captureStopPolling() {
+        captures++;
+        const expected = generation;
+        return {
+          isCurrent: () => generation === expected,
+          async stop() {
+            if (generation !== expected) throw new Error("Telegram disconnect was superseded by a new connection.");
+            stops++;
+            return "stopped";
+          },
+        };
+      },
+      getCurrentThreadRecord() {
+        reads++;
+        return { owner: { kind: "leader" }, instanceId: "leader-runtime:1", target: { chatId: 7, threadId: 42 } };
+      },
+      topicTargetStore: {
+        list: () => [],
+        upsertPendingCleanup: () => { mutations.push("intent"); },
+        persist: async () => { if (replaceAt === "intent-persist") generation++; },
+        markStaleByTarget: () => { mutations.push("mark-stale"); return false; },
+        removePendingCleanup: () => { mutations.push("remove-intent"); return false; },
+      },
+      async callApi<TResponse>(method: string) {
+        apiCalls.push(method);
+        if (replaceAt === "api-reply") generation++;
+        return { ok: true } as TResponse;
+      },
+      getCurrentLeaderEpoch: () => 1,
+      getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+      clearLeaderTarget: () => { mutations.push("clear-target"); },
+      getSyncState: createUnknownTelegramSyncState,
+      setSyncState: () => { mutations.push("sync"); },
+      stopPolling: async () => { assert.fail("Uncaptured stop must not touch the replacement"); },
+      suspendPolling: async () => {},
+      recordRuntimeEvent: () => {},
+      async runWorkspaceOperation(_input, operation) {
+        if (replaceAt === "admission") generation++;
+        return operation();
+      },
+    });
+    await assert.rejects(assembly.disconnect(), /superseded by a new connection/);
+    assert.equal(captures, 1);
+    assert.equal(stops, 0);
+    assert.deepEqual(apiCalls, replaceAt === "api-reply" ? ["closeForumTopic"] : []);
+    assert.deepEqual(mutations, replaceAt === "admission" ? [] : ["intent"]);
+    assert.equal(reads, replaceAt === "admission" ? 0 : 1);
+  }
+});
+
+test("Manual disconnect does not retry failed stop or claim uncertain cleanup was skipped", async () => {
+  for (const failureAt of ["admission", "follower-reply", "stop"] as const) {
+    let stops = 0;
+    const apiCalls: string[] = [];
+    const diagnostics: string[] = [];
+    const assembly = createTelegramThreadDisconnectAssembly({
+      instanceId: "leader-runtime:1",
+      getCurrentThreadRecord: () => failureAt === "stop" ? undefined : {
+        owner: { kind: failureAt === "follower-reply" ? "manual-follower" : "leader" },
+        instanceId: "leader-runtime:1", target: { chatId: 7, threadId: 42 },
+      },
+      async disconnectFollowerThread() {
+        apiCalls.push("follower.disconnect");
+        throw new Error("Follower deletion reply unknown: private details");
+      },
+      topicTargetStore: {
+        list: () => [],
+        upsertPendingCleanup: () => {},
+        persist: async () => {},
+        markStaleByTarget: () => false,
+        removePendingCleanup: () => false,
+      },
+      async callApi<TResponse>(method: string) {
+        apiCalls.push(method);
+        return { ok: true } as TResponse;
+      },
+      getCurrentLeaderEpoch: () => failureAt === "follower-reply" ? undefined : 1,
+      getLeaderTarget: () => undefined,
+      clearLeaderTarget: () => {},
+      getSyncState: createUnknownTelegramSyncState,
+      setSyncState: () => {},
+      async stopPolling() {
+        stops++;
+        if (failureAt === "stop") throw new Error("Release reply unknown");
+        return "Telegram bridge disconnected.";
+      },
+      suspendPolling: async () => {},
+      recordRuntimeEvent: (_category, _error, details) => { diagnostics.push(String(details?.phase)); },
+      async runWorkspaceOperation(_input, operation) {
+        if (failureAt === "admission") throw new Error("Admission unavailable: private details");
+        return operation();
+      },
+    });
+    if (failureAt === "stop") {
+      await assert.rejects(assembly.disconnect(), /Release reply unknown/);
+    } else {
+      assert.equal(await assembly.disconnect(),
+        "Telegram bridge disconnected. Thread cleanup was not confirmed. Check /telegram-status --debug.");
+      assert.ok(diagnostics.includes("disconnect-cleanup"));
+    }
+    assert.equal(stops, 1, "An uncertain stop outcome cannot authorize another teardown");
+    if (failureAt === "stop") assert.deepEqual(diagnostics, ["disconnect-stop"]);
+    assert.deepEqual(apiCalls, failureAt === "follower-reply" ? ["follower.disconnect"] : []);
+  }
 });
 
 test("Manual follower disconnect delegates thread deletion to its live leader", async () => {

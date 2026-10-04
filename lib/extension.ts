@@ -1539,9 +1539,6 @@ export default function (pi: Pi.ExtensionAPI) {
       onPersistentConflict(ctx, count): Promise<void> {
         return lockedPollingRuntime.onPersistentConflict(ctx, count);
       },
-      onRetryExhausted(ctx, count): Promise<void> {
-        return lockedPollingRuntime.onRetryExhausted(ctx, count);
-      },
       getConfig: configStore.get,
       hasBotToken: configStore.hasBotToken,
       deleteWebhook,
@@ -1821,6 +1818,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getSyncState: telegramSyncStateRuntime.getState,
     setSyncState: telegramSyncStateRuntime.setState,
     stopPolling: lockedPollingRuntime.stop,
+    captureStopPolling: lockedPollingRuntime.captureStop,
     suspendPolling: lockedPollingRuntime.suspend,
     recordRuntimeEvent,
     runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,

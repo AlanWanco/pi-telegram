@@ -2990,48 +2990,47 @@ test("Persistent conflicts stop watchers and monitoring, revoke sends, and relea
   }
 });
 
-test("Retry exhaustion stops transport, monitoring, and exact ownership", async () => {
-  const temp = createTempLockPath();
-  const ctx = { cwd: "/repo" };
-  const lock = createTelegramLockRuntime({
-    locksPath: temp.path, pid: 10, instanceId: "local", isProcessAlive: () => true,
-  });
-  let stops = 0;
-  let monitoring = false;
-  const diagnostics: Array<{ message: string; details: Record<string, unknown> | undefined }> = [];
-  const runtime = createTelegramLockedPollingRuntime({
-    lock, hasBotToken: () => true,
-    startPolling: async () => {}, stopPolling: async () => { stops++; },
-    transportMonitor: { start: () => { monitoring = true; }, stop: () => { monitoring = false; } },
-    updateStatus: () => {},
-    recordRuntimeEvent: (_category, error, details) => {
-      const message = error instanceof Error ? error.message : String(error);
-      diagnostics.push({ message, details });
-    },
-  });
-  try {
-    assert.equal((await runtime.start(ctx)).ok, true);
-    assert.equal(monitoring, true);
-    await runtime.onRetryExhausted(ctx, 8);
-    assert.equal(stops, 1);
-    assert.equal(monitoring, false);
-    assert.equal(lock.owns(ctx), false);
-    assert.equal(lock.refresh(ctx), false);
-    assert.equal(diagnostics.length, 1);
-    assert.equal(diagnostics[0]?.details?.phase, "retry-exhausted");
-    assert.equal(diagnostics[0]?.details?.count, 8);
-    assert.equal(diagnostics[0]?.details?.ownership, "owned");
-    assert.equal(
-      diagnostics[0]?.message,
-      "Telegram transport stopped: polling failed repeatedly; run /telegram-connect to retry.",
-    );
-    // A later stand-down attempt must not stop the transport twice.
-    await runtime.onRetryExhausted(ctx, 8);
-    assert.equal(stops, 1);
-    assert.equal(diagnostics.length, 1);
-  } finally {
-    await runtime.suspend();
-    rmSync(temp.dir, { recursive: true, force: true });
+test("Captured disconnect cannot stop or release a replacement connection", async () => {
+  for (const replacementAt of ["before-stop", "during-stop"] as const) {
+    const temp = createTempLockPath();
+    const ctx = { cwd: "/repo" };
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path, pid: 10, instanceId: "local", isProcessAlive: () => true,
+    });
+    let stops = 0;
+    let releaseStop!: () => void;
+    const heldStop = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock, hasBotToken: () => true, startPolling: async () => {}, updateStatus: () => {},
+      stopPolling: async () => {
+        stops++;
+        if (replacementAt === "during-stop" && stops === 1) await heldStop;
+      },
+    });
+    try {
+      assert.equal((await runtime.start(ctx)).ok, true);
+      const captured = runtime.captureStop();
+      assert.equal(captured.isCurrent(), true);
+      const stopping = replacementAt === "during-stop" ? captured.stop() : undefined;
+      assert.equal((await runtime.start(ctx)).ok, true);
+      const replacement = readFileSync(temp.path, "utf8");
+      const epoch = lock.getOwnedLeaderEpoch();
+      assert.equal(captured.isCurrent(), false);
+      releaseStop();
+      const [settlement] = await Promise.allSettled([stopping ?? captured.stop()]);
+      assert.equal(stops, replacementAt === "during-stop" ? 1 : 0);
+      assert.equal(readFileSync(temp.path, "utf8"), replacement);
+      assert.equal(lock.getOwnedLeaderEpoch(), epoch);
+      assert.equal(lock.owns(ctx), true);
+      assert.equal(lock.commitIfOwned(() => true), true);
+      assert.equal(runtime.captureTransportAuthority(ctx)?.(), true);
+      assert.equal(settlement.status, "rejected");
+      if (settlement.status === "rejected") assert.match(String(settlement.reason), /superseded by a new connection/);
+    } finally {
+      releaseStop();
+      await runtime.suspend();
+      rmSync(temp.dir, { recursive: true, force: true });
+    }
   }
 });
 

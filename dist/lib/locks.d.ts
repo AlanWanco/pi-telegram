@@ -215,12 +215,16 @@ type TelegramLockedPollingStartResult = {
 export interface TelegramLockedPollingRuntime<TContext extends TelegramLockContext> {
     start: (ctx: TContext, options?: TelegramLockedPollingStartOptions) => Promise<TelegramLockedPollingStartResult>;
     stop: () => Promise<string>;
+    /** Capture one disconnect attempt before cleanup awaits; a newer start revokes it. */
+    captureStop: () => {
+        isCurrent: () => boolean;
+        stop: () => Promise<string>;
+    };
     suspend: () => Promise<void>;
     isSuspended: () => boolean;
     /** Fence one owned polling generation; suspension, restart, conflict or lock loss revokes it. */
     captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
     onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
-    onRetryExhausted: (ctx: TContext, count: number) => Promise<void>;
     onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
     registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;

@@ -92,6 +92,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
     recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     runWorkspaceOperation: TelegramSyncWorkspaceOperationRunner;
     workspaceOperationKind?: string;
+    isDisconnectCurrent?: () => boolean;
     getNowMs?: () => number;
 }
 export declare function createTelegramPreservedLeaderQuitHandler(deps: {
@@ -112,6 +113,10 @@ export interface TelegramThreadDisconnectAssembly {
 }
 export declare function createTelegramThreadDisconnectAssembly<TSyncState extends TelegramSyncState>(deps: Omit<TelegramManualThreadDisconnectDeps<TSyncState>, "stopPolling"> & {
     stopPolling: () => Promise<string>;
+    captureStopPolling?: () => {
+        isCurrent: () => boolean;
+        stop: () => Promise<string>;
+    };
     suspendPolling: () => Promise<void>;
 }): TelegramThreadDisconnectAssembly;
 export declare function createTelegramManualThreadDisconnectHandler<TSyncState extends TelegramSyncState>(deps: TelegramManualThreadDisconnectDeps<TSyncState>): () => Promise<string>;

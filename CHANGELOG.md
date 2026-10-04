@@ -4,8 +4,8 @@
 
 ## Unreleased
 
-- `Polling stand-down`: Consecutive non-conflict polling failures now use exponential backoff and stop after a bounded attempt count instead of retrying forever. The terminal stop releases local ownership, stops the typing loop and transport, and reports `retry-exhausted` in the status bar, so one unreachable endpoint or permanent transport failure cannot leave Telegram traffic running with no operator remedy.
-- `Disconnect durability`: Unreadable, malformed, or fenced Workspace admission state can no longer block `/telegram-disconnect`. A failed Thread cleanup is reported as skipped after local polling stops and ownership releases, so the bridge never stays connected just because durable cleanup authority is unavailable.
+- `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.
+- `Disconnect safety`: Failed or unavailable Thread cleanup still attempts one captured local transport stop without bypassing Workspace fences. Reconnect revokes stale cleanup/stop continuations; delayed teardown cannot release replacement ownership. Unconfirmed cleanup is reported without claiming it was skipped, while uncertain stop/release outcomes remain incomplete and are never blindly retried.
 
 ## 0.52.1: Finite chooser lifetime, continue cancellation and callback copy
 

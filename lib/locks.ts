@@ -1489,12 +1489,13 @@ export interface TelegramLockedPollingRuntime<
     options?: TelegramLockedPollingStartOptions,
   ) => Promise<TelegramLockedPollingStartResult>;
   stop: () => Promise<string>;
+  /** Capture one disconnect attempt before cleanup awaits; a newer start revokes it. */
+  captureStop: () => { isCurrent: () => boolean; stop: () => Promise<string> };
   suspend: () => Promise<void>;
   isSuspended: () => boolean;
   /** Fence one owned polling generation; suspension, restart, conflict or lock loss revokes it. */
   captureTransportAuthority: (ctx: TContext) => (() => boolean) | undefined;
   onPersistentConflict: (ctx: TContext, count: number) => Promise<void>;
-  onRetryExhausted: (ctx: TContext, count: number) => Promise<void>;
   onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
   registerFollowerWithOwner?: (
     ctx: TContext,
@@ -1583,6 +1584,7 @@ export function createTelegramLockedPollingRuntime<
       stopOwnershipWatcher();
       if (sessionAutoStartRun) {
         await sessionAutoStartRun;
+        if (generation !== pollingGeneration) return;
         deps.stopFollowerRegistration?.();
       }
       if (ownershipStop) {
@@ -1688,49 +1690,19 @@ export function createTelegramLockedPollingRuntime<
   const formatStartBlockedMessage = (ctx: TContext): string =>
     deps.formatStartBlockedMessage?.(ctx) ??
     "Telegram polling is unavailable in this Pi run mode.";
-  // A terminal polling failure must release local ownership and stop the
-  // transport, otherwise polling keeps retrying with no operator remedy.
-  const standDownTransport = async (
-    ctx: TContext,
-    terminal: "persistent-conflict" | "retry-exhausted",
-    count: number,
-  ): Promise<void> => {
-    if (activeContext === undefined || ownershipStop) return;
-    if (!(deps.isContextCurrent?.(ctx) ?? activeContext === ctx)) return;
-    activeContext = undefined;
-    pollingGeneration += 1;
-    stopOwnershipWatcher();
-    deps.transportMonitor?.stop();
-    let ownership = "unverifiable";
-    const cleanupErrors: string[] = [];
-    try {
-      ownership = deps.lock.owns(snapshotLockContext(ctx)) ? "owned" : "lost";
-    } catch (error) {
-      cleanupErrors.push(String(error));
-    }
-    try {
-      deps.lock.release();
-    } catch (error) {
-      ownership = "unverifiable";
-      cleanupErrors.push(String(error));
-    }
-    ownershipStop = Promise.resolve()
-      .then(() => deps.stopPolling())
-      .catch((error) => { cleanupErrors.push(String(error)); })
-      .finally(() => {
-        ownershipStop = undefined;
-        deps.recordRuntimeEvent?.("polling", terminal === "persistent-conflict"
-          ? (ownership === "lost"
-            ? "Telegram transport stopped: local ownership lost; check for another Pi instance."
-            : "Telegram transport stopped: competing getUpdates client or ownership mismatch.")
-          : "Telegram transport stopped: polling failed repeatedly; run /telegram-connect to retry.", {
-          phase: terminal, count, ownership,
-          ...(cleanupErrors.length ? { cleanupErrors } : {}),
-        });
-        deps.updateStatus(ctx);
-      });
+  const stop = async (): Promise<string> => {
+    const generation = pollingGeneration + 1;
+    await suspendPolling();
+    if (generation !== pollingGeneration) throw new Error("Telegram disconnect was superseded by a new connection.");
+    const state = deps.lock.release();
     deps.onTransportAvailabilityChanged?.();
-    await ownershipStop;
+    if (state.kind === "active-elsewhere") {
+      return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
+    }
+    if (state.kind === "stale") {
+      return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
+    }
+    return "Telegram bridge disconnected.";
   };
   return {
     start: async (ctx, options = {}) => {
@@ -1843,17 +1815,17 @@ export function createTelegramLockedPollingRuntime<
       const staleSuffix = acquired.replacedStale ? " Replaced stale lock." : "";
       return { ok: true, message: `Telegram bridge connected.${staleSuffix}` };
     },
-    stop: async () => {
-      await suspendPolling();
-      const state = deps.lock.release();
-      deps.onTransportAvailabilityChanged?.();
-      if (state.kind === "active-elsewhere") {
-        return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
-      }
-      if (state.kind === "stale") {
-        return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
-      }
-      return "Telegram bridge disconnected.";
+    stop,
+    captureStop() {
+      const generation = pollingGeneration;
+      const isCurrent = () => generation === pollingGeneration;
+      return {
+        isCurrent,
+        async stop() {
+          if (!isCurrent()) throw new Error("Telegram disconnect was superseded by a new connection.");
+          return stop();
+        },
+      };
     },
     suspend: suspendPolling,
     captureTransportAuthority(ctx) {
@@ -1864,10 +1836,42 @@ export function createTelegramLockedPollingRuntime<
     },
     isSuspended: () => suspendedGeneration === pollingGeneration &&
       suspensionsInFlight === 0 && startupsInFlight === 0 && !sessionAutoStartRun && !ownershipStop,
-    onPersistentConflict: (ctx, count) =>
-      standDownTransport(ctx, "persistent-conflict", count),
-    onRetryExhausted: (ctx, count) =>
-      standDownTransport(ctx, "retry-exhausted", count),
+    onPersistentConflict: async (ctx, count) => {
+      if (activeContext === undefined || ownershipStop) return;
+      if (!(deps.isContextCurrent?.(ctx) ?? activeContext === ctx)) return;
+      activeContext = undefined;
+      pollingGeneration += 1;
+      stopOwnershipWatcher();
+      deps.transportMonitor?.stop();
+      let ownership = "unverifiable";
+      const cleanupErrors: string[] = [];
+      try {
+        ownership = deps.lock.owns(snapshotLockContext(ctx)) ? "owned" : "lost";
+      } catch (error) {
+        cleanupErrors.push(String(error));
+      }
+      try {
+        deps.lock.release();
+      } catch (error) {
+        ownership = "unverifiable";
+        cleanupErrors.push(String(error));
+      }
+      ownershipStop = Promise.resolve()
+        .then(() => deps.stopPolling())
+        .catch((error) => { cleanupErrors.push(String(error)); })
+        .finally(() => {
+          ownershipStop = undefined;
+          deps.recordRuntimeEvent?.("polling", ownership === "lost"
+            ? "Telegram transport stopped: local ownership lost; check for another Pi instance."
+            : "Telegram transport stopped: competing getUpdates client or ownership mismatch.", {
+            phase: "persistent-conflict", count, ownership,
+            ...(cleanupErrors.length ? { cleanupErrors } : {}),
+          });
+          deps.updateStatus(ctx);
+        });
+      deps.onTransportAvailabilityChanged?.();
+      await ownershipStop;
+    },
     onSessionStart: async (_event, ctx) => {
       if (!deps.hasBotToken()) return;
       if (!canStartPolling(ctx)) return;

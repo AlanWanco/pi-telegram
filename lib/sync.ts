@@ -176,6 +176,7 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
   ) => void;
   runWorkspaceOperation: TelegramSyncWorkspaceOperationRunner;
   workspaceOperationKind?: string;
+  isDisconnectCurrent?: () => boolean;
   getNowMs?: () => number;
 }
 
@@ -270,39 +271,42 @@ export function createTelegramThreadDisconnectAssembly<
 >(
   deps: Omit<TelegramManualThreadDisconnectDeps<TSyncState>, "stopPolling"> & {
     stopPolling: () => Promise<string>;
+    captureStopPolling?: () => { isCurrent: () => boolean; stop: () => Promise<string> };
     suspendPolling: () => Promise<void>;
   },
 ): TelegramThreadDisconnectAssembly {
-  const disconnect = createTelegramManualThreadDisconnectHandler({
-    ...deps,
-    workspaceOperationKind: "workspace.disconnect-thread",
-    stopPolling: deps.stopPolling,
-  });
   return {
     async disconnect() {
+      const captured = deps.captureStopPolling?.();
+      const stop = captured?.stop ?? deps.stopPolling;
+      let stopAttempted = false;
+      const disconnect = createTelegramManualThreadDisconnectHandler({
+        ...deps,
+        workspaceOperationKind: "workspace.disconnect-thread",
+        isDisconnectCurrent: captured?.isCurrent ?? deps.isDisconnectCurrent,
+        stopPolling() {
+          stopAttempted = true;
+          return stop();
+        },
+      });
       try {
         return await disconnect();
       } catch (error) {
-        // Thread cleanup can need durable Workspace authority that is unreadable,
-        // malformed, or fenced. Local transport ownership never does, so a failed
-        // cleanup must still stop polling instead of leaving it running forever.
-        deps.recordRuntimeEvent("connection", error, {
-          phase: "disconnect-cleanup",
-        });
-        let stopped: string | undefined;
-        try {
-          stopped = await deps.stopPolling();
-        } catch (stopError) {
-          deps.recordRuntimeEvent("connection", stopError, {
-            phase: "disconnect-stop",
-          });
+        // Never retry a stop whose teardown/release outcome may already have committed.
+        if (stopAttempted) {
+          deps.recordRuntimeEvent("connection", error, { phase: "disconnect-stop" });
+          throw error;
         }
-        const reason = error instanceof Error ? error.message : String(error);
-        if (!stopped) return `Telegram bridge disconnect was incomplete: ${reason}`;
-        // The stop message is owned by the lock runtime; keep the two sentences
-        // separated even when it omits terminal punctuation.
+        deps.recordRuntimeEvent("connection", error, { phase: "disconnect-cleanup" });
+        let stopped: string;
+        try {
+          stopped = await stop();
+        } catch (stopError) {
+          deps.recordRuntimeEvent("connection", stopError, { phase: "disconnect-stop" });
+          throw stopError;
+        }
         const separator = /[.!?]$/u.test(stopped) ? " " : ". ";
-        return `${stopped}${separator}Thread cleanup was skipped: ${reason}`;
+        return `${stopped}${separator}Thread cleanup was not confirmed. Check /telegram-status --debug.`;
       }
     },
     cleanupForSessionRestart:
@@ -316,7 +320,11 @@ export function createTelegramThreadDisconnectAssembly<
 export function createTelegramManualThreadDisconnectHandler<
   TSyncState extends TelegramSyncState,
 >(deps: TelegramManualThreadDisconnectDeps<TSyncState>): () => Promise<string> {
+  const assertCurrent = () => {
+    if (deps.isDisconnectCurrent?.() === false) throw new Error("Telegram disconnect was superseded by a new connection.");
+  };
   const operation = async (): Promise<string> => {
+    assertCurrent();
     const currentRecord = deps.getCurrentThreadRecord();
     let cleanupPending = false;
     if (currentRecord?.target.threadId) {
@@ -328,6 +336,7 @@ export function createTelegramManualThreadDisconnectHandler<
       if (isManualFollower && !ownsLeader) {
         if (deps.disconnectFollowerThread) {
           const disconnected = await deps.disconnectFollowerThread();
+          assertCurrent();
           if (!disconnected) {
             throw new Error(
               "Telegram follower thread deletion requires a live leader registration.",
@@ -355,6 +364,7 @@ export function createTelegramManualThreadDisconnectHandler<
         const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
         deps.topicTargetStore.upsertPendingCleanup(intent);
         await deps.topicTargetStore.persist();
+        assertCurrent();
         const cleanupPlan = ThreadReconciler.planThreadReconciliation({
           nowMs: (deps.getNowMs ?? Date.now)(),
           currentLeaderEpoch: leaderEpoch,
@@ -366,9 +376,11 @@ export function createTelegramManualThreadDisconnectHandler<
           {
             isCleanupTargetProtected,
             callApi(method, body) {
+              assertCurrent();
               return deps.callApi(method, body);
             },
             markStaleByTarget(targetToMark, syncStatus, lastSyncError) {
+              assertCurrent();
               return deps.topicTargetStore.markStaleByTarget(
                 targetToMark,
                 syncStatus,
@@ -376,15 +388,18 @@ export function createTelegramManualThreadDisconnectHandler<
               );
             },
             removeCleanupIntentById(id) {
+              assertCurrent();
               return deps.topicTargetStore.removePendingCleanup(id);
             },
             persist() {
+              assertCurrent();
               return deps.topicTargetStore.persist();
             },
             getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
             recordRuntimeEvent: deps.recordRuntimeEvent,
           },
         );
+        assertCurrent();
         if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) {
           return "Thread disconnect superseded by a new binding.";
         }
@@ -404,6 +419,7 @@ export function createTelegramManualThreadDisconnectHandler<
         }) as TSyncState,
       );
     }
+    assertCurrent();
     const stopped = await deps.stopPolling();
     return cleanupPending
       ? `${stopped} Telegram thread cleanup remains pending for the next leader.`
