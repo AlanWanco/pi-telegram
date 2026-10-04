@@ -1210,6 +1210,8 @@ export function createTelegramLockedPollingRuntime(deps) {
             stopOwnershipWatcher();
             if (sessionAutoStartRun) {
                 await sessionAutoStartRun;
+                if (generation !== pollingGeneration)
+                    return;
                 deps.stopFollowerRegistration?.();
             }
             if (ownershipStop) {
@@ -1325,6 +1327,21 @@ export function createTelegramLockedPollingRuntime(deps) {
     const canStartPolling = (ctx) => deps.canStartPolling?.(ctx) ?? true;
     const formatStartBlockedMessage = (ctx) => deps.formatStartBlockedMessage?.(ctx) ??
         "Telegram polling is unavailable in this Pi run mode.";
+    const stop = async () => {
+        const generation = pollingGeneration + 1;
+        await suspendPolling();
+        if (generation !== pollingGeneration)
+            throw new Error("Telegram disconnect was superseded by a new connection.");
+        const state = deps.lock.release();
+        deps.onTransportAvailabilityChanged?.();
+        if (state.kind === "active-elsewhere") {
+            return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
+        }
+        if (state.kind === "stale") {
+            return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
+        }
+        return "Telegram bridge disconnected.";
+    };
     return {
         start: async (ctx, options = {}) => {
             if (!deps.hasBotToken()) {
@@ -1440,17 +1457,18 @@ export function createTelegramLockedPollingRuntime(deps) {
             const staleSuffix = acquired.replacedStale ? " Replaced stale lock." : "";
             return { ok: true, message: `Telegram bridge connected.${staleSuffix}` };
         },
-        stop: async () => {
-            await suspendPolling();
-            const state = deps.lock.release();
-            deps.onTransportAvailabilityChanged?.();
-            if (state.kind === "active-elsewhere") {
-                return `Telegram bridge is active in another Pi instance (${formatTelegramLockEntry(state.lock)}).`;
-            }
-            if (state.kind === "stale") {
-                return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
-            }
-            return "Telegram bridge disconnected.";
+        stop,
+        captureStop() {
+            const generation = pollingGeneration;
+            const isCurrent = () => generation === pollingGeneration;
+            return {
+                isCurrent,
+                async stop() {
+                    if (!isCurrent())
+                        throw new Error("Telegram disconnect was superseded by a new connection.");
+                    return stop();
+                },
+            };
         },
         suspend: suspendPolling,
         captureTransportAuthority(ctx) {

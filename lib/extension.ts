@@ -1818,6 +1818,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getSyncState: telegramSyncStateRuntime.getState,
     setSyncState: telegramSyncStateRuntime.setState,
     stopPolling: lockedPollingRuntime.stop,
+    captureStopPolling: lockedPollingRuntime.captureStop,
     suspendPolling: lockedPollingRuntime.suspend,
     recordRuntimeEvent,
     runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,

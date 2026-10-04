@@ -7,6 +7,12 @@ _This file owns unresolved project work only. Completed behavior belongs in `CHA
 - [ ] Report the patch's precise shipped routing-lifetime scope externally only after separate authorization and verified release evidence. Do not claim a universal TTL or cleanup of historical originals lacking saved chooser clocks; native Windows destructive cleanup remains gated on strict evidence.
 - Evidence boundary: The operator reports passing TTL live acceptance. New continuation-reaction and callback-copy behavior has native regression evidence, not a separate live-client claim. Neither establishes native Windows Restore/destructive-cleanup support. Completed implementation is recorded in `CHANGELOG.md`; durable contracts remain in `/docs`.
 
+## Transport Recovery Acceptance
+
+- CI boundary: Native Linux/macOS/Windows checks exercise capped poll/admission backoff, preserved persistent-conflict stand-down and generation-fenced manual disconnect. Existing skipped strict journal witnesses remain a separate Windows boundary; green CI does not replace operator acceptance.
+- [ ] Obtain operator acceptance for ordinary disconnect, unconfirmed-cleanup reporting and outage recovery without manual reconnect on a disposable setup. Local fake-transport/storage regressions do not certify real Telegram or platform fault behavior; installation/reload and live fault injection require separate authorization.
+- Acceptance: Captured manual stop never affects a replacement connection or bypasses Thread deletion fences, uncertain stop is not retried, and accepted local work is preserved. Session-restart cleanup remains admission-required.
+
 ## Windows Reliability
 
 - [ ] Strengthen native Windows reliability beyond the 0.52.0 ordinary-queue fix. Audit filesystem paths, named pipes, locking, owner fencing, heartbeat and atomic publication; cover interrupted writes, damaged state, ownership changes and lost-ACK retries with focused regressions.
