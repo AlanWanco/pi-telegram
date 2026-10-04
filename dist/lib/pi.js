@@ -109,7 +109,8 @@ export function getExtensionContextCwd(ctx) {
     return ctx.cwd;
 }
 export function getExtensionContextSessionId(ctx) {
-    return ctx.sessionManager.getSessionId();
+    // Minimal hosts and stale contexts may omit a session manager; absence is not an invented ID.
+    return ctx?.sessionManager?.getSessionId?.();
 }
 export function isExtensionContextIdle(ctx) {
     return ctx.isIdle();

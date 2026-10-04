@@ -6,7 +6,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { resolveTelegramTempDir } from "./paths.js";
+import { resolveTelegramAttachmentsDir } from "./paths.js";
 import * as Replies from "./replies.js";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
 import { planTelegramButtonReply, } from "./outbound-buttons.js";
@@ -57,7 +57,7 @@ export function registerTelegramOutboundHandler(kind, handler) {
         }
     };
 }
-export function getTelegramOutboundProgrammaticHandlers(kind) {
+function getTelegramOutboundProgrammaticHandlers(kind) {
     const registry = getOrCreateOutboundHandlerRegistry();
     return [...(registry.handlers.get(kind) ?? [])];
 }
@@ -183,7 +183,7 @@ function getVoiceReplyTemplateValues(text, options) {
     };
 }
 function getDefaultTelegramVoiceTempDir() {
-    return resolveTelegramTempDir();
+    return resolveTelegramAttachmentsDir();
 }
 async function generateTelegramVoiceReplyFileWithHandler(text, options) {
     await mkdir(options.tempDir, { recursive: true });
@@ -275,7 +275,7 @@ async function transformTelegramOutboundTextWithHandler(text, options) {
     });
     return result.stdout.trim() || text;
 }
-export async function transformTelegramOutboundText(text, options) {
+async function transformTelegramOutboundText(text, options) {
     let transformed = text;
     for (const handler of findTelegramOutboundHandlers(options.handlers, "text")) {
         try {
@@ -316,7 +316,7 @@ async function transformTelegramOutboundReplyMarkup(replyMarkup, options) {
     }
     return { ...replyMarkup, inline_keyboard: translatedRows };
 }
-export async function transformTelegramOutboundTextReply(text, options) {
+async function transformTelegramOutboundTextReply(text, options) {
     const transformOptions = {
         handlers: options.handlers,
         cwd: options.cwd,

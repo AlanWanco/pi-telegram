@@ -684,7 +684,6 @@ test("Compaction observer stops typing on timeout and shutdown", () => {
     "typing:stop",
     "status",
     "compact:Compaction observer timed out",
-    "activity:compact-abandoned",
     "dispatch:request",
     "compact:true",
     "typing:start",
@@ -693,7 +692,7 @@ test("Compaction observer stops typing on timeout and shutdown", () => {
   ]);
 });
 
-test("Superseded compaction timeout cannot abandon the current observation", () => {
+test("Superseded compaction timeout cannot release the current observation", () => {
   const timers: Array<() => void> = [];
   const effects: string[] = [];
   const observer = createTelegramCompactionObserverRuntime({
@@ -711,9 +710,11 @@ test("Superseded compaction timeout cannot abandon the current observation", () 
   timers[0]!();
   assert.deepEqual(effects, ["active:true", "active:true"]);
   timers[1]!();
-  assert.deepEqual(effects, ["active:true", "active:true", "active:false", "abandoned", "dispatch"]);
+  assert.deepEqual(effects, ["active:true", "active:true", "active:false", "dispatch"]);
   timers[1]!();
-  assert.equal(effects.length, 5);
+  assert.equal(effects.length, 4);
+  observer.onSessionCompactFailed({} as never, ctx);
+  assert.deepEqual(effects.slice(4), ["active:false", "abandoned", "dispatch"]);
 });
 
 test("Stale compaction completion cannot cancel the replacement context timeout", () => {
@@ -740,6 +741,8 @@ test("Stale compaction completion cannot cancel the replacement context timeout"
   observer.onSessionCompactFailed({} as never, oldContext);
   assert.equal(timer, replacementTimer);
   timer!();
+  assert.equal(abandoned, 0);
+  observer.onSessionCompactFailed({} as never, currentContext);
   assert.equal(abandoned, 1);
 });
 

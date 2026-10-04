@@ -162,7 +162,7 @@ export function registerTelegramInboundHandler(
   };
 }
 
-export function getTelegramInboundProgrammaticHandlers(
+function getTelegramInboundProgrammaticHandlers(
   kind: string,
 ): TelegramInboundProgrammaticHandler[] {
   const registry = getOrCreateInboundHandlerRegistry();
@@ -255,7 +255,7 @@ export function telegramInboundHandlerMatchesFile(
   return matchesAnyPattern(matchPatterns, file.kind);
 }
 
-export function findTelegramInboundHandlers(
+function findTelegramInboundHandlers(
   handlers: TelegramInboundHandlerConfig[] | undefined,
   file: TelegramInboundHandlerFile,
 ): TelegramInboundHandlerConfig[] {

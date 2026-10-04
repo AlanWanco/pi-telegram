@@ -11,6 +11,7 @@ import type {
   TelegramInlineKeyboardMarkup,
 } from "./keyboard.ts";
 import {
+  getTelegramActionString as getTelegramButtonString,
   parseTelegramActionPayloadRows,
   parseTelegramButtonPayloadRows,
   replaceTelegramButtonFences,
@@ -99,16 +100,6 @@ function nowMs(): number {
 
 function normalizeMarkdownAfterButtonExtraction(markdown: string): string {
   return markdown.replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function getTelegramButtonString(
-  payload: Record<string, unknown>,
-  key: string,
-): string | undefined {
-  const value = payload[key];
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed || undefined;
 }
 
 function parseTelegramButtonAction(

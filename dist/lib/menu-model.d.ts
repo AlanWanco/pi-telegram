@@ -177,7 +177,6 @@ export interface TelegramModelMenuRuntime<TModel extends MenuModel = MenuModel> 
 export declare const TELEGRAM_MODEL_PAGE_SIZE = 6;
 export declare const MODEL_MENU_TITLE = "<b>\uD83E\uDD16 Choose a model:</b>";
 export declare const MODEL_PAGE_MENU_TITLE = "<b>Choose a page:</b>";
-export declare const MODEL_DETAIL_MENU_TITLE = "<b>\uD83E\uDD16 Model:</b>";
 export declare function formatScopedModelButtonText<TModel extends MenuModel = MenuModel>(entry: ScopedTelegramModel<TModel>, currentModel: TModel | undefined): string;
 export declare function formatStatusButtonLabel(label: string, value: string): string;
 export declare function getModelMenuItems<TModel extends MenuModel = MenuModel>(state: TelegramModelMenuState<TModel>): ScopedTelegramModel<TModel>[];
@@ -195,21 +194,11 @@ export declare function buildTelegramModelMenuStateRuntime<TContext extends Tele
 export declare function applyTelegramModelScopeSelection(state: TelegramModelMenuState, value: string | undefined): TelegramMenuMutationResult;
 export declare function applyTelegramModelPageSelection(state: TelegramModelMenuState, value: string | undefined): TelegramMenuMutationResult;
 export declare function getTelegramModelSelection<TModel extends MenuModel = MenuModel>(state: TelegramModelMenuState<TModel>, value: string | undefined): TelegramMenuSelectionResult<TModel>;
-export declare function applyTelegramModelDetailSelection(state: TelegramModelMenuState, value: string | undefined): TelegramMenuMutationResult;
-export declare function getTelegramSelectedDetailModel<TModel extends MenuModel = MenuModel>(state: TelegramModelMenuState<TModel>): TelegramMenuSelectionResult<TModel>;
-export declare function isTelegramModelScoped(state: TelegramModelMenuState, model: MenuModel): boolean;
-export declare function focusTelegramModelListPage(state: TelegramModelMenuState, model: MenuModel, pageSize?: number): void;
-export declare function setTelegramModelScope(state: TelegramModelMenuState, model: MenuModel, enabled: boolean): {
-    patterns: string[];
-    enabled: boolean;
-};
 export declare function buildTelegramModelCallbackPlan<TModel extends MenuModel = MenuModel>(params: BuildTelegramModelCallbackPlanParams<TModel>): TelegramModelCallbackPlan<TModel>;
 export declare function openTelegramModelMenu<TModel extends MenuModel = MenuModel>(deps: TelegramModelMenuOpenDeps<TModel>): Promise<void>;
 export declare function handleTelegramModelMenuCallbackAction<TModel extends MenuModel = MenuModel>(callbackQueryId: string, params: BuildTelegramModelCallbackPlanParams<TModel>, deps: TelegramModelMenuCallbackDeps<TModel>): Promise<boolean>;
 export declare function getTelegramModelMenuPage(state: TelegramModelMenuState, pageSize: number): TelegramModelMenuPage;
 export declare function buildModelMenuReplyMarkup(state: TelegramModelMenuState, currentModel: MenuModel | undefined, pageSize: number): TelegramReplyMarkup;
-export declare function buildModelDetailMenuReplyMarkup(state: TelegramModelMenuState, currentModel: MenuModel | undefined): TelegramReplyMarkup;
-export declare function buildModelDetailMenuText(state: TelegramModelMenuState): string;
 export declare function buildModelPageMenuReplyMarkup(state: TelegramModelMenuState, pageSize: number): TelegramReplyMarkup;
 export declare function buildTelegramModelPageMenuRenderPayload(state: TelegramModelMenuState): TelegramMenuRenderPayload;
 export declare function buildTelegramModelMenuRenderPayload(state: TelegramModelMenuState, activeModel: MenuModel | undefined): TelegramMenuRenderPayload;

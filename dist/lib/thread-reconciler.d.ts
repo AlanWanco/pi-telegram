@@ -192,6 +192,8 @@ export interface ThreadReconciliationApplyResult {
     incompleteActions?: ThreadReconciliationAction[];
 }
 export interface ThreadReconciliationApplyPorts {
+    /** Private-chat temporary tabs support deletion, not forum closing. */
+    skipCloseBeforeDelete?: boolean;
     isCleanupTargetProtected?: (target: ThreadTarget, action: ThreadReconciliationAction) => boolean;
     callApi?: <TResponse>(method: string, body: Record<string, unknown>) => Promise<TResponse>;
     markActiveByTarget?: (target: ThreadTarget) => boolean;

@@ -68,7 +68,6 @@ export interface TelegramOutboundHandlerRegistry {
     handlers: Map<string, TelegramOutboundProgrammaticHandler[]>;
 }
 export declare function registerTelegramOutboundHandler(kind: string, handler: TelegramOutboundProgrammaticHandler): () => void;
-export declare function getTelegramOutboundProgrammaticHandlers(kind: string): TelegramOutboundProgrammaticHandler[];
 export interface TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup = unknown> {
     execCommand: TelegramVoiceReplySenderDeps["execCommand"];
     getHandlers?: () => TelegramOutboundHandlerConfig[] | undefined;
@@ -117,13 +116,6 @@ export declare function generateTelegramVoiceReplyFile(text: string, options: {
     cwd?: string;
     execCommand: TelegramVoiceReplySenderDeps["execCommand"];
 }): Promise<string | undefined>;
-export declare function transformTelegramOutboundText(text: string, options: {
-    handlers?: TelegramOutboundHandlerConfig[];
-    cwd?: string;
-    execCommand: TelegramVoiceReplySenderDeps["execCommand"];
-    recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
-}): Promise<string>;
-export declare function transformTelegramOutboundTextReply<TReplyMarkup = unknown>(text: string, options: TelegramOutboundTextTransformOptions<TReplyMarkup>): Promise<TelegramOutboundTextTransformResult<TReplyMarkup>>;
 export declare function createTelegramOutboundTextReplyRuntime<TReplyMarkup = unknown>(deps: TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>): Pick<TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup>, "sendTextReply" | "sendMarkdownReply">;
 export declare function createTelegramOutboundTextPreviewRuntime<TReplyMarkup = unknown>(deps: TelegramOutboundTextPreviewRuntimeDeps<TReplyMarkup>): {
     finalizeMarkdownPreview: TelegramPreparedPreviewDelivery<TReplyMarkup>["finalizeMarkdownPreview"];

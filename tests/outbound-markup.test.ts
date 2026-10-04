@@ -8,10 +8,24 @@ import test from "node:test";
 
 import {
   collectTopLevelHtmlComments,
+  getTelegramActionString,
   planTelegramVoiceReply,
   stripTelegramCommentMarkupForDelivery,
   stripTelegramCommentMarkupForPreview,
 } from "../lib/outbound-markup.ts";
+
+test("Action string fields trim exactly once without coercion or payload mutation", () => {
+  for (const value of [undefined, null, 1, false, {}, [], new String("text"), "", " \t\n"]) {
+    assert.equal(getTelegramActionString({ value }, "value"), undefined);
+  }
+  assert.equal(getTelegramActionString({ value: "\t label \n" }, "value"), "label");
+  assert.equal(getTelegramActionString({}, "missing"), undefined);
+  let reads = 0;
+  const payload = { get value() { reads++; return " text "; } };
+  assert.equal(getTelegramActionString(payload, "value"), "text");
+  assert.equal(reads, 1);
+  assert.ok(Object.getOwnPropertyDescriptor(payload, "value")?.get);
+});
 
 test("Drafts hide complete and unfinished button fences but preserve outer code examples", () => {
   assert.equal(stripTelegramCommentMarkupForPreview('Before\n```telegram_button\n{Hidden|secret prompt}'), 'Before');

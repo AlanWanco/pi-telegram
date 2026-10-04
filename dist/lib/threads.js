@@ -1,113 +1,27 @@
 /**
  * Telegram thread binding helpers
- * Zones: multi-instance bus, Telegram UI threads, volatile extension state
- * Owns current live instance-binding to Telegram UI thread mappings backed by Bot API ForumTopic/message_thread_id transport
+ * Zones: multi-instance bus, Telegram UI threads, durable Workspace state
+ * Owns live mappings, Workspace bindings and guarded Restore transitions; routing and transport effects stay outside.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync, } from "node:fs";
-import { chmod, mkdir, readFile, rename, unlink, writeFile, } from "node:fs/promises";
-import { dirname, posix, resolve } from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFile as readFileCallback, readFileSync, renameSync, unlinkSync, writeFileSync, } from "node:fs";
+import { chmod, mkdir, unlink, writeFile, } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { isTelegramApiCommitUnknownError, TelegramApiCommitUnknownError, } from "./telegram-api.js";
-import { withTelegramFileTransaction } from "./locks.js";
+import { areTelegramTargetsEqual as targetMatches, getTelegramTargetKey as getTargetRecoveryHintKey, } from "./target.js";
+import { isWireRecord as restoreObject, isNonEmptyWireString as restoreText } from "./wire.js";
+import { chooseTelegramThreadName, getTelegramManualThreadDisplayNameValidationError, getTelegramThreadNameLeadingSlot, getTelegramTopicIdentityName, getTelegramTopicName as buildTelegramTopicName, getTelegramTopicTitleForThreadName, isTelegramTopicThreadNameValidForSlot, normalizeTelegramTopicTargetThreadName, } from "./thread-naming.js";
+export { chooseTelegramThreadName, createTelegramThreadName, getTelegramManualThreadDisplayNameValidationError, getTelegramTopicIdentityName, getTelegramTopicThreadNameValidationError, getTelegramTopicTitleForThreadName, isTelegramTopicThreadNameValidForSlot, } from "./thread-naming.js";
+// Preserve the legacy provision-request signature without a runtime wrapper.
+export const getTelegramTopicName = buildTelegramTopicName;
+import { TELEGRAM_WORKSPACE_KEY_MAX_LENGTH, createTelegramSessionKey, createTelegramWorkspaceBindingIdentityWithKey, createTelegramWorkspaceDirectoryKey, normalizeTelegramSessionId, normalizeTelegramWorkspacePath, } from "./workspace-identity.js";
+export { createTelegramWorkspaceBindingIdentity, createTelegramWorkspaceDirectoryKey, normalizeTelegramSessionId, normalizeTelegramWorkspacePath, } from "./workspace-identity.js";
+import { withTelegramFileTransaction, readTelegramRuntimeState, } from "./locks.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
+import { createTelegramRuntimeProjectionStore } from "./status.js";
 import { planTelegramWorkspaceSlotAllocation, TELEGRAM_WORKSPACE_SLOTS, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 import { resolveAgentDir, resolveTelegramProfileTempFilePath, } from "./paths.js";
-const TELEGRAM_WORKSPACE_KEY_MAX_LENGTH = 180;
-const TELEGRAM_SESSION_ID_MAX_LENGTH = 256;
-export function normalizeTelegramSessionId(sessionId) {
-    if (typeof sessionId !== "string")
-        return undefined;
-    const normalized = sessionId.trim();
-    return normalized && Buffer.byteLength(normalized, "utf8") <=
-        TELEGRAM_SESSION_ID_MAX_LENGTH
-        ? normalized
-        : undefined;
-}
-export function createTelegramSessionKey(sessionId) {
-    const normalized = normalizeTelegramSessionId(sessionId);
-    return normalized
-        ? createHash("sha256").update(normalized).digest("hex")
-        : undefined;
-}
-export function normalizeTelegramWorkspacePath(cwd) {
-    const trimmed = cwd.trim();
-    if (!trimmed)
-        return undefined;
-    const normalized = (trimmed.startsWith("/")
-        ? posix.normalize(trimmed)
-        : resolve(trimmed).replaceAll("\\", "/"));
-    const withoutTrailingSeparators = normalized.length > 1 ? normalized.replace(/\/+$/u, "") : normalized;
-    return process.platform === "win32"
-        ? withoutTrailingSeparators.replace(/^([A-Z]):/u, (_, drive) => `${drive.toLowerCase()}:`)
-        : withoutTrailingSeparators;
-}
-export function createTelegramWorkspaceDirectoryKey(cwd) {
-    const normalized = normalizeTelegramWorkspacePath(cwd);
-    if (!normalized)
-        return undefined;
-    const readable = normalized
-        .replace(/[^\p{L}\p{N}._-]+/gu, "-")
-        .replace(/^-+|-+$/gu, "") || "root";
-    const candidate = `--${readable}--`;
-    if (candidate.length <= TELEGRAM_WORKSPACE_KEY_MAX_LENGTH)
-        return candidate;
-    const digest = createHash("sha256")
-        .update(normalized)
-        .digest("hex")
-        .slice(0, 12);
-    const prefixLength = TELEGRAM_WORKSPACE_KEY_MAX_LENGTH - digest.length - 5;
-    return `--${readable.slice(0, prefixLength)}-${digest}--`;
-}
-function createTelegramWorkspaceInstanceSlot(ordinal) {
-    if (!Number.isSafeInteger(ordinal) || ordinal < 0)
-        return undefined;
-    let value = ordinal + 1;
-    let slot = "";
-    while (value > 0) {
-        value -= 1;
-        slot = String.fromCharCode(97 + (value % 26)) + slot;
-        value = Math.floor(value / 26);
-    }
-    return slot;
-}
-function createTelegramWorkspaceBindingIdentityWithKey(cwd, workspaceKey, ordinal, sessionId) {
-    const instanceSlot = createTelegramWorkspaceInstanceSlot(ordinal);
-    if (!instanceSlot)
-        return undefined;
-    const normalizedSessionId = sessionId === undefined
-        ? undefined
-        : normalizeTelegramSessionId(sessionId);
-    const sessionKey = normalizedSessionId
-        ? createTelegramSessionKey(normalizedSessionId)
-        : undefined;
-    if (sessionId !== undefined && (!normalizedSessionId || !sessionKey)) {
-        return undefined;
-    }
-    const legacyBindingKey = instanceSlot === "a"
-        ? workspaceKey
-        : `${workspaceKey}${instanceSlot}`;
-    return {
-        cwd,
-        workspaceKey,
-        ...(normalizedSessionId && sessionKey
-            ? { sessionId: normalizedSessionId, sessionKey }
-            : {}),
-        instanceSlot,
-        bindingKey: sessionKey
-            ? `${legacyBindingKey}-s-${sessionKey}`
-            : legacyBindingKey,
-    };
-}
-export function createTelegramWorkspaceBindingIdentity(cwd, ordinal = 0, sessionId) {
-    const normalized = normalizeTelegramWorkspacePath(cwd);
-    const workspaceKey = normalized
-        ? createTelegramWorkspaceDirectoryKey(normalized)
-        : undefined;
-    if (!normalized || !workspaceKey)
-        return undefined;
-    return createTelegramWorkspaceBindingIdentityWithKey(normalized, workspaceKey, ordinal, sessionId);
-}
 const TELEGRAM_THREAD_RESERVATION_TTL_MS = 15 * 60 * 1000;
 function getNextMonotonicSlot(records, reservations, pendingProvisions, nowMs, lastSlot) {
     let cursorCode;
@@ -188,6 +102,16 @@ export function createTelegramCleanupTargetProtection(store, departingRecord) {
     // optional fields; neither changes the authority represented by a snapshot.
     const sameSnapshot = (left, right) => isDeepStrictEqual(JSON.parse(JSON.stringify(left)), JSON.parse(JSON.stringify(right)));
     return (target, action) => {
+        // A source-bound temporary tab is removed only by its own Forward/Cancel, never by generic reconciliation.
+        if (store.listTemporaryThreadTargets) {
+            try {
+                if (store.listTemporaryThreadTargets().some(candidate => targetMatches(candidate, target)))
+                    return true;
+            }
+            catch {
+                return true;
+            }
+        }
         for (const record of store.list()) {
             if (!targetMatches(record.target, target))
                 continue;
@@ -261,41 +185,6 @@ export function commitTelegramWorkspaceProvisionBinding(input) {
         input.store.removePendingProvision(provision.id);
     return displayTitle === undefined ? committed : { ...committed, displayTitle };
 }
-function hashString(value) {
-    let hash = 2166136261;
-    for (let index = 0; index < value.length; index += 1) {
-        hash ^= value.charCodeAt(index);
-        hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-}
-function getWorkspaceHint(cwd) {
-    if (!cwd)
-        return undefined;
-    const parts = cwd.split("/").filter(Boolean);
-    const last = parts.at(-1)?.trim();
-    if (!last)
-        return undefined;
-    return (last
-        .replace(/[^\p{L}\p{N}._-]+/gu, " ")
-        .trim()
-        .slice(0, 32) || undefined);
-}
-export function createTelegramThreadName(input) {
-    const workspace = getWorkspaceHint(input.cwd);
-    const roleMark = input.role === "leader"
-        ? "Leader"
-        : input.role === "follower"
-            ? "Follower"
-            : undefined;
-    const slot = input.slot ? `Thread ${input.slot}` : undefined;
-    const peerSalt = input.peers?.slice().sort().join("|") ?? "";
-    const fallback = `Instance ${hashString(`${input.seed}|${input.cwd ?? ""}|${input.role ?? ""}|${peerSalt}|${input.slot ?? ""}`)
-        .toString(36)
-        .slice(0, 4)}`;
-    return ([slot, workspace, roleMark].filter(Boolean).join(" ").slice(0, 96) ||
-        fallback);
-}
 export function getTelegramStatePath(agentDir = resolveAgentDir(), profileName) {
     return resolveTelegramProfileTempFilePath("state", "json", agentDir, profileName);
 }
@@ -326,7 +215,7 @@ export function setTelegramLeaderSessionHandoff(handoff) {
     else
         store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = handoff;
 }
-export function isTelegramLeaderSessionHandoffFresh(handoff, options = {}) {
+function isTelegramLeaderSessionHandoffFresh(handoff, options = {}) {
     if (!handoff)
         return false;
     const pid = options.pid ?? process.pid;
@@ -476,6 +365,7 @@ function normalizeRecord(value) {
     if (typeof record.createdAtMs !== "number" ||
         typeof record.updatedAtMs !== "number")
         return undefined;
+    const threadName = getPersistedThreadName(record);
     const normalized = {
         profileKey: getTelegramThreadOwnerKey(owner),
         owner,
@@ -483,7 +373,7 @@ function normalizeRecord(value) {
         status,
         createdAtMs: record.createdAtMs,
         updatedAtMs: record.updatedAtMs,
-        threadName: getPersistedThreadName(record),
+        ...(threadName !== undefined ? { threadName } : {}),
         ...(typeof record.manualThreadName === "string" &&
             normalizeTelegramTopicTargetThreadName(record.manualThreadName)
             ? { manualThreadName: normalizeTelegramTopicTargetThreadName(record.manualThreadName) }
@@ -557,6 +447,23 @@ function cloneIdentityRecord(identity) {
 function getWorkspaceBindingMapKey(binding) {
     return `${binding.cwd}\u0000${binding.sessionId ?? ""}\u0000${binding.instanceSlot}`;
 }
+function normalizeWorkspaceJournalSources(value) {
+    if (!Array.isArray(value) || value.length > 256)
+        return undefined;
+    const sources = new Map();
+    for (const entry of value) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry))
+            return undefined;
+        const source = entry;
+        if (Object.keys(source).some(key => key !== "sessionId" && key !== "recipientBindingKey") ||
+            typeof source.sessionId !== "string" || normalizeTelegramSessionId(source.sessionId) !== source.sessionId ||
+            typeof source.recipientBindingKey !== "string" || !source.recipientBindingKey || source.recipientBindingKey.length > 512)
+            return undefined;
+        const normalized = { sessionId: source.sessionId, recipientBindingKey: source.recipientBindingKey };
+        sources.set(JSON.stringify(normalized), normalized);
+    }
+    return Array.from(sources.values());
+}
 function normalizeWorkspaceBindingRecord(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
@@ -617,6 +524,9 @@ function normalizeWorkspaceBindingRecord(value) {
         record.journalBindingKeys.every((key) => typeof key === "string" && key.length > 0 && key.length <= 512)
         ? Array.from(new Set(record.journalBindingKeys))
         : undefined;
+    const journalSources = record.journalSources === undefined ? undefined : normalizeWorkspaceJournalSources(record.journalSources);
+    if (record.journalSources !== undefined && !journalSources)
+        return undefined;
     return {
         cwd,
         workspaceKey: record.workspaceKey,
@@ -632,7 +542,8 @@ function normalizeWorkspaceBindingRecord(value) {
             ? { inactiveSinceMs: record.inactiveSinceMs }
             : {}),
         ...(journalBindingKeys ? { journalBindingKeys } : {}),
-        ...(record.journalBindingsComplete === true && journalBindingKeys
+        ...(journalSources ? { journalSources } : {}),
+        ...(record.journalBindingsComplete === true && (journalBindingKeys || journalSources)
             ? { journalBindingsComplete: true }
             : {}),
         target: { chatId: target.chatId, threadId: target.threadId },
@@ -643,7 +554,9 @@ function normalizeWorkspaceBindingRecord(value) {
     };
 }
 function cloneWorkspaceBinding(binding) {
-    return { ...binding, target: { ...binding.target } };
+    return { ...binding, target: { ...binding.target },
+        ...(binding.journalBindingKeys ? { journalBindingKeys: [...binding.journalBindingKeys] } : {}),
+        ...(binding.journalSources ? { journalSources: binding.journalSources.map(source => ({ ...source })) } : {}) };
 }
 function cloneSessionReplacementIntent(intent) {
     return { ...intent, target: { ...intent.target } };
@@ -909,6 +822,351 @@ function normalizeReservation(value) {
             : undefined,
     };
 }
+function normalizeTelegramWorkspaceRelocationRequest(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return undefined;
+    const request = value;
+    const binding = normalizeWorkspaceBindingRecord(request.binding);
+    const owner = normalizeRecord(request.owner);
+    const target = request.target;
+    if (typeof request.operationId !== "string" || !request.operationId ||
+        !binding?.sessionId || !binding.slot || !/^[A-Z]$/.test(binding.slot) || binding.inactiveSinceMs !== undefined ||
+        !owner || owner.status !== "active" || !owner.instanceId || owner.slot !== binding.slot ||
+        !["leader", "manual-follower"].includes(owner.owner?.kind ?? "") ||
+        (owner.owner?.kind === "leader" &&
+            (owner.owner.cwd !== binding.cwd || owner.owner.instanceId !== owner.instanceId)) ||
+        !targetMatches(binding.target, owner.target) ||
+        !Number.isSafeInteger(binding.target.chatId) || binding.target.chatId === 0 ||
+        !Number.isSafeInteger(binding.target.threadId) || binding.target.threadId <= 0 ||
+        !target || target.chatId !== binding.target.chatId ||
+        !Number.isSafeInteger(target.threadId) || target.threadId <= 0 ||
+        targetMatches(target, binding.target))
+        return undefined;
+    const normalized = { operationId: request.operationId, binding, owner,
+        target: { chatId: target.chatId, threadId: target.threadId } };
+    return isDeepStrictEqual(value, normalized) ? normalized : undefined;
+}
+const restoreInteger = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const restoreKeys = (value, allowed) => Object.keys(value).every(key => allowed.includes(key));
+const isTelegramWorkspaceRestoreExecutor = (value) => restoreObject(value) &&
+    restoreKeys(value, ["instanceId", "leaderEpoch"]) && restoreText(value.instanceId) && restoreText(value.leaderEpoch);
+export const isTelegramWorkspaceRestoreRecipient = (value) => restoreObject(value) &&
+    restoreKeys(value, ["kind", "instanceId", "sessionId", "generation"]) &&
+    (value.kind === "leader" || value.kind === "follower") && restoreText(value.instanceId) && restoreText(value.sessionId) && restoreText(value.generation);
+export function isTelegramWorkspaceRestoreRequest(value) {
+    if (!restoreObject(value))
+        return false;
+    const { source, ...relocation } = value;
+    return !!normalizeTelegramWorkspaceRelocationRequest(relocation) && restoreObject(source) &&
+        restoreKeys(source, ["journalBindingKey", "updateIds"]) && restoreText(source.journalBindingKey) &&
+        Array.isArray(source.updateIds) && source.updateIds.length > 0 &&
+        source.updateIds.every((id, index, ids) => restoreInteger(id) && (index === 0 || id > ids[index - 1]));
+}
+function isTelegramWorkspaceRestoreSettlement(value, source) {
+    if (!restoreObject(value) || value.journalBindingKey !== source.journalBindingKey || !Array.isArray(value.updateIds) ||
+        value.updateIds.length === 0 || !value.updateIds.every((id, index, ids) => restoreInteger(id) && source.updateIds.includes(id) &&
+        (index === 0 || id > ids[index - 1])))
+        return false;
+    return value.kind === "completed" ? restoreKeys(value, ["journalBindingKey", "updateIds", "kind"]) :
+        (value.kind === "queued" || value.kind === "queue-completed") && restoreKeys(value, ["journalBindingKey", "updateIds", "kind", "receiptId", "queueKind"]) &&
+            restoreText(value.receiptId) && (value.queueKind === "prompt" || value.queueKind === "control");
+}
+function isWorkspaceRestoreSourceAcceptance(value, operation) {
+    if (!restoreObject(value) || value.journalBindingKey !== operation.request.source.journalBindingKey || !restoreInteger(value.updateId) ||
+        !operation.request.source.updateIds.includes(value.updateId) || typeof value.sourceSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(value.sourceSha256) || !isTelegramWorkspaceRestoreRecipient(value.recipient) ||
+        value.recipient.sessionId !== operation.request.binding.sessionId || value.recipient.kind !== operation.recipient?.kind)
+        return false;
+    const keys = ["journalBindingKey", "updateId", "sourceSha256", "recipient", "kind"];
+    if (value.kind === "completed")
+        return value.recipient.kind === "leader" && restoreKeys(value, keys);
+    if (value.kind === "forwarded")
+        return value.recipient.kind === "follower" &&
+            restoreKeys(value, [...keys, "deliveryId", "recipientBindingKey"]) && typeof value.deliveryId === "string" &&
+            /^telegram-follower-v1-[a-f0-9]{64}$/u.test(value.deliveryId) && restoreText(value.recipientBindingKey);
+    return value.kind === "queued" && value.recipient.kind === "leader" &&
+        restoreKeys(value, [...keys, "receiptId", "queueKind", "queueOwnerSha256"]) && restoreText(value.receiptId) &&
+        (value.queueKind === "prompt" || value.queueKind === "control") && typeof value.queueOwnerSha256 === "string" &&
+        /^[a-f0-9]{64}$/u.test(value.queueOwnerSha256);
+}
+/** Stable acceptance scope, not a removal ACK; adoption and mutable progress cannot change it. */
+export function getTelegramWorkspaceRestoreSourceCompletionSha256(operation, acceptance) {
+    if (!isTelegramWorkspaceRestoreRequest(operation.request) || operation.operatorUserId !== operation.request.target.chatId ||
+        !isWorkspaceRestoreSourceAcceptance(acceptance, operation) ||
+        !operation.routing?.acceptances?.some(value => isDeepStrictEqual(value, acceptance))) {
+        throw new Error("Workspace Restore retained acceptance scope is unavailable.");
+    }
+    const frame = { kind: "workspace-restore-source-completion-v1", request: operation.request,
+        operatorUserId: operation.operatorUserId, acceptance };
+    return createHash("sha256").update(JSON.stringify(frame, function (_key, value) {
+        return restoreObject(value) ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value;
+    })).digest("hex");
+}
+function workspaceRestoreAcceptancesConsistent(acceptances) {
+    return acceptances.every((value, index) => (index === 0 || value.updateId > acceptances[index - 1].updateId) &&
+        acceptances.slice(0, index).every(previous => {
+            if (value.kind === "forwarded" && previous.kind === "forwarded")
+                return value.deliveryId !== previous.deliveryId;
+            if (value.kind !== "queued" || previous.kind !== "queued" || value.receiptId !== previous.receiptId)
+                return true;
+            return value.queueKind === previous.queueKind && value.queueOwnerSha256 === previous.queueOwnerSha256 &&
+                isDeepStrictEqual(value.recipient, previous.recipient);
+        }));
+}
+function workspaceRestoreSettlementMatchesAcceptance(evidence, acceptances) {
+    return evidence.updateIds.every(id => {
+        const accepted = acceptances.find(value => value.updateId === id);
+        if (!accepted)
+            return evidence.kind !== "queue-completed"; // Legacy admission is retained, never terminal receipt proof.
+        return evidence.kind === "completed" ? accepted.kind !== "queued" : accepted.kind === "queued" &&
+            evidence.receiptId === accepted.receiptId && evidence.queueKind === accepted.queueKind;
+    });
+}
+function workspaceRestoreSourcesSettled(operation) {
+    const settled = new Set(operation.routing?.settlements.filter(value => value.kind !== "queued").flatMap(value => value.updateIds));
+    return operation.request.source.updateIds.every(id => settled.has(id));
+}
+function isWorkspaceRestoreIntent(value) {
+    if (!restoreObject(value) || !restoreKeys(value, ["request", "operatorUserId", "executor", "revision", "createdAtMs",
+        "updatedAtMs", "phase", "committedAtMs", "recipient", "readyRecipient", "routing"]) || !isTelegramWorkspaceRestoreRequest(value.request) ||
+        !restoreInteger(value.operatorUserId) || value.operatorUserId !== value.request.target.chatId ||
+        !isTelegramWorkspaceRestoreExecutor(value.executor) || !restoreInteger(value.revision) || !restoreInteger(value.createdAtMs) ||
+        !restoreInteger(value.updatedAtMs) || value.updatedAtMs < value.createdAtMs ||
+        !restoreInteger(value.committedAtMs))
+        return false;
+    const source = value.request.source;
+    if (value.routing !== undefined) {
+        if (value.phase !== "ready" || !restoreObject(value.routing) || !restoreKeys(value.routing, ["acceptances", "settlements", "cleanup"]) ||
+            !Array.isArray(value.routing.settlements) || !value.routing.settlements.every(item => isTelegramWorkspaceRestoreSettlement(item, source)))
+            return false;
+        if (value.routing.acceptances !== undefined) {
+            const acceptances = value.routing.acceptances;
+            if (!Array.isArray(acceptances) || !acceptances.length ||
+                !acceptances.every(item => isWorkspaceRestoreSourceAcceptance(item, value)) ||
+                !workspaceRestoreAcceptancesConsistent(acceptances))
+                return false;
+        }
+        const acceptances = (value.routing.acceptances ?? []);
+        if (!value.routing.settlements.every(item => workspaceRestoreSettlementMatchesAcceptance(item, acceptances)))
+            return false;
+        const ids = value.routing.settlements.flatMap(item => item.updateIds);
+        if (new Set(ids).size !== ids.length || (value.routing.cleanup !== undefined &&
+            (!["issued", "completed", "not-issued"].includes(value.routing.cleanup) ||
+                !workspaceRestoreSourcesSettled(value))))
+            return false;
+    }
+    if (value.readyRecipient !== undefined && (value.phase !== "ready" || !isTelegramWorkspaceRestoreRecipient(value.readyRecipient) ||
+        value.readyRecipient.sessionId !== value.request.binding.sessionId))
+        return false;
+    if (value.phase === "relocated")
+        return value.recipient === undefined;
+    return (value.phase === "recipient-issued" || value.phase === "ready") && isTelegramWorkspaceRestoreRecipient(value.recipient) &&
+        value.recipient.sessionId === value.request.binding.sessionId;
+}
+function isTemporaryThreadInput(value) {
+    return restoreObject(value) && restoreKeys(value, ["journalBindingKey", "updateIds"]) && restoreText(value.journalBindingKey) &&
+        Array.isArray(value.updateIds) && value.updateIds.length > 0 && value.updateIds.length <= TEMPORARY_THREAD_INPUT_CAPACITY &&
+        value.updateIds.every((id, index, ids) => restoreInteger(id) && (index === 0 || id > ids[index - 1]));
+}
+export function getTelegramTemporaryThreadInputs(entry) {
+    return structuredClone(entry.inputs ?? [{ journalBindingKey: entry.source.journalBindingKey, updateIds: [entry.source.updateId] }]);
+}
+/** Every known group is durably cancelled or Forward-completed; still not deletion authority by itself. */
+export function isTelegramTemporaryThreadFullyResolved(entry) {
+    const inputs = getTelegramTemporaryThreadInputs(entry), resolved = [...(entry.cancelledInputs ?? []), ...(entry.completedInputs ?? [])];
+    return resolved.length > 0 && inputs.every(input => resolved.some(other => isDeepStrictEqual(other, input)));
+}
+/** One unresolved group may release protection after completion when every other group has a durable terminal fact. */
+function isTemporaryThreadReleasedByCompletion(entry, completed) {
+    if (!completed || !isTemporaryThreadInput(completed))
+        return false;
+    const inputs = getTelegramTemporaryThreadInputs(entry), cancelled = [...(entry.cancelledInputs ?? []), ...(entry.completedInputs ?? [])];
+    const same = (left, right) => isDeepStrictEqual(left, right);
+    return inputs.some(input => same(input, completed)) && !cancelled.some(input => same(input, completed)) &&
+        inputs.every(input => same(input, completed) || cancelled.some(other => same(other, input)));
+}
+function isTemporaryThreadEntry(value) {
+    if (!restoreObject(value) || !restoreKeys(value, ["source", "inputs", "cancelledInputs", "completedInputs", "forwardedInputs", "forwardProtocol", "cleanupIssued", "operatorUserId", "executor", "token", "phase", "target", "revision",
+        "createdAtMs", "updatedAtMs"]) || !restoreObject(value.source) || !restoreKeys(value.source, ["journalBindingKey", "updateId"]) ||
+        !restoreText(value.source.journalBindingKey) || !restoreInteger(value.source.updateId) ||
+        !restoreInteger(value.operatorUserId) || value.operatorUserId === 0 || !isTelegramWorkspaceRestoreExecutor(value.executor) ||
+        typeof value.token !== "string" || !/^[a-f0-9]{32}$/u.test(value.token) || !restoreInteger(value.revision) ||
+        !restoreInteger(value.createdAtMs) || !restoreInteger(value.updatedAtMs) || value.updatedAtMs < value.createdAtMs)
+        return false;
+    const source = value.source;
+    if (value.forwardProtocol !== undefined && (value.forwardProtocol !== "one-shot-v1" || value.inputs === undefined))
+        return false;
+    if (value.inputs !== undefined) {
+        const inputs = value.inputs;
+        if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > TEMPORARY_THREAD_INPUT_CAPACITY ||
+            !inputs.every(isTemporaryThreadInput) || !isDeepStrictEqual(inputs[0], { journalBindingKey: source.journalBindingKey, updateIds: [source.updateId] }) ||
+            inputs.some((input, index) => input.journalBindingKey !== source.journalBindingKey ||
+                inputs.slice(index + 1).some(other => other.updateIds.some(id => input.updateIds.includes(id)))))
+            return false;
+    }
+    if (value.cancelledInputs !== undefined) {
+        const cancelled = value.cancelledInputs;
+        const inputs = Array.isArray(value.inputs) ? value.inputs : [{ journalBindingKey: source.journalBindingKey, updateIds: [source.updateId] }];
+        if (!Array.isArray(cancelled) || cancelled.length === 0 || cancelled.length > TEMPORARY_THREAD_INPUT_CAPACITY ||
+            !cancelled.every(isTemporaryThreadInput) || cancelled.some((input, index) => !inputs.some(candidate => isDeepStrictEqual(candidate, input)) || cancelled.slice(index + 1).some(other => isDeepStrictEqual(other, input))))
+            return false;
+    }
+    if (value.completedInputs !== undefined) {
+        const completed = value.completedInputs;
+        const inputs = Array.isArray(value.inputs) ? value.inputs : [{ journalBindingKey: source.journalBindingKey, updateIds: [source.updateId] }];
+        const cancelled = Array.isArray(value.cancelledInputs) ? value.cancelledInputs : [];
+        if (!Array.isArray(completed) || completed.length === 0 || completed.length > TEMPORARY_THREAD_INPUT_CAPACITY ||
+            !completed.every(isTemporaryThreadInput) || completed.some((input, index) => !inputs.some(candidate => isDeepStrictEqual(candidate, input)) || cancelled.some(other => isDeepStrictEqual(other, input)) ||
+            completed.slice(index + 1).some(other => isDeepStrictEqual(other, input))))
+            return false;
+    }
+    if (value.forwardedInputs !== undefined) {
+        const forwarded = value.forwardedInputs;
+        const inputs = Array.isArray(value.inputs) ? value.inputs : [{ journalBindingKey: source.journalBindingKey, updateIds: [source.updateId] }];
+        const cancelled = Array.isArray(value.cancelledInputs) ? value.cancelledInputs : [];
+        if (!Array.isArray(forwarded) || forwarded.length === 0 || forwarded.length > TEMPORARY_THREAD_INPUT_CAPACITY ||
+            !forwarded.every(isTemporaryThreadInput) || forwarded.some((input, index) => !inputs.some(candidate => isDeepStrictEqual(candidate, input)) || cancelled.some(other => isDeepStrictEqual(other, input)) ||
+            forwarded.slice(index + 1).some(other => isDeepStrictEqual(other, input))))
+            return false;
+    }
+    if (value.cleanupIssued !== undefined && (value.cleanupIssued !== true ||
+        !isTelegramTemporaryThreadFullyResolved(value)))
+        return false;
+    if (value.phase === "creating")
+        return value.target === undefined && value.cancelledInputs === undefined && value.completedInputs === undefined && value.forwardedInputs === undefined && value.cleanupIssued === undefined &&
+            (!Array.isArray(value.inputs) || value.inputs.length === 1);
+    const target = value.target;
+    return value.phase === "created" && restoreObject(target) && restoreKeys(target, ["chatId", "threadId"]) &&
+        target.chatId === value.operatorUserId && Number.isSafeInteger(target.threadId) && target.threadId > 0;
+}
+/** Only an exact recorded source group may Restore into its temporary tab. */
+function isTemporaryThreadRestore(entry, operations) {
+    return operations.some(({ request }) => !!entry.target && targetMatches(request.target, entry.target) &&
+        ![...(entry.cancelledInputs ?? []), ...(entry.completedInputs ?? []), ...(entry.forwardedInputs ?? [])].some(input => input.journalBindingKey === request.source.journalBindingKey &&
+            input.updateIds.some(id => request.source.updateIds.includes(id))) &&
+        (entry.inputs ? entry.inputs.some(input => isDeepStrictEqual(input, request.source)) :
+            request.source.journalBindingKey === entry.source.journalBindingKey && request.source.updateIds.includes(entry.source.updateId)));
+}
+function conflictsWithTemporaryThread(snapshot, target) {
+    return !!target && !!snapshot?.temporaryThreads?.some(entry => !!entry.target && targetMatches(entry.target, target));
+}
+function conflictsWithWorkspaceRestoreProvision(request, provision) {
+    if ("owner" in provision && !provision.workspaceBindingKey &&
+        (provision.profileKey === request.owner.profileKey || provision.instanceId === request.owner.instanceId))
+        return true;
+    return ("workspaceBindingKey" in provision && provision.workspaceBindingKey === request.binding.bindingKey) || provision.slot === request.binding.slot ||
+        !!provision.target && (targetMatches(provision.target, request.binding.target) || targetMatches(provision.target, request.target));
+}
+function assertWorkspaceRestoreBindingProtection(file) {
+    for (const { request } of file.workspaceRestore?.operations ?? []) {
+        if (file.pendingProvisions?.some(value => conflictsWithWorkspaceRestoreProvision(request, value)) ||
+            file.reservations?.some(value => conflictsWithWorkspaceRestoreProvision(request, value))) {
+            throw new Error("Protected Workspace Restore provisioning conflict.");
+        }
+        const bindings = file.workspaceBindings ?? [];
+        const retained = bindings.filter(value => value.bindingKey === request.binding.bindingKey);
+        const current = retained[0];
+        const identity = ["bindingKey", "cwd", "workspaceKey", "instanceSlot", "sessionId", "sessionKey", "slot"];
+        if (retained.length !== 1 || !current || identity.some(key => current[key] !== request.binding[key]) ||
+            !targetMatches(current.target, request.target) || bindings.some(value => value !== current &&
+            (value.slot === current.slot || targetMatches(value.target, request.binding.target) || targetMatches(value.target, request.target)))) {
+            throw new Error("Protected Workspace Restore binding changed.");
+        }
+        const owners = (file.threads ?? []).filter(value => value.slot === current.slot ||
+            targetMatches(value.target, request.binding.target) || targetMatches(value.target, request.target));
+        if (owners.length > 1 || owners.some(value => value.slot !== current.slot || !targetMatches(value.target, request.target))) {
+            throw new Error("Protected Workspace Restore owner target changed.");
+        }
+    }
+    const operations = file.workspaceRestore?.operations ?? [];
+    for (const entry of file.workspaceRestore?.temporaryThreads ?? []) {
+        const target = entry.target;
+        if (!target)
+            continue;
+        const claimed = [...(file.workspaceBindings ?? []), ...(file.threads ?? [])].some(value => targetMatches(value.target, target));
+        if (file.pendingProvisions?.some(value => !!value.target && targetMatches(value.target, target)) ||
+            file.reservations?.some(value => targetMatches(value.target, target)) ||
+            (claimed && !isTemporaryThreadRestore(entry, operations))) {
+            throw new Error("Protected temporary Thread target conflict.");
+        }
+    }
+}
+function workspaceRestoresConflict(left, right) {
+    const targets = [left.binding.target, left.target];
+    return left.operationId === right.operationId || left.binding.bindingKey === right.binding.bindingKey ||
+        left.binding.slot === right.binding.slot || targets.some(target => targetMatches(target, right.binding.target) || targetMatches(target, right.target)) ||
+        (left.source.journalBindingKey === right.source.journalBindingKey && right.source.updateIds.some(id => left.source.updateIds.includes(id)));
+}
+const WORKSPACE_RESTORE_MAX_BYTES = 1024 * 1024;
+const TEMPORARY_THREAD_CAPACITY = 26;
+const TEMPORARY_THREAD_INPUT_CAPACITY = 100;
+const WORKSPACE_SNAPSHOT_MAX_BYTES = 8 * WORKSPACE_RESTORE_MAX_BYTES;
+function parseWorkspaceRestore(value) {
+    if (value === undefined)
+        return undefined;
+    const temporary = restoreObject(value) ? value.temporaryThreads : undefined;
+    if (!restoreObject(value) || !restoreKeys(value, ["version", "profileName", "tokenSha256", "revision", "operations", "temporaryThreads"]) ||
+        value.version !== 1 || !restoreText(value.profileName) || typeof value.tokenSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(value.tokenSha256) ||
+        !restoreInteger(value.revision) || !Array.isArray(value.operations) || value.operations.length > 26 ||
+        (temporary !== undefined && (!Array.isArray(temporary) || temporary.length === 0 ||
+            temporary.length > TEMPORARY_THREAD_CAPACITY || !temporary.every(isTemporaryThreadEntry))) ||
+        ((value.operations.length > 0 || temporary !== undefined) && value.revision === 0) || !value.operations.every(isWorkspaceRestoreIntent) ||
+        Buffer.byteLength(JSON.stringify(value)) > WORKSPACE_RESTORE_MAX_BYTES)
+        throw new Error("Invalid Workspace Restore evidence.");
+    const snapshot = value;
+    if (snapshot.operations.some((operation, index) => snapshot.operations.slice(index + 1).some(other => workspaceRestoresConflict(operation.request, other.request))))
+        throw new Error("Conflicting Workspace Restore evidence.");
+    const entries = snapshot.temporaryThreads ?? [];
+    if (entries.some((entry, index) => entries.slice(index + 1).some(other => other.token === entry.token ||
+        getTelegramTemporaryThreadInputs(entry).some(input => getTelegramTemporaryThreadInputs(other).some(candidate => input.journalBindingKey === candidate.journalBindingKey && input.updateIds.some(id => candidate.updateIds.includes(id)))) ||
+        (!!entry.target && !!other.target && targetMatches(entry.target, other.target)))) ||
+        entries.some(entry => !!entry.target && snapshot.operations.some(({ request }) => targetMatches(request.binding.target, entry.target) ||
+            (targetMatches(request.target, entry.target) && !isTemporaryThreadRestore(entry, [{ request }])))))
+        throw new Error("Conflicting Workspace Restore evidence.");
+    return snapshot;
+}
+/** All Restore reads and publishers share these physical-file checks; there is no repairing read. */
+const readWorkspaceDescriptor = promisify(readFileCallback);
+function readWorkspaceSnapshot(path, requirePrivate = true, asynchronous = false) {
+    let before;
+    try {
+        before = lstatSync(path, { bigint: true });
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return undefined;
+        throw error;
+    }
+    const uid = process.getuid?.();
+    const privateFile = uid === undefined || (before.uid === BigInt(uid) && (before.mode & 63n) === 0n);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(WORKSPACE_SNAPSHOT_MAX_BYTES) ||
+        (requirePrivate && !privateFile))
+        throw new Error("Workspace snapshot must be a bounded private regular file.");
+    const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    let closeImmediately = true;
+    try {
+        const opened = fstatSync(fd, { bigint: true });
+        if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size || opened.mtimeNs !== before.mtimeNs)
+            throw new Error("Workspace snapshot changed during inspection.");
+        const decode = (content) => {
+            const value = JSON.parse(content);
+            // Legacy metadata may predate private storage; a Restore-bearing snapshot never may.
+            if (!privateFile && restoreObject(value) && value.workspaceRestore !== undefined)
+                throw new Error("Workspace snapshot must be a bounded private regular file.");
+            return value;
+        };
+        if (asynchronous) {
+            const reading = readWorkspaceDescriptor(fd, "utf8").then(decode);
+            closeImmediately = false;
+            return reading.finally(() => closeSync(fd));
+        }
+        return decode(readFileSync(fd, "utf8"));
+    }
+    finally {
+        if (closeImmediately)
+            closeSync(fd);
+    }
+}
 function parseTopicTargetFile(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         return {
@@ -920,6 +1178,13 @@ function parseTopicTargetFile(value) {
         };
     }
     const file = value;
+    // The unpublished two-file draft is not migration or source-reconstruction authority.
+    if ((file.workspaceRelocations !== undefined && (!Array.isArray(file.workspaceRelocations) || file.workspaceRelocations.length !== 0)) ||
+        (file.workspaceRelocationRevision !== undefined && file.workspaceRelocationRevision !== 0))
+        throw new Error("Unmigrated Workspace relocation evidence.");
+    const workspaceRestore = parseWorkspaceRestore(file.workspaceRestore);
+    if (file.version !== 1 && workspaceRestore)
+        throw new Error("Unsupported Workspace Restore snapshot.");
     if (file.version !== 1) {
         return {
             version: 1,
@@ -948,6 +1213,8 @@ function parseTopicTargetFile(value) {
         workspaceBindings: Array.isArray(file.workspaceBindings)
             ? file.workspaceBindings.flatMap((binding) => {
                 const normalized = normalizeWorkspaceBindingRecord(binding);
+                if (!normalized && binding && typeof binding === "object" && "journalSources" in binding)
+                    throw new Error("Invalid Workspace session journal evidence.");
                 return normalized ? [normalized] : [];
             })
             : [],
@@ -957,6 +1224,7 @@ function parseTopicTargetFile(value) {
                 return normalized ? [normalized] : [];
             })
             : [],
+        ...(workspaceRestore ? { workspaceRestore } : {}),
         sessionReplacement: normalizeTelegramSessionReplacementIntent(file.sessionReplacement),
         reservations: Array.isArray(file.reservations)
             ? file.reservations.flatMap((reservation) => {
@@ -984,17 +1252,90 @@ function parseTopicTargetFile(value) {
             : [],
     };
 }
+/** The unified section accepts only lossless current-format Workspace evidence, never tolerant legacy repair. */
+export function parseTelegramWorkspaceStateSection(value, profile) {
+    if (value === undefined)
+        return undefined;
+    if (!restoreObject(value) || value.version !== 1 || value.source !== "snapshot" ||
+        !Number.isSafeInteger(value.writtenAtMs) || value.writtenAtMs < 0 ||
+        !restoreObject(value.bot) || !Array.isArray(value.threads))
+        throw new Error("Invalid consolidated Workspace section.");
+    if (Buffer.byteLength(JSON.stringify(value)) > WORKSPACE_SNAPSHOT_MAX_BYTES)
+        throw new Error("Workspace snapshot byte capacity reached.");
+    const parsed = parseTopicTargetFile(value), rawThreads = value.threads;
+    const wire = JSON.parse(JSON.stringify(parsed));
+    wire.threads = wire.threads.map((record, index) => {
+        const copied = { ...record };
+        const original = rawThreads[index];
+        if (!restoreObject(original))
+            throw new Error("Invalid consolidated Workspace thread evidence.");
+        if (!Object.hasOwn(original, "profileKey"))
+            delete copied.profileKey;
+        return copied;
+    });
+    for (const key of Object.keys(value)) {
+        if (!Object.hasOwn(wire, key) || !isDeepStrictEqual(value[key], wire[key]))
+            throw new Error("Consolidated Workspace evidence cannot drop or normalize unknown facts.");
+    }
+    if ((parsed.workspaceRestore && parsed.workspaceRestore.profileName !== profile) ||
+        (parsed.sessionReplacement && parsed.sessionReplacement.profileName !== profile) ||
+        parsed.threads.some(record => record.owner && "telegramProfile" in record.owner &&
+            record.owner.telegramProfile !== undefined && record.owner.telegramProfile !== profile))
+        throw new Error("Foreign consolidated Workspace profile evidence.");
+    assertWorkspaceRestoreBindingProtection(parsed);
+    return parsed;
+}
+export function resolveTelegramWorkspaceProvisionRecoveryPath(statePath, profileName = "default", layout) {
+    if (layout !== undefined && layout !== "consolidated")
+        throw new Error("Invalid Workspace provisioning recovery layout.");
+    return layout === "consolidated"
+        ? join(dirname(statePath), "runtime", `${basename(statePath)}.provision-recovery.${createHash("sha256").update(profileName).digest("hex").slice(0, 16)}.json`)
+        : `${statePath}.provision-recovery.json`;
+}
+/** Prepared Workspace IO adapter; transition/CAS policy remains with the existing Threads owner. */
+export function createTelegramConsolidatedWorkspaceStorage(options) {
+    const { getPath, getProfile, captureAuthority, publishIfOwned } = options;
+    const profileName = () => getProfile() ?? "default";
+    const readRaw = () => {
+        const path = getPath(), profile = profileName(), root = readTelegramRuntimeState(path);
+        const raw = Object.hasOwn(root.profiles, profile) ? root.profiles[profile]?.workspace : undefined;
+        parseTelegramWorkspaceStateSection(raw, profile);
+        if (path !== getPath() || profile !== profileName())
+            throw new Error("Workspace storage scope changed during observation.");
+        return raw;
+    };
+    return {
+        readRaw,
+        read: () => parseTelegramWorkspaceStateSection(readRaw(), profileName()),
+        capturePublication() {
+            const path = getPath(), profile = profileName(), authority = captureAuthority();
+            if (!authority)
+                return undefined;
+            const isCurrent = () => path === getPath() && profile === profileName() && authority() === true;
+            if (!isCurrent())
+                return undefined;
+            return (mutate, publication) => {
+                const sourceCurrent = publication?.isCurrent;
+                const currentGrant = () => isCurrent() && (sourceCurrent?.() ?? true);
+                if (!currentGrant())
+                    return { committed: false };
+                return publishIfOwned("workspace", current => {
+                    parseTelegramWorkspaceStateSection(current, profile);
+                    const next = mutate(current);
+                    if (next.value === undefined && current !== undefined)
+                        throw new Error("Consolidated Workspace section removal is not authorized.");
+                    parseTelegramWorkspaceStateSection(next.value, profile);
+                    return next;
+                }, { ...publication, isCurrent: currentGrant, expectedScope: { path, profile } });
+            };
+        },
+    };
+}
 function getTelegramStateSemanticSnapshot(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
     const { writtenAtMs: _writtenAtMs, ...semantic } = value;
     return semantic;
-}
-function targetMatches(left, right) {
-    return left.chatId === right.chatId && left.threadId === right.threadId;
-}
-function getTargetRecoveryHintKey(target) {
-    return `${target.chatId}:${target.threadId ?? "private"}`;
 }
 function parseFollowerRecoveryHints(value) {
     const hints = new Map();
@@ -1059,7 +1400,32 @@ function isPendingProvisionLiveOrTargeted(provision, nowMs) {
     }
     return !!provision.target;
 }
+/** Resolving selects a scope-bound view of the existing Workspace owner; it creates no files. */
+export function createTelegramWorkspaceRestoreResolver(deps) {
+    const { getProfileName, getBotToken, threadStore, agentDir } = deps;
+    let active;
+    return () => {
+        const profile = getProfileName();
+        const profileName = profile ?? "default";
+        const token = getBotToken();
+        if (!token)
+            return undefined;
+        const tokenSha256 = createHash("sha256").update(token).digest("hex");
+        if (active?.profileName === profileName && active.tokenSha256 === tokenSha256)
+            return active.store;
+        const store = threadStore.workspaceRestore({ profileName, tokenSha256,
+            legacyPath: resolveTelegramProfileTempFilePath("workspace-restore", "json", agentDir, profile),
+            isCurrentScope: () => (getProfileName() ?? "default") === profileName &&
+                createHash("sha256").update(getBotToken() ?? "").digest("hex") === tokenSha256 });
+        active = { profileName, tokenSha256, store };
+        return store;
+    };
+}
 export function createTelegramTopicTargetStore(options) {
+    if (options.consolidated && options.commitPersist)
+        throw new Error("Workspace must select one publication backend.");
+    const consolidated = options.consolidated ? { ...options.consolidated } : undefined;
+    const commitPersist = options.commitPersist?.bind(options);
     const getNowMs = options.getNowMs ?? Date.now;
     const captureExternalReservedSlots = () => {
         try {
@@ -1079,6 +1445,7 @@ export function createTelegramTopicTargetStore(options) {
     let identities = new Map();
     let workspaceBindings = new Map();
     let workspaceRetirements = [];
+    let workspaceRestore;
     let sessionReplacement;
     let workspaceRetirementCommitInFlight = false;
     const hasWorkspaceRetirementConflict = (input) => workspaceRetirements.some((intent) => (input.bindingKey !== undefined && intent.binding.bindingKey === input.bindingKey) ||
@@ -1093,10 +1460,14 @@ export function createTelegramTopicTargetStore(options) {
     let followerRecoveryHints = new Map();
     let loaded = false;
     let loadedPath;
+    let loadedProfile;
+    let observedWorkspaceSemantic;
     let dirty = false;
     let mutationRevision = 0;
-    let statusRevision = 0;
     let persistQueue = Promise.resolve();
+    let statusQueue = Promise.resolve();
+    let lastStatusSemantic;
+    let lastStatusPath;
     let statusSnapshot = {};
     const reconcileWorkspaceSuffixExposure = () => {
         const directoryCounts = new Map();
@@ -1168,6 +1539,11 @@ export function createTelegramTopicTargetStore(options) {
             .sort((left, right) => right.updatedAtMs - left.updatedAtMs)[0];
     };
     const getPath = () => typeof options.path === "function" ? options.path() : options.path;
+    /** The non-canonical projection sits beside canonical state (`state*.json` → `status*.json`). */
+    const getStatusPath = () => {
+        const statePath = getPath(), name = basename(statePath);
+        return join(dirname(statePath), /^state/u.test(name) ? name.replace(/^state/u, "status") : `${name}.status`);
+    };
     const getTelegramProfile = () => typeof options.telegramProfile === "function"
         ? options.telegramProfile()
         : options.telegramProfile;
@@ -1181,9 +1557,72 @@ export function createTelegramTopicTargetStore(options) {
         }
         return { ...owner, telegramProfile };
     };
-    const getRecoveryPath = (path) => `${path}.provision-recovery.json`;
-    const readProvisionRecoveries = (path) => {
+    const activeProfile = () => getTelegramProfile() ?? "default";
+    const scopeMatches = (path, profile) => getPath() === path && activeProfile() === profile;
+    const loadedScopeMatches = (path) => loadedPath === path && (!consolidated || loadedProfile === activeProfile());
+    const workspaceIO = consolidated ? createTelegramConsolidatedWorkspaceStorage({ getPath, getProfile: getTelegramProfile, ...consolidated }) : undefined;
+    const runtimeProjection = consolidated ? createTelegramRuntimeProjectionStore({ getPath, getProfile: getTelegramProfile,
+        captureAuthority: consolidated.captureAuthority, getNowMs,
+        storage: {
+            read({ path, profile }) { const root = readTelegramRuntimeState(path); return Object.hasOwn(root.profiles, profile) ? root.profiles[profile]?.runtime : undefined; },
+            publish(expectedScope, mutate, isCurrent) {
+                const outcome = consolidated.publishIfOwned("runtime", current => {
+                    const next = mutate(current);
+                    return { value: next.value, result: next.changed };
+                }, { isCurrent, expectedScope });
+                return outcome.committed && outcome.result;
+            },
+        },
+    }) : undefined;
+    let workspaceFrame;
+    const readStoreSnapshot = (path, requirePrivate = true, asynchronous = false) => {
+        if (!workspaceIO)
+            return readWorkspaceSnapshot(path, requirePrivate, asynchronous);
+        if (path !== getPath())
+            throw new Error("Workspace storage scope changed during observation.");
+        if (workspaceFrame) {
+            if (!scopeMatches(workspaceFrame.path, workspaceFrame.profile))
+                throw new Error("Workspace transaction scope changed.");
+            return workspaceFrame.value;
+        }
+        const value = workspaceIO.readRaw();
+        return asynchronous ? Promise.resolve(value) : value;
+    };
+    const withStoreTransaction = (path, operation, publication) => {
+        if (!workspaceIO)
+            return withTelegramFileTransaction(`${path}.transaction`, operation);
+        if (workspaceFrame)
+            throw new Error("Nested Workspace transaction is not allowed.");
+        const profile = activeProfile(), publish = workspaceIO.capturePublication();
+        if (!publish || path !== getPath())
+            throw new Error("Workspace publication authority changed.");
+        const outcome = publish(value => {
+            workspaceFrame = { path, profile, value };
+            try {
+                const result = operation();
+                return { value: workspaceFrame.value, result };
+            }
+            finally {
+                workspaceFrame = undefined;
+            }
+        }, publication);
+        if (!outcome.committed)
+            throw new Error("Workspace publication authority changed.");
+        return outcome.result;
+    };
+    const getRecoveryPath = (path) => consolidated
+        ? resolveTelegramWorkspaceProvisionRecoveryPath(path, activeProfile(), "consolidated")
+        : resolveTelegramWorkspaceProvisionRecoveryPath(path);
+    const readProvisionRecoveries = (path, strict = false) => {
         const recoveryPath = getRecoveryPath(path);
+        if (strict) {
+            const value = readWorkspaceSnapshot(recoveryPath);
+            if (value === undefined)
+                return {};
+            if (!restoreObject(value))
+                throw new Error("Invalid Workspace provisioning recovery evidence.");
+            return value;
+        }
         if (!existsSync(recoveryPath))
             return {};
         try {
@@ -1196,14 +1635,43 @@ export function createTelegramTopicTargetStore(options) {
             return {};
         }
     };
+    const assertRestoreRecoveryProtection = (path, operations, provisions, requireKnownTargets = false, recoveryEvidence) => {
+        if (!operations.length)
+            return;
+        const recoveries = recoveryEvidence ?? readProvisionRecoveries(path, true);
+        for (const provision of provisions) {
+            let target = provision.target;
+            if (Object.hasOwn(recoveries, provision.id)) {
+                const recovery = recoveries[provision.id];
+                if (!restoreObject(recovery))
+                    throw new Error("Invalid Workspace provisioning recovery evidence.");
+                if (recovery.instanceId === provision.instanceId && recovery.profileKey === provision.profileKey &&
+                    recovery.leaderEpoch === provision.leaderEpoch) {
+                    const observed = recovery.target;
+                    if (!restoreObject(observed) || typeof observed.chatId !== "number" || !Number.isSafeInteger(observed.chatId) ||
+                        !restoreInteger(observed.threadId) || observed.threadId === 0)
+                        throw new Error("Invalid Workspace provisioning recovery evidence.");
+                    const recovered = { chatId: observed.chatId, threadId: observed.threadId };
+                    if (target && !targetMatches(target, recovered))
+                        throw new Error("Conflicting Workspace provisioning target evidence.");
+                    target = recovered;
+                }
+            }
+            if (requireKnownTargets && !target)
+                throw new Error("Workspace Restore target availability is unknown during unfinished creation.");
+            if (operations.some(({ request }) => conflictsWithWorkspaceRestoreProvision(request, { ...provision, target })))
+                throw new Error("Protected Workspace Restore provisioning recovery conflict.");
+        }
+    };
     const resetForPath = (path) => {
-        if (loadedPath === path)
+        if (loadedScopeMatches(path))
             return;
         botState = { threadMode: "unknown" };
         records = new Map();
         identities = new Map();
         workspaceBindings = new Map();
         workspaceRetirements = [];
+        workspaceRestore = undefined;
         sessionReplacement = undefined;
         workspaceRetirementCommitInFlight = false;
         workspaceClaims = new Map();
@@ -1216,16 +1684,62 @@ export function createTelegramTopicTargetStore(options) {
         loaded = false;
         dirty = false;
         loadedPath = path;
+        loadedProfile = activeProfile();
+        observedWorkspaceSemantic = undefined;
+    };
+    const observeWorkspaceRestore = (incoming) => {
+        if (workspaceRestore && (!incoming || incoming.profileName !== workspaceRestore.profileName ||
+            incoming.tokenSha256 !== workspaceRestore.tokenSha256 || incoming.revision < workspaceRestore.revision ||
+            (incoming.revision === workspaceRestore.revision && !isDeepStrictEqual(incoming, workspaceRestore))))
+            throw new Error("Workspace Restore evidence moved backwards or changed without revision.");
+    };
+    const withRestoreRegistration = (candidate, publish) => {
+        const path = getPath();
+        withStoreTransaction(path, () => {
+            const file = parseTopicTargetFile(readStoreSnapshot(path, false));
+            observeWorkspaceRestore(file.workspaceRestore);
+            const operations = file.workspaceRestore?.operations ?? [];
+            if (operations.length) {
+                if ((options.canPersist && !options.canPersist()) || getPath() !== path)
+                    throw new Error("Workspace Restore registration authority changed.");
+                assertWorkspaceRestoreBindingProtection(file);
+                assertRestoreRecoveryProtection(path, operations, file.pendingProvisions ?? []);
+                for (const { request } of operations) {
+                    if (targetMatches(candidate.target, request.binding.target) ||
+                        ((candidate.bindingKey === request.binding.bindingKey || candidate.slot === request.binding.slot ||
+                            targetMatches(candidate.target, request.target)) &&
+                            (candidate.bindingKey !== request.binding.bindingKey || candidate.slot !== request.binding.slot ||
+                                !targetMatches(candidate.target, request.target))))
+                        throw new Error("Protected Workspace Restore registration conflicts with its binding or target.");
+                }
+            }
+            if (publish && candidate.bindingKey !== undefined) {
+                const bindings = (file.workspaceBindings ?? []).filter(binding => binding.bindingKey === candidate.bindingKey);
+                if (bindings.length !== 1 || bindings[0]?.slot !== candidate.slot || !targetMatches(bindings[0].target, candidate.target))
+                    throw new Error("Workspace registration binding changed before publication.");
+            }
+            publish?.();
+        });
     };
     const loadFromDisk = async () => {
-        const path = getPath();
+        const path = getPath(), profile = activeProfile();
         resetForPath(path);
-        if (!existsSync(path)) {
+        const revision = mutationRevision;
+        const rawFile = await readStoreSnapshot(path, !!workspaceRestore, true);
+        // A read begun before a local mutation cannot replace the newly admitted projection.
+        if (mutationRevision !== revision || getPath() !== path || (consolidated && !scopeMatches(path, profile)))
+            return;
+        if (consolidated)
+            observedWorkspaceSemantic = getTelegramStateSemanticSnapshot(rawFile);
+        if (rawFile === undefined) {
+            if (workspaceRestore?.revision)
+                throw new Error("Workspace Restore evidence disappeared.");
             botState = { threadMode: "unknown" };
             records = new Map();
             identities = new Map();
             workspaceBindings = new Map();
             workspaceRetirements = [];
+            workspaceRestore = undefined;
             sessionReplacement = undefined;
             workspaceRetirementCommitInFlight = false;
             reservations = [];
@@ -1236,15 +1750,18 @@ export function createTelegramTopicTargetStore(options) {
             loaded = true;
             return;
         }
-        const revision = mutationRevision;
-        const content = await readFile(path, "utf8");
-        // A read begun before a local mutation must not replace the newly admitted
-        // binding/cleanup state with its older disk snapshot.
-        if (mutationRevision !== revision || getPath() !== path)
-            return;
-        const rawFile = JSON.parse(content);
         const file = parseTopicTargetFile(rawFile);
-        followerRecoveryHints = parseFollowerRecoveryHints(rawFile);
+        observeWorkspaceRestore(file.workspaceRestore);
+        const recoveries = readProvisionRecoveries(path, !!file.workspaceRestore?.operations.length);
+        assertRestoreRecoveryProtection(path, file.workspaceRestore?.operations ?? [], file.pendingProvisions ?? [], false, recoveries);
+        try {
+            followerRecoveryHints = parseFollowerRecoveryHints(consolidated
+                ? runtimeProjection?.read()
+                : JSON.parse(readFileSync(getStatusPath(), "utf8")));
+        }
+        catch {
+            followerRecoveryHints = new Map();
+        }
         botState = file.bot;
         const scopedRecords = file.threads.map((record) => cloneRecord({
             ...record,
@@ -1264,6 +1781,7 @@ export function createTelegramTopicTargetStore(options) {
             cloneWorkspaceBinding(binding),
         ]));
         workspaceRetirements = (file.workspaceRetirements ?? []).map(cloneWorkspaceRetirementIntent);
+        workspaceRestore = structuredClone(file.workspaceRestore);
         sessionReplacement = file.sessionReplacement
             ? cloneSessionReplacementIntent(file.sessionReplacement)
             : undefined;
@@ -1275,9 +1793,7 @@ export function createTelegramTopicTargetStore(options) {
             .filter((reservation) => reservation.expiresAtMs === undefined ||
             reservation.expiresAtMs > nowMs)
             .map((reservation) => ({ ...reservation }));
-        const recoveries = readProvisionRecoveries(path);
         pendingProvisions = (file.pendingProvisions ?? [])
-            .filter((provision) => isPendingProvisionLiveOrTargeted(provision, nowMs))
             .map((provision) => {
             const recovery = recoveries[provision.id];
             const recoveryMatches = recovery?.instanceId === provision.instanceId &&
@@ -1292,7 +1808,8 @@ export function createTelegramTopicTargetStore(options) {
                         ? { target: { ...provision.target } }
                         : {}),
             };
-        });
+        })
+            .filter((provision) => isPendingProvisionLiveOrTargeted(provision, nowMs));
         pendingCleanups = (file.pendingCleanups ?? []).map((intent) => ({
             ...intent,
             target: { ...intent.target },
@@ -1305,6 +1822,12 @@ export function createTelegramTopicTargetStore(options) {
         dirty = false;
     };
     const markDirty = () => {
+        if (consolidated && !loadedScopeMatches(getPath())) {
+            if (loadedPath !== undefined)
+                throw new Error("Workspace projection must refresh after scope change.");
+            loadedPath = getPath();
+            loadedProfile = activeProfile();
+        }
         loaded = true;
         dirty = true;
         mutationRevision += 1;
@@ -1321,10 +1844,14 @@ export function createTelegramTopicTargetStore(options) {
         }
         return false;
     };
-    const persistSnapshot = (transition) => {
+    const persistSnapshot = (transition, isExactJournalFrame) => {
+        const submittedPath = getPath(), submittedProfile = activeProfile();
+        const publishWorkspace = workspaceIO?.capturePublication();
         const persist = persistQueue.then(async () => {
             const path = getPath();
-            if (loadedPath !== path && !dirty)
+            if (workspaceIO && (!publishWorkspace || !scopeMatches(submittedPath, submittedProfile) || (dirty && !loadedScopeMatches(path))))
+                return false;
+            if (!loadedScopeMatches(path) && !dirty)
                 resetForPath(path);
             if (options.canPersist && !options.canPersist()) {
                 if (!transition)
@@ -1333,6 +1860,8 @@ export function createTelegramTopicTargetStore(options) {
             }
             if (!dirty || !loaded)
                 await loadFromDisk();
+            if (workspaceIO && (!scopeMatches(submittedPath, submittedProfile) || !loadedScopeMatches(path)))
+                return false;
             if (transition && !transition.isCurrent())
                 return false;
             const nowMs = getNowMs();
@@ -1347,21 +1876,71 @@ export function createTelegramTopicTargetStore(options) {
                 if (owners.length !== 1 || !isDeepStrictEqual(normalizeRecord(owners[0]), transition.owner))
                     return false;
             }
+            if (transition?.kind === "relocate") {
+                const { binding, owner, nextTarget } = transition;
+                const slots = captureExternalReservedSlots();
+                const sourceBindings = Array.from(workspaceBindings.values())
+                    .filter((value) => targetMatches(value.target, binding.target));
+                const sourceOwners = currentRecords.filter((value) => targetMatches(value.target, binding.target));
+                if ((workspaceRestore?.operations ?? []).some((operation) => workspaceRestoresConflict(operation.request, transition.restore.operations.at(-1).request)) ||
+                    !binding.sessionId || !binding.slot || !/^[A-Z]$/.test(binding.slot) ||
+                    binding.inactiveSinceMs !== undefined || owner.status !== "active" ||
+                    !owner.instanceId || owner.slot !== binding.slot ||
+                    !["leader", "manual-follower"].includes(owner.owner?.kind ?? "") ||
+                    (owner.owner?.kind === "leader" &&
+                        (owner.owner.cwd !== binding.cwd || owner.owner.instanceId !== owner.instanceId)) ||
+                    !targetMatches(owner.target, binding.target) ||
+                    sourceBindings.length !== 1 || !isDeepStrictEqual(sourceBindings[0], binding) ||
+                    sourceOwners.length !== 1 || !isDeepStrictEqual(sourceOwners[0], owner) ||
+                    !slots || slots.includes(binding.slot) || workspaceRetirementCommitInFlight ||
+                    hasWorkspaceRetirementConflict(binding) || hasWorkspaceRetirementConflict({ target: nextTarget }) ||
+                    Array.from(workspaceBindings.values()).some((value) => value.bindingKey !== binding.bindingKey &&
+                        (value.slot === binding.slot || targetMatches(value.target, nextTarget))) ||
+                    currentRecords.some((value) => targetMatches(value.target, nextTarget) ||
+                        (!targetMatches(value.target, binding.target) && value.slot === binding.slot)) ||
+                    Array.from(workspaceClaims.values()).some((value) => value.identity.bindingKey === binding.bindingKey || value.identity.slot === binding.slot) ||
+                    reservations.some((value) => value.slot === binding.slot ||
+                        targetMatches(value.target, binding.target) || targetMatches(value.target, nextTarget)) ||
+                    pendingProvisions.some((value) => value.workspaceBindingKey === binding.bindingKey ||
+                        value.instanceId === owner.instanceId || value.profileKey === owner.profileKey ||
+                        value.slot === binding.slot || (value.target &&
+                        (targetMatches(value.target, binding.target) || targetMatches(value.target, nextTarget)))) ||
+                    pendingCleanups.some((value) => targetMatches(value.target, binding.target) ||
+                        targetMatches(value.target, nextTarget)) ||
+                    syncObservations.some((value) => targetMatches(value.target, nextTarget) &&
+                        (value.syncStatus === "deleted" || value.syncStatus === "closed")) ||
+                    (sessionReplacement && ((sessionReplacement.cwd === binding.cwd &&
+                        sessionReplacement.sourceSessionId === binding.sessionId) ||
+                        targetMatches(sessionReplacement.target, binding.target) ||
+                        targetMatches(sessionReplacement.target, nextTarget))))
+                    return false;
+            }
             records = new Map(currentRecords.map((record) => [
                 getRecordOwnerKey(record),
                 cloneRecord(record),
             ]));
             const persistedRevision = mutationRevision;
-            const persistedStatusRevision = statusRevision;
+            const expectedRestore = structuredClone(workspaceRestore);
+            const assertRestoreEvidenceCurrent = (raw, fromTransaction = false) => {
+                if (isExactJournalFrame?.() === false)
+                    throw new Error("Telegram Workspace journal evidence publication lost its exact frame or authority.");
+                const disk = parseTopicTargetFile(fromTransaction ? raw : readStoreSnapshot(path, transition?.kind === "relocate" || !!expectedRestore));
+                if (!isDeepStrictEqual(disk.workspaceRestore, expectedRestore))
+                    throw new Error("Workspace Restore evidence changed before publication.");
+                assertWorkspaceRestoreBindingProtection(disk);
+                assertRestoreRecoveryProtection(path, [...(disk.workspaceRestore?.operations ?? []), ...(file.workspaceRestore?.operations ?? [])], [...(disk.pendingProvisions ?? []), ...(file.pendingProvisions ?? [])]);
+                const additions = (file.workspaceRestore?.operations ?? []).filter(operation => !disk.workspaceRestore?.operations.some(retained => retained.request.operationId === operation.request.operationId));
+                assertRestoreRecoveryProtection(path, additions, disk.pendingProvisions ?? [], true);
+            };
             const file = {
                 version: 1,
                 source: "snapshot",
                 writtenAtMs: nowMs,
                 bot: botState,
-                ...statusSnapshot,
                 identities: Array.from(identities.values()).map(cloneIdentityRecord),
                 workspaceBindings: Array.from(workspaceBindings.values()).map(cloneWorkspaceBinding),
                 workspaceRetirements: workspaceRetirements.map(cloneWorkspaceRetirementIntent),
+                ...(workspaceRestore ? { workspaceRestore: structuredClone(workspaceRestore) } : {}),
                 ...(sessionReplacement
                     ? { sessionReplacement: cloneSessionReplacementIntent(sessionReplacement) }
                     : {}),
@@ -1393,60 +1972,153 @@ export function createTelegramTopicTargetStore(options) {
                         bindings[0].slot !== record.slot)
                         return false;
                 }
-                file.threads = file.threads.filter((candidate) => candidate !== record);
-                for (const binding of file.workspaceBindings) {
-                    if (targetMatches(binding.target, transition.target) && binding.inactiveSinceMs === undefined) {
-                        binding.inactiveSinceMs = nowMs;
+                if (transition.kind === "relocate") {
+                    if (transition.restore.revision !== (workspaceRestore?.revision ?? 0) + 1 ||
+                        !isDeepStrictEqual(transition.restore.operations.slice(0, -1), workspaceRestore?.operations ?? []))
+                        return false;
+                    file.workspaceRestore = structuredClone(transition.restore);
+                    parseWorkspaceRestore(file.workspaceRestore);
+                    if (Buffer.byteLength(JSON.stringify(file.workspaceRestore)) > transition.maxBytes)
+                        throw new Error("Workspace Restore byte capacity reached.");
+                    const binding = file.workspaceBindings.find((value) => value.bindingKey === transition.binding.bindingKey);
+                    binding.target = { ...transition.nextTarget };
+                    binding.updatedAtMs = nowMs;
+                    delete binding.displayTitle;
+                    record.target = { ...transition.nextTarget };
+                    record.updatedAtMs = nowMs;
+                    record.rerouteConfirmedAtMs = nowMs;
+                    record.syncStatus = "unknown";
+                    record.lastReconcileAction = "workspace-restore";
+                    delete record.lastError;
+                    delete record.lastSyncError;
+                    delete record.lastSyncObservedAtMs;
+                    delete record.lastSyncProbeAtMs;
+                }
+                else {
+                    file.threads = file.threads.filter((candidate) => candidate !== record);
+                    for (const binding of file.workspaceBindings) {
+                        if (targetMatches(binding.target, transition.target) && binding.inactiveSinceMs === undefined) {
+                            binding.inactiveSinceMs = nowMs;
+                        }
+                    }
+                    if (transition.kind === "invalidate") {
+                        file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
+                        file.syncObservations.push({
+                            target: { ...record.target },
+                            syncStatus: "deleted",
+                            observedAtMs: nowMs,
+                            ...(record.instanceId ? { instanceId: record.instanceId } : {}),
+                            ...(record.slot ? { slot: record.slot } : {}),
+                            lastSyncError: transition.lastSyncError,
+                            lastReconcileAction: "mark-stale",
+                        });
                     }
                 }
-                if (transition.kind === "invalidate") {
-                    file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
-                    file.syncObservations.push({
-                        target: { ...record.target },
-                        syncStatus: "deleted",
-                        observedAtMs: nowMs,
-                        ...(record.instanceId ? { instanceId: record.instanceId } : {}),
-                        ...(record.slot ? { slot: record.slot } : {}),
-                        lastSyncError: transition.lastSyncError,
-                        lastReconcileAction: "mark-stale",
-                    });
+            }
+            assertWorkspaceRestoreBindingProtection(file);
+            assertRestoreRecoveryProtection(path, file.workspaceRestore?.operations ?? [], file.pendingProvisions ?? []);
+            if (publishWorkspace) {
+                const wire = JSON.parse(JSON.stringify(file));
+                const outcome = publishWorkspace(current => {
+                    if (!scopeMatches(submittedPath, submittedProfile) || mutationRevision !== persistedRevision ||
+                        transition?.isCurrent() === false || isExactJournalFrame?.() === false)
+                        return { value: current, result: false };
+                    const semanticCurrent = getTelegramStateSemanticSnapshot(current);
+                    if (!isDeepStrictEqual(semanticCurrent, observedWorkspaceSemantic))
+                        throw new Error("Workspace canonical snapshot changed before publication.");
+                    // A late whole-Workspace replacement cannot erase a concurrent canonical mutation.
+                    if (workspaceRestore && !isDeepStrictEqual(parseTopicTargetFile(current).workspaceRestore, expectedRestore))
+                        throw new Error("Workspace Restore evidence changed before publication.");
+                    assertRestoreEvidenceCurrent(current, true);
+                    if (transition?.kind === "relocate") {
+                        const slots = captureExternalReservedSlots();
+                        if (!slots || slots.includes(transition.binding.slot) || workspaceRetirementCommitInFlight ||
+                            Array.from(workspaceClaims.values()).some(value => value.identity.bindingKey === transition.binding.bindingKey || value.identity.slot === transition.binding.slot))
+                            return { value: current, result: false };
+                    }
+                    const unchanged = !transition && isDeepStrictEqual(semanticCurrent, getTelegramStateSemanticSnapshot(wire));
+                    return { value: unchanged ? current : wire, result: true };
+                }, { isCurrent: () => scopeMatches(submittedPath, submittedProfile) && mutationRevision === persistedRevision &&
+                        (transition?.isCurrent() ?? true) && (isExactJournalFrame?.() ?? true),
+                    onPublicationBoundary: transition?.kind === "relocate" ? boundary => {
+                        if (boundary !== "before-write")
+                            transition.onPublicationBoundary?.(boundary);
+                    } : undefined });
+                if (!outcome.committed || !outcome.result)
+                    return false;
+                loadedPath = path;
+                loadedProfile = submittedProfile;
+                loaded = true;
+                observedWorkspaceSemantic = getTelegramStateSemanticSnapshot(wire);
+                if (transition) {
+                    records = new Map(file.threads.map(record => {
+                        const normalized = normalizeRecord(record);
+                        return [getRecordOwnerKey(normalized), cloneRecord(normalized)];
+                    }));
+                    workspaceRestore = structuredClone(file.workspaceRestore);
+                    syncObservations = file.syncObservations;
+                    workspaceBindings = new Map(file.workspaceBindings.map(binding => [getWorkspaceBindingMapKey(binding), cloneWorkspaceBinding(binding)]));
+                    mutationRevision += 1;
                 }
+                dirty = false;
+                return true;
             }
             let persistedSemanticSnapshot;
             try {
-                persistedSemanticSnapshot = getTelegramStateSemanticSnapshot(JSON.parse(await readFile(path, "utf8")));
+                persistedSemanticSnapshot = getTelegramStateSemanticSnapshot(await readStoreSnapshot(path, !!workspaceRestore, true));
             }
             catch {
-                /* missing or invalid snapshots must be replaced */
+                /* Final Restore validation fences missing or unverifiable snapshots before publication. */
             }
             // Normalize optional fields to wire JSON; object key order is not a state change.
             if (!transition && isDeepStrictEqual(persistedSemanticSnapshot, getTelegramStateSemanticSnapshot(JSON.parse(JSON.stringify(file)))) &&
-                mutationRevision === persistedRevision &&
-                statusRevision === persistedStatusRevision) {
+                mutationRevision === persistedRevision) {
                 loadedPath = path;
                 loaded = true;
                 dirty = false;
                 return true;
             }
+            const serialized = `${JSON.stringify(file, null, 2)}\n`;
+            if (file.workspaceRestore && Buffer.byteLength(serialized) > WORKSPACE_SNAPSHOT_MAX_BYTES)
+                throw new Error("Workspace snapshot byte capacity reached.");
             await mkdir(dirname(path), { recursive: true });
             const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-            await writeFile(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
-                encoding: "utf8",
-                mode: 0o600,
-            });
+            await writeFile(tempPath, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
             await chmod(tempPath, 0o600);
             try {
                 if (transition) {
+                    if (transition.kind === "relocate")
+                        transition.onPublicationBoundary?.("after-write-before-rename");
                     let applied = false;
                     const commit = () => {
-                        if (getPath() !== path || mutationRevision !== persistedRevision ||
-                            statusRevision !== persistedStatusRevision || !transition.isCurrent())
+                        if (!transition.isCurrent())
                             return;
-                        // Fence and rename share one synchronous commit boundary. No stale
-                        // transition enters the live projection before durable commit.
+                        if (transition.kind === "relocate") {
+                            // Transient claims and external fences do not advance snapshot revisions.
+                            const slots = captureExternalReservedSlots();
+                            if (!slots || slots.includes(transition.binding.slot) || workspaceRetirementCommitInFlight ||
+                                Array.from(workspaceClaims.values()).some((value) => value.identity.bindingKey === transition.binding.bindingKey ||
+                                    value.identity.slot === transition.binding.slot))
+                                return;
+                        }
+                        if (getPath() !== path || mutationRevision !== persistedRevision)
+                            return;
+                        // All publishers fence the same retained operation, including after its terminal removal.
+                        assertRestoreEvidenceCurrent();
+                        if (!transition.isCurrent() || getPath() !== path || mutationRevision !== persistedRevision)
+                            return;
                         renameSync(tempPath, path);
                         loadedPath = path;
-                        records = new Map(Array.from(records).filter(([, record]) => !targetMatches(record.target, transition.target)));
+                        if (transition.kind === "relocate") {
+                            const relocated = file.threads.find((record) => targetMatches(record.target, transition.nextTarget));
+                            records.set(getRecordOwnerKey(transition.owner), {
+                                ...relocated, profileKey: transition.owner.profileKey,
+                            });
+                        }
+                        else {
+                            records = new Map(Array.from(records).filter(([, record]) => !targetMatches(record.target, transition.target)));
+                        }
+                        workspaceRestore = structuredClone(file.workspaceRestore);
                         syncObservations = file.syncObservations;
                         workspaceBindings = new Map(file.workspaceBindings.map((binding) => [
                             getWorkspaceBindingMapKey(binding), cloneWorkspaceBinding(binding),
@@ -1454,28 +2126,36 @@ export function createTelegramTopicTargetStore(options) {
                         mutationRevision += 1;
                         dirty = false;
                         applied = true;
+                        if (transition.kind === "relocate")
+                            transition.onPublicationBoundary?.("after-rename");
                     };
-                    if (options.commitPersist)
-                        options.commitPersist(commit);
-                    else if (!options.canPersist || options.canPersist())
-                        commit();
+                    withTelegramFileTransaction(`${path}.transaction`, () => {
+                        if (commitPersist)
+                            commitPersist(commit);
+                        else if (!options.canPersist || options.canPersist())
+                            commit();
+                    });
                     if (!applied)
                         await unlink(tempPath).catch(() => undefined);
                     return applied;
                 }
-                if (options.commitPersist) {
-                    const committed = options.commitPersist(() => {
+                if (commitPersist) {
+                    const committed = withTelegramFileTransaction(`${path}.transaction`, () => commitPersist(() => {
+                        assertRestoreEvidenceCurrent();
                         renameSync(tempPath, path);
                         chmodSync(path, 0o600);
-                    });
+                    }));
                     if (!committed) {
                         await loadFromDisk();
                         throw new Error("Telegram thread snapshot lost exact transport ownership before commit.");
                     }
                 }
                 else {
-                    await rename(tempPath, path);
-                    await chmod(path, 0o600);
+                    withTelegramFileTransaction(`${path}.transaction`, () => {
+                        assertRestoreEvidenceCurrent();
+                        renameSync(tempPath, path);
+                        chmodSync(path, 0o600);
+                    });
                 }
             }
             catch (error) {
@@ -1493,6 +2173,8 @@ export function createTelegramTopicTargetStore(options) {
     };
     return {
         async load() {
+            if (workspaceIO && dirty && !loadedScopeMatches(getPath()))
+                throw new Error("Workspace projection must refresh after scope change.");
             if (dirty)
                 return;
             await loadFromDisk();
@@ -1503,7 +2185,9 @@ export function createTelegramTopicTargetStore(options) {
             return refresh;
         },
         async persist() {
-            await persistSnapshot();
+            const committed = await persistSnapshot();
+            if (workspaceIO && !committed)
+                throw new Error("Workspace snapshot lost captured publication authority.");
         },
         invalidateTarget(target, isCurrent, lastSyncError) {
             return persistSnapshot({ kind: "invalidate", target, isCurrent, lastSyncError });
@@ -1513,6 +2197,719 @@ export function createTelegramTopicTargetStore(options) {
             if (!owner)
                 return Promise.resolve(false);
             return persistSnapshot({ kind: "detach", owner, target: owner.target, isCurrent });
+        },
+        assertWorkspaceRestoreRegistration(candidate) {
+            withRestoreRegistration(candidate);
+        },
+        commitWorkspaceRestoreRegistration: withRestoreRegistration,
+        listTemporaryThreadTargets() {
+            const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
+            return (file.workspaceRestore?.temporaryThreads ?? []).flatMap(entry => entry.target ? [{ ...entry.target }] : []);
+        },
+        withWorkspaceRestoreSnapshot(expected, observe) {
+            const path = getPath();
+            withStoreTransaction(path, () => {
+                const file = parseTopicTargetFile(readStoreSnapshot(path, false));
+                observeWorkspaceRestore(file.workspaceRestore);
+                if (getPath() !== path || !isDeepStrictEqual(file.workspaceRestore?.operations.find(intent => intent.request.operationId === expected.request.operationId), expected))
+                    throw new Error("Workspace Restore observation changed.");
+                assertWorkspaceRestoreBindingProtection(file);
+                assertRestoreRecoveryProtection(path, file.workspaceRestore.operations, file.pendingProvisions ?? []);
+                observe({ threads: file.threads, workspaceBindings: file.workspaceBindings });
+            });
+        },
+        workspaceRestore(storageOptions) {
+            const path = getPath(), profile = activeProfile();
+            const now = storageOptions.getNowMs ?? Date.now;
+            const { profileName, tokenSha256, isCurrentScope, legacyPath, onPublicationBoundary } = storageOptions;
+            if (consolidated && profileName !== profile)
+                throw new Error("Foreign Workspace Restore storage scope.");
+            const maxBytes = Math.min(storageOptions.maxBytes ?? WORKSPACE_RESTORE_MAX_BYTES, WORKSPACE_RESTORE_MAX_BYTES);
+            if (!restoreText(profileName) || !/^[a-f0-9]{64}$/u.test(tokenSha256) || !Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+                throw new Error("Invalid Workspace Restore storage scope.");
+            const empty = { version: 1, profileName, tokenSha256, revision: 0, operations: [] };
+            let observed;
+            const currentScope = () => getPath() === path && (!consolidated || scopeMatches(path, profile)) && (isCurrentScope?.() ?? true) && (options.canPersist?.() ?? true);
+            const read = () => {
+                if (legacyPath) {
+                    try {
+                        lstatSync(legacyPath);
+                        throw new Error("Unmigrated Workspace Restore file.");
+                    }
+                    catch (error) {
+                        if (error.code !== "ENOENT")
+                            throw error;
+                    }
+                }
+                const raw = readStoreSnapshot(path);
+                if (raw !== undefined && (!restoreObject(raw) || raw.version !== 1))
+                    throw new Error("Invalid Workspace snapshot.");
+                const file = (raw ?? (consolidated ? { version: 1, source: "snapshot", writtenAtMs: 0, bot: { threadMode: "unknown" }, threads: [] }
+                    : { version: 1, records: [] }));
+                const state = parseTopicTargetFile(file).workspaceRestore;
+                if (state && (state.profileName !== profileName || state.tokenSha256 !== tokenSha256))
+                    throw new Error("Invalid or foreign Workspace Restore evidence.");
+                if (observed && (!state || state.revision < observed.revision ||
+                    (state.revision === observed.revision && !isDeepStrictEqual(state, observed))))
+                    throw new Error("Workspace Restore evidence moved backwards or changed without revision.");
+                if (state && Buffer.byteLength(JSON.stringify(state)) > maxBytes)
+                    throw new Error("Workspace Restore byte capacity reached.");
+                observed = structuredClone(state);
+                if (loadedScopeMatches(path))
+                    observeWorkspaceRestore(state);
+                return { file, state: structuredClone(state ?? empty) };
+            };
+            const inspectTemporaryOwnership = (before, entry) => {
+                if (entry.phase !== "created" || !entry.target)
+                    return { kind: "unknown" };
+                const file = parseTopicTargetFile(before.file);
+                // Normalization omissions never prove an unbound target.
+                for (const key of ["threads", "workspaceBindings", "reservations", "pendingProvisions", "pendingCleanups", "workspaceRetirements"]) {
+                    const raw = before.file[key];
+                    if ((key === "threads" && raw === undefined) || (raw !== undefined &&
+                        (!Array.isArray(raw) || raw.length !== (file[key]?.length ?? 0))))
+                        throw new Error("Invalid temporary Thread target evidence.");
+                }
+                assertWorkspaceRestoreBindingProtection(file);
+                assertRestoreRecoveryProtection(path, before.state.operations, file.pendingProvisions ?? [], true);
+                const target = entry.target;
+                const bindings = (file.workspaceBindings ?? []).filter(value => targetMatches(value.target, target));
+                if (bindings.length === 1)
+                    return { kind: "bound", binding: structuredClone(bindings[0]) };
+                if (bindings.length > 1 || file.threads.some(value => targetMatches(value.target, target)) ||
+                    file.reservations?.some(value => targetMatches(value.target, target)) ||
+                    file.pendingProvisions?.some(value => !value.target || targetMatches(value.target, target)) ||
+                    file.pendingCleanups?.some(value => targetMatches(value.target, target)) ||
+                    file.workspaceRetirements?.some(value => targetMatches(value.binding.target, target)) ||
+                    before.state.operations.some(value => targetMatches(value.request.target, target)))
+                    return { kind: "unknown" };
+                return { kind: "temporary" };
+            };
+            const classifyTemporaryTarget = (before, entry) => entry.cleanupIssued ? { kind: "unknown" } : inspectTemporaryOwnership(before, entry);
+            const storage = {
+                read: () => read().state,
+                async relocate(input, isCurrent) {
+                    if (!currentScope() || !isCurrent())
+                        return false;
+                    const intent = structuredClone(input);
+                    if (!currentScope() || !isCurrent() || !isWorkspaceRestoreIntent(intent) || intent.phase !== "relocated" || intent.revision !== 0 ||
+                        intent.recipient !== undefined || intent.routing !== undefined)
+                        return false;
+                    const state = read().state;
+                    if (state.operations.some(operation => workspaceRestoresConflict(operation.request, intent.request)))
+                        return false;
+                    if (state.revision === Number.MAX_SAFE_INTEGER)
+                        throw new Error("Workspace Restore revision exhausted.");
+                    if (state.operations.length >= 26)
+                        throw new Error("Workspace Restore operation capacity reached.");
+                    const restore = { ...state, revision: state.revision + 1, operations: [...state.operations, intent] };
+                    const request = intent.request;
+                    return persistSnapshot({ kind: "relocate", operationId: request.operationId, binding: request.binding, owner: request.owner,
+                        target: { ...request.binding.target }, nextTarget: { ...request.target }, restore, maxBytes, onPublicationBoundary,
+                        isCurrent: () => currentScope() && isCurrent() });
+                },
+                update(expectedInput, nextInput, isCurrent) {
+                    const expected = structuredClone(expectedInput), next = structuredClone(nextInput);
+                    if (!currentScope() || !isCurrent())
+                        return false;
+                    if (expected.revision === Number.MAX_SAFE_INTEGER)
+                        throw new Error("Workspace Restore revision exhausted.");
+                    if (next.profileName !== profileName || next.tokenSha256 !== tokenSha256 || next.revision !== expected.revision + 1 || !parseWorkspaceRestore(next))
+                        throw new Error("Invalid Workspace Restore publication.");
+                    if (Buffer.byteLength(JSON.stringify(next)) > maxBytes)
+                        throw new Error("Workspace Restore byte capacity reached.");
+                    if (!workspaceIO)
+                        mkdirSync(dirname(path), { recursive: true });
+                    let committedBefore;
+                    let committedAfter;
+                    const committed = withStoreTransaction(path, () => {
+                        const before = read();
+                        if (!isDeepStrictEqual(before.state, expected) || !currentScope() || !isCurrent())
+                            return false;
+                        for (const entry of next.temporaryThreads ?? []) {
+                            const prior = expected.temporaryThreads?.find(value => value.token === entry.token);
+                            if (!prior && entry.phase === "created" && classifyTemporaryTarget(before, entry).kind !== "temporary")
+                                return false;
+                            if (!entry.cleanupIssued)
+                                continue;
+                            if (!prior?.cleanupIssued && (!prior || classifyTemporaryTarget(before, prior).kind !== "temporary"))
+                                return false;
+                        }
+                        assertWorkspaceRestoreBindingProtection(before.file);
+                        const provisions = parseTopicTargetFile(before.file).pendingProvisions ?? [];
+                        assertRestoreRecoveryProtection(path, before.state.operations, provisions);
+                        const after = { ...before.file, workspaceRestore: next };
+                        // New temporary targets must be checked against the file they will be published into.
+                        assertWorkspaceRestoreBindingProtection(parseTopicTargetFile(after));
+                        const content = JSON.stringify(after);
+                        if (Buffer.byteLength(content) > WORKSPACE_SNAPSHOT_MAX_BYTES)
+                            throw new Error("Workspace snapshot byte capacity reached.");
+                        if (workspaceIO) {
+                            if (!workspaceFrame || !currentScope() || !isCurrent())
+                                return false;
+                            assertRestoreRecoveryProtection(path, [...before.state.operations, ...next.operations], provisions);
+                            committedBefore = before;
+                            committedAfter = JSON.parse(content);
+                            workspaceFrame.value = committedAfter;
+                            return true;
+                        }
+                        const temporary = `${path}.${randomUUID()}.tmp`;
+                        try {
+                            writeFileSync(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+                            onPublicationBoundary?.("after-write-before-rename");
+                            let published = false;
+                            const publish = () => {
+                                if (!currentScope() || !isCurrent())
+                                    return;
+                                if (!isDeepStrictEqual(read().file, before.file))
+                                    throw new Error("Workspace Restore evidence changed before publication.");
+                                assertRestoreRecoveryProtection(path, [...before.state.operations, ...next.operations], provisions);
+                                if (!currentScope() || !isCurrent())
+                                    return;
+                                renameSync(temporary, path);
+                                observed = structuredClone(next);
+                                // A read-only Restore view must never bless a stale binding/owner projection.
+                                if (loadedPath === path && isDeepStrictEqual(workspaceRestore, before.file.workspaceRestore))
+                                    workspaceRestore = structuredClone(next);
+                                mutationRevision += 1;
+                                published = true;
+                                onPublicationBoundary?.("after-rename");
+                            };
+                            const owned = commitPersist ? commitPersist(publish) : (publish(), true);
+                            return owned && published;
+                        }
+                        finally {
+                            try {
+                                unlinkSync(temporary);
+                            }
+                            catch (error) {
+                                if (error.code !== "ENOENT")
+                                    throw error;
+                            }
+                        }
+                    }, { isCurrent: () => currentScope() && isCurrent(), onPublicationBoundary: boundary => {
+                            if (boundary !== "before-write")
+                                onPublicationBoundary?.(boundary);
+                        } });
+                    if (workspaceIO && committed && committedBefore && committedAfter) {
+                        observed = structuredClone(next);
+                        if (loadedScopeMatches(path) && isDeepStrictEqual(workspaceRestore, committedBefore.file.workspaceRestore))
+                            workspaceRestore = structuredClone(next);
+                        if (isDeepStrictEqual(observedWorkspaceSemantic, getTelegramStateSemanticSnapshot(committedBefore.file)))
+                            observedWorkspaceSemantic = getTelegramStateSemanticSnapshot(committedAfter);
+                        mutationRevision += 1;
+                    }
+                    return committed;
+                },
+            };
+            const mutate = (authority, change) => {
+                if (!authority.isCurrent())
+                    return undefined;
+                const executor = structuredClone(authority.executor);
+                const operator = authority.operatorUserId;
+                if (!isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator))
+                    return undefined;
+                const current = () => authority.isCurrent() && authority.operatorUserId === operator && isDeepStrictEqual(authority.executor, executor);
+                const before = storage.read();
+                const file = structuredClone(before);
+                const operation = change(file, executor, operator);
+                if (!operation || !current())
+                    return undefined;
+                if (isDeepStrictEqual(file, before))
+                    return structuredClone(operation);
+                if (file.revision === Number.MAX_SAFE_INTEGER)
+                    throw new Error("Workspace Restore revision exhausted.");
+                file.revision += 1;
+                return storage.update(before, file, current) ? structuredClone(operation) : undefined;
+            };
+            const advance = (expected, authority, change, adopt = false) => mutate(authority, (file, executor, operator) => {
+                const operation = file.operations.find(candidate => candidate.request.operationId === expected.request.operationId);
+                if (!operation || !isDeepStrictEqual(operation, expected) || operation.operatorUserId !== operator ||
+                    (!adopt && !isDeepStrictEqual(operation.executor, executor)))
+                    return undefined;
+                const changed = change(operation);
+                if (!changed)
+                    return undefined;
+                if (changed === "unchanged")
+                    return operation;
+                if (operation.revision === Number.MAX_SAFE_INTEGER)
+                    throw new Error("Workspace Restore operation revision exhausted.");
+                const at = now();
+                if (!restoreInteger(at))
+                    throw new Error("Invalid Workspace Restore clock.");
+                operation.executor = executor;
+                operation.revision += 1;
+                operation.updatedAtMs = Math.max(at, operation.updatedAtMs);
+                return operation;
+            });
+            const advanceTemporary = (expected, authority, change, adopt = false) => mutate(authority, (file, executor, operator) => {
+                const entry = file.temporaryThreads?.find(value => isDeepStrictEqual(value, expected));
+                if (!entry || entry.operatorUserId !== operator || (!adopt && !isDeepStrictEqual(entry.executor, executor)))
+                    return undefined;
+                const changed = change(entry, file, executor);
+                if (!changed)
+                    return undefined;
+                if (changed === "unchanged")
+                    return entry;
+                if (entry.revision === Number.MAX_SAFE_INTEGER)
+                    throw new Error("Workspace Restore operation revision exhausted.");
+                const at = now();
+                if (!restoreInteger(at))
+                    throw new Error("Invalid Workspace Restore clock.");
+                entry.executor = executor;
+                entry.revision += 1;
+                entry.updatedAtMs = Math.max(at, entry.updatedAtMs);
+                return entry;
+            });
+            return {
+                list: () => structuredClone(storage.read().operations),
+                inspectTemporaryThreadTarget(expected, authority) {
+                    const executor = structuredClone(authority.executor), operator = authority.operatorUserId;
+                    const current = () => currentScope() && authority.isCurrent() && authority.operatorUserId === operator &&
+                        isDeepStrictEqual(authority.executor, executor);
+                    if (!isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator) || !current())
+                        return undefined;
+                    return withStoreTransaction(path, () => {
+                        if (!current())
+                            return undefined;
+                        const before = read(), entry = before.state.temporaryThreads?.find(value => isDeepStrictEqual(value, expected));
+                        if (!entry || entry.operatorUserId !== operator || !current())
+                            return undefined;
+                        const result = classifyTemporaryTarget(before, entry);
+                        return current() ? result : undefined;
+                    });
+                },
+                isTemporaryThreadCleanupCurrent(expected, authority) {
+                    const executor = structuredClone(authority.executor), operator = authority.operatorUserId;
+                    const current = () => currentScope() && authority.isCurrent() && authority.operatorUserId === operator &&
+                        isDeepStrictEqual(authority.executor, executor);
+                    if (!expected.cleanupIssued || expected.operatorUserId !== operator || !isDeepStrictEqual(expected.executor, executor) ||
+                        !isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator) || !current())
+                        return false;
+                    return withStoreTransaction(path, () => {
+                        if (!current())
+                            return false;
+                        const before = read(), entry = before.state.temporaryThreads?.find(value => isDeepStrictEqual(value, expected));
+                        return !!entry && inspectTemporaryOwnership(before, entry).kind === "temporary" && current();
+                    });
+                },
+                /** The first durable state already includes both relocation and exact original references. */
+                async commit(requestInput, authority) {
+                    if (!authority.isCurrent())
+                        return undefined;
+                    const request = structuredClone(requestInput), executor = structuredClone(authority.executor), operatorUserId = authority.operatorUserId;
+                    const current = () => authority.isCurrent() && authority.operatorUserId === operatorUserId && isDeepStrictEqual(authority.executor, executor);
+                    if (!current() || !isTelegramWorkspaceRestoreRequest(request) || !isTelegramWorkspaceRestoreExecutor(executor) ||
+                        !restoreInteger(operatorUserId) || request.target.chatId !== operatorUserId)
+                        return undefined;
+                    const retained = () => {
+                        if (!current())
+                            return undefined;
+                        const operation = storage.read().operations.find(value => value.request.operationId === request.operationId);
+                        return current() && operation?.phase === "relocated" && isDeepStrictEqual(operation.request, request) &&
+                            operation.operatorUserId === operatorUserId && isDeepStrictEqual(operation.executor, executor) ? operation : undefined;
+                    };
+                    const existing = retained();
+                    if (existing)
+                        return existing;
+                    await (dirty ? undefined : loadFromDisk());
+                    if (!current())
+                        return undefined;
+                    const at = now();
+                    if (!restoreInteger(at))
+                        throw new Error("Invalid Workspace Restore clock.");
+                    const intent = { request, executor, operatorUserId, revision: 0,
+                        createdAtMs: at, updatedAtMs: at, committedAtMs: at, phase: "relocated" };
+                    let failure;
+                    try {
+                        await storage.relocate(intent, current);
+                    }
+                    catch (error) {
+                        failure = { error };
+                    }
+                    if (!current())
+                        return undefined;
+                    // A lost rename reply is reconciled from the complete operation, never target equality.
+                    const committed = retained();
+                    if (!committed && failure)
+                        throw failure.error;
+                    return committed;
+                },
+                adopt(expected, authority) {
+                    return advance(expected, authority, () => !isDeepStrictEqual(expected.executor, authority.executor), true);
+                },
+                /** Caller validates the live recipient under admission. Only this fresh result grants one RPC issuance. */
+                issueRecipient(expected, recipient, authority) {
+                    const intent = advance(expected, authority, operation => {
+                        if (operation.phase !== "relocated" || !isTelegramWorkspaceRestoreRecipient(recipient) || recipient.sessionId !== operation.request.binding.sessionId)
+                            return false;
+                        operation.phase = "recipient-issued";
+                        operation.recipient = structuredClone(recipient);
+                        return true;
+                    });
+                    return intent ? { issued: true, intent } : undefined;
+                },
+                /** One source-dispatch grant; uncertainty never resets it. Caller retains the original carriers. */
+                issueRouting(expected, authority) {
+                    const intent = advance(expected, authority, operation => {
+                        if (operation.phase !== "ready" || operation.routing)
+                            return false;
+                        operation.routing = { settlements: [] };
+                        return true;
+                    });
+                    return intent ? { issued: true, intent } : undefined;
+                },
+                /** Caller owns the positive result and exact source hash; this grants neither source removal nor cleanup. */
+                recordSourceAcceptance(expected, evidenceInput, authority) {
+                    if (!authority.isCurrent())
+                        return undefined;
+                    const evidence = structuredClone(evidenceInput);
+                    return advance(expected, authority, operation => {
+                        if (!operation.routing || !isWorkspaceRestoreSourceAcceptance(evidence, operation))
+                            return false;
+                        const existing = operation.routing.acceptances?.find(value => value.updateId === evidence.updateId);
+                        if (existing)
+                            return isDeepStrictEqual(existing, evidence) ? "unchanged" : false;
+                        if (operation.routing.cleanup !== undefined ||
+                            operation.routing.settlements.some(value => value.updateIds.includes(evidence.updateId)) ||
+                            !isDeepStrictEqual(evidence.recipient, operation.readyRecipient ?? operation.recipient))
+                            return false;
+                        const acceptances = [...operation.routing.acceptances ?? [], evidence].sort((a, b) => a.updateId - b.updateId);
+                        if (!workspaceRestoreAcceptancesConsistent(acceptances))
+                            return false;
+                        operation.routing.acceptances = acceptances;
+                        return true;
+                    });
+                },
+                /** Queue admission is nonterminal; only its exact journal-owner completion ACK may upgrade it. */
+                recordSourceSettlement(expected, evidenceInput, authority) {
+                    const evidence = structuredClone(evidenceInput);
+                    return advance(expected, authority, operation => {
+                        if (!operation.routing || !isTelegramWorkspaceRestoreSettlement(evidence, operation.request.source) ||
+                            !workspaceRestoreSettlementMatchesAcceptance(evidence, operation.routing.acceptances ?? []))
+                            return false;
+                        const overlaps = operation.routing.settlements.filter(value => value.updateIds.some(id => evidence.updateIds.includes(id)));
+                        if (overlaps.some(value => evidence.kind !== "queue-completed" || value.kind !== "queued" ||
+                            value.receiptId !== evidence.receiptId || value.queueKind !== evidence.queueKind))
+                            return false;
+                        operation.routing.settlements = operation.routing.settlements.flatMap(value => {
+                            const updateIds = value.updateIds.filter(id => !evidence.updateIds.includes(id));
+                            return updateIds.length ? [{ ...value, updateIds }] : [];
+                        });
+                        operation.routing.settlements.push(evidence);
+                        return true;
+                    });
+                },
+                /** Existing cleanup owner retains deletion authority; this merely fences one invocation. */
+                issueCleanup(expected, authority) {
+                    const intent = advance(expected, authority, operation => {
+                        if (!operation.routing || !workspaceRestoreSourcesSettled(operation) || operation.routing.cleanup !== undefined)
+                            return false;
+                        operation.routing.cleanup = "issued";
+                        return true;
+                    });
+                    return intent ? { issued: true, intent } : undefined;
+                },
+                recordCleanup(expected, result, authority) {
+                    return advance(expected, authority, operation => {
+                        if (!operation.routing || !workspaceRestoreSourcesSettled(operation) || !isDeepStrictEqual(result.target, operation.request.binding.target) ||
+                            (result.kind === "completed" ? operation.routing.cleanup !== "issued" :
+                                result.kind !== "not-issued" || operation.routing.cleanup !== undefined))
+                            return false;
+                        operation.routing.cleanup = result.kind;
+                        return true;
+                    });
+                },
+                /** Exact terminal CAS releases Restore protection only; it cannot settle or cancel recipient queue work. */
+                retire(expected, authority) {
+                    return mutate(authority, (file, executor, operator) => {
+                        const index = file.operations.findIndex(value => value.request.operationId === expected.request.operationId);
+                        const operation = file.operations[index];
+                        if (!operation || !isDeepStrictEqual(operation, expected) || operation.operatorUserId !== operator ||
+                            !isDeepStrictEqual(operation.executor, executor) || !workspaceRestoreSourcesSettled(operation) ||
+                            !["completed", "not-issued"].includes(operation.routing?.cleanup ?? ""))
+                            return undefined;
+                        file.operations.splice(index, 1);
+                        return operation;
+                    });
+                },
+                listTemporaryThreads: () => structuredClone(storage.read().temporaryThreads ?? []),
+                reserveTemporaryThread(sourceInput, token, authority) {
+                    const source = structuredClone(sourceInput);
+                    let reserved = false;
+                    const entry = mutate(authority, (file, executor, operator) => {
+                        const entries = file.temporaryThreads ?? [];
+                        const existing = entries.find(value => value.source.journalBindingKey === source.journalBindingKey &&
+                            value.source.updateId === source.updateId);
+                        // A retained entry proves an earlier attempt; it is never a license for another creation.
+                        if (existing)
+                            return existing.operatorUserId === operator ? existing : undefined;
+                        const at = now();
+                        if (!restoreInteger(at))
+                            throw new Error("Invalid Workspace Restore clock.");
+                        const next = { source,
+                            inputs: [{ journalBindingKey: source.journalBindingKey, updateIds: [source.updateId] }],
+                            operatorUserId: operator, executor, token, phase: "creating", forwardProtocol: "one-shot-v1",
+                            revision: 0, createdAtMs: at, updatedAtMs: at };
+                        if (!isTemporaryThreadEntry(next) || entries.some(value => value.token === token ||
+                            getTelegramTemporaryThreadInputs(value).some(input => input.journalBindingKey === source.journalBindingKey &&
+                                input.updateIds.includes(source.updateId))))
+                            return undefined;
+                        if (entries.length >= TEMPORARY_THREAD_CAPACITY)
+                            throw new Error("Temporary Thread capacity reached.");
+                        file.temporaryThreads = [...entries, next];
+                        reserved = true;
+                        return next;
+                    });
+                    return entry ? { reserved, entry } : undefined;
+                },
+                registerImplicitTemporaryThread(inputValue, targetInput, token, authority) {
+                    const input = structuredClone(inputValue), target = { chatId: targetInput.chatId, threadId: targetInput.threadId };
+                    if (!isTemporaryThreadInput(input) || input.updateIds.length !== 1 || !Number.isSafeInteger(target.threadId) || target.threadId <= 0)
+                        return undefined;
+                    return mutate(authority, (file, executor, operator) => {
+                        const entries = file.temporaryThreads ?? [];
+                        if (target.chatId !== operator || entries.some(value => value.token === token ||
+                            (value.target && targetMatches(value.target, target)) || getTelegramTemporaryThreadInputs(value).some(other => other.journalBindingKey === input.journalBindingKey && other.updateIds.some(id => input.updateIds.includes(id)))))
+                            return undefined;
+                        const at = now();
+                        if (!restoreInteger(at))
+                            throw new Error("Invalid Workspace Restore clock.");
+                        const entry = { source: { journalBindingKey: input.journalBindingKey, updateId: input.updateIds[0] },
+                            inputs: [input], target, operatorUserId: operator, executor, token, phase: "created", forwardProtocol: "one-shot-v1",
+                            revision: 0, createdAtMs: at, updatedAtMs: at };
+                        if (!isTemporaryThreadEntry(entry))
+                            return undefined;
+                        if (entries.length >= TEMPORARY_THREAD_CAPACITY)
+                            throw new Error("Temporary Thread capacity reached.");
+                        file.temporaryThreads = [...entries, entry];
+                        return entry;
+                    });
+                },
+                acknowledgeTemporaryThread(expected, targetInput, authority) {
+                    const target = { chatId: targetInput.chatId, threadId: targetInput.threadId };
+                    return advanceTemporary(expected, authority, (entry, file) => {
+                        if (entry.phase !== "creating" || target.chatId !== entry.operatorUserId || !Number.isSafeInteger(target.threadId) ||
+                            target.threadId <= 0 || file.temporaryThreads.some(value => !!value.target && targetMatches(value.target, target)) ||
+                            file.operations.some(({ request }) => targetMatches(request.target, target) || targetMatches(request.binding.target, target)))
+                            return false;
+                        entry.phase = "created";
+                        entry.target = target;
+                        return true;
+                    });
+                },
+                adoptTemporaryThread(expected, authority) {
+                    return advanceTemporary(expected, authority, (entry, _file, executor) => !isDeepStrictEqual(entry.executor, executor), true);
+                },
+                recordTemporaryThreadInput(expected, inputValue, authority) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input))
+                        return undefined;
+                    return advanceTemporary(expected, authority, (entry, file) => {
+                        if (entry.phase !== "created" || input.journalBindingKey !== entry.source.journalBindingKey ||
+                            file.operations.some(({ request }) => targetMatches(request.target, entry.target)))
+                            return false;
+                        const inputs = getTelegramTemporaryThreadInputs(entry);
+                        if (inputs.some(value => isDeepStrictEqual(value, input)))
+                            return "unchanged";
+                        if (entry.cleanupIssued || inputs.some(value => value.updateIds.some(id => input.updateIds.includes(id))) ||
+                            file.temporaryThreads.some(value => value !== entry && getTelegramTemporaryThreadInputs(value).some(other => other.journalBindingKey === input.journalBindingKey && other.updateIds.some(id => input.updateIds.includes(id)))))
+                            return false;
+                        if (inputs.length >= TEMPORARY_THREAD_INPUT_CAPACITY)
+                            throw new Error("Temporary Thread input capacity reached.");
+                        entry.inputs = [...inputs, input];
+                        return true;
+                    });
+                },
+                recordTemporaryThreadInputCancellation(expected, inputValue, authority, inspect) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input) || typeof inspect !== "function")
+                        return undefined;
+                    const operatorUserId = authority.operatorUserId, executor = structuredClone(authority.executor);
+                    const owned = () => authority.isCurrent() && authority.operatorUserId === operatorUserId &&
+                        isDeepStrictEqual(authority.executor, executor);
+                    // Every publication fence observes retained proof again; neither cached cancellation nor absence suffices.
+                    const current = () => owned() && input.updateIds.every(updateId => {
+                        const evidence = inspect(updateId);
+                        return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId &&
+                            evidence.operatorAuthorityId === `telegram-owner:${operatorUserId}`;
+                    }) && owned();
+                    const recorded = advanceTemporary(expected, { ...authority, isCurrent: current }, (entry, file) => {
+                        if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            file.operations.some(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+                                request.source.updateIds.some(id => input.updateIds.includes(id))))
+                            return false;
+                        const cancelled = entry.cancelledInputs ?? [];
+                        if (cancelled.some(candidate => isDeepStrictEqual(candidate, input)))
+                            return "unchanged";
+                        if (entry.completedInputs?.some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            entry.forwardedInputs?.some(candidate => isDeepStrictEqual(candidate, input)))
+                            return false;
+                        entry.cancelledInputs = [...cancelled, input];
+                        return true;
+                    });
+                    return recorded && current() ? recorded : undefined;
+                },
+                recordTemporaryThreadInputExpiry(expected, inputValue, authority, inspect) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input) || typeof inspect !== "function")
+                        return undefined;
+                    const operator = authority.operatorUserId, executor = structuredClone(authority.executor);
+                    const bound = classifyTemporaryTarget(read(), expected).kind === "bound";
+                    const current = () => authority.isCurrent() && authority.operatorUserId === operator &&
+                        isDeepStrictEqual(authority.executor, executor) && input.updateIds.every(updateId => {
+                        const evidence = inspect(updateId);
+                        return evidence?.journalBindingKey === input.journalBindingKey && evidence.updateId === updateId &&
+                            evidence.operatorAuthorityId === `telegram-owner:${operator}`;
+                    }) && authority.isCurrent();
+                    return advanceTemporary(expected, { ...authority, isCurrent: current }, (entry, file) => {
+                        if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(value => isDeepStrictEqual(value, input)) ||
+                            entry.completedInputs?.some(value => isDeepStrictEqual(value, input)))
+                            return false;
+                        const cancelled = entry.cancelledInputs ?? [];
+                        if (cancelled.some(value => isDeepStrictEqual(value, input)))
+                            return "unchanged";
+                        const operations = file.operations.filter(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+                            request.source.updateIds.some(id => input.updateIds.includes(id)));
+                        if (operations.some(({ request }) => !request.source.updateIds.every(id => input.updateIds.includes(id))))
+                            return false;
+                        // Forget only expired donor intent; canonical binding, recipient queue and immutable settlement proofs are untouched.
+                        file.operations = file.operations.filter(value => !operations.includes(value));
+                        // Once bound, this is no longer a disposable tab. Forget its temporary frame, not the binding or other journal sources.
+                        if (bound) {
+                            file.temporaryThreads = file.temporaryThreads?.filter(value => value !== entry);
+                            if (!file.temporaryThreads?.length)
+                                delete file.temporaryThreads;
+                            return true;
+                        }
+                        const forwarded = entry.forwardedInputs?.filter(value => !isDeepStrictEqual(value, input));
+                        if (forwarded?.length)
+                            entry.forwardedInputs = forwarded;
+                        else
+                            delete entry.forwardedInputs;
+                        entry.cancelledInputs = [...cancelled, input];
+                        return true;
+                    });
+                },
+                recordTemporaryThreadForwardIssued(expected, inputValue, authority) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input))
+                        return undefined;
+                    return advanceTemporary(expected, authority, (entry, file) => {
+                        if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            [...(entry.cancelledInputs ?? []), ...(entry.completedInputs ?? []), ...(entry.forwardedInputs ?? [])]
+                                .some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            file.operations.some(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+                                request.source.updateIds.some(id => input.updateIds.includes(id))))
+                            return false;
+                        entry.forwardedInputs = [...(entry.forwardedInputs ?? []), input];
+                        return true;
+                    });
+                },
+                recordTemporaryThreadInputCompletion(expected, inputValue, authority) {
+                    const input = structuredClone(inputValue);
+                    if (!isTemporaryThreadInput(input))
+                        return undefined;
+                    return advanceTemporary(expected, authority, (entry, file) => {
+                        if (entry.phase !== "created" || !getTelegramTemporaryThreadInputs(entry).some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            entry.cancelledInputs?.some(candidate => isDeepStrictEqual(candidate, input)) ||
+                            file.operations.some(({ request }) => request.source.journalBindingKey === input.journalBindingKey &&
+                                request.source.updateIds.some(id => input.updateIds.includes(id))))
+                            return false;
+                        const completed = entry.completedInputs ?? [];
+                        if (completed.some(candidate => isDeepStrictEqual(candidate, input)))
+                            return "unchanged";
+                        entry.completedInputs = [...completed, input];
+                        return true;
+                    });
+                },
+                issueTemporaryThreadCleanup(expected, authority) {
+                    const entry = advanceTemporary(expected, authority, value => {
+                        if (value.phase !== "created" || value.cleanupIssued || !isTelegramTemporaryThreadFullyResolved(value))
+                            return false;
+                        value.cleanupIssued = true;
+                        return true;
+                    });
+                    return entry ? { issued: true, entry } : undefined;
+                },
+                retireTemporaryThread(expected, authority, completed) {
+                    return mutate(authority, (file, executor, operator) => {
+                        const entries = file.temporaryThreads ?? [];
+                        const index = entries.findIndex(value => isDeepStrictEqual(value, expected));
+                        const entry = entries[index];
+                        if (!entry || entry.operatorUserId !== operator || !isDeepStrictEqual(entry.executor, executor) ||
+                            (getTelegramTemporaryThreadInputs(entry).length > 1 && !isTelegramTemporaryThreadFullyResolved(entry) &&
+                                !isTemporaryThreadReleasedByCompletion(entry, completed)))
+                            return undefined;
+                        const remaining = entries.filter((_value, position) => position !== index);
+                        if (remaining.length)
+                            file.temporaryThreads = remaining;
+                        else
+                            delete file.temporaryThreads;
+                        return entry;
+                    });
+                },
+                forgetPreviousWorld(authority, preserveTemporaryTokens = []) {
+                    if (!authority.isCurrent())
+                        return undefined;
+                    const executor = structuredClone(authority.executor), operator = authority.operatorUserId;
+                    if (!isTelegramWorkspaceRestoreExecutor(executor) || !restoreInteger(operator))
+                        return undefined;
+                    const current = () => authority.isCurrent() && authority.operatorUserId === operator && isDeepStrictEqual(authority.executor, executor);
+                    const previous = (value) => value.operatorUserId === operator && value.executor.instanceId !== executor.instanceId;
+                    const before = storage.read(), file = structuredClone(before);
+                    const forgetTemporary = (value) => previous(value) && !preserveTemporaryTokens.includes(value.token);
+                    const operations = file.operations.filter(previous), temporaryThreads = (file.temporaryThreads ?? []).filter(forgetTemporary);
+                    if (!current())
+                        return undefined;
+                    if (!operations.length && !temporaryThreads.length)
+                        return { operations, temporaryThreads };
+                    file.operations = file.operations.filter(value => !previous(value));
+                    const remaining = (file.temporaryThreads ?? []).filter(value => !forgetTemporary(value));
+                    if (remaining.length)
+                        file.temporaryThreads = remaining;
+                    else
+                        delete file.temporaryThreads;
+                    if (file.revision === Number.MAX_SAFE_INTEGER)
+                        throw new Error("Workspace Restore revision exhausted.");
+                    file.revision += 1;
+                    return storage.update(before, file, current) ? structuredClone({ operations, temporaryThreads }) : undefined;
+                },
+                /** Ends protection without cleanup: the old Thread is kept, and no source was ever dispatched. */
+                retireAbandoned(expected, abandonedUpdateIds, authority) {
+                    const abandoned = [...new Set(abandonedUpdateIds)].sort((left, right) => left - right);
+                    return mutate(authority, (file, executor, operator) => {
+                        const index = file.operations.findIndex(value => value.request.operationId === expected.request.operationId);
+                        const operation = file.operations[index];
+                        if (!operation || !isDeepStrictEqual(operation, expected) || operation.operatorUserId !== operator ||
+                            !isDeepStrictEqual(operation.executor, executor) || operation.phase !== "ready" || operation.routing !== undefined ||
+                            !isDeepStrictEqual(abandoned, operation.request.source.updateIds))
+                            return undefined;
+                        file.operations.splice(index, 1);
+                        return operation;
+                    });
+                },
+                /** Caller proves current canonical ownership and authenticates a read-only observation, including successors. */
+                confirmInspectedReady(expected, observed, authority) {
+                    return advance(expected, authority, operation => {
+                        if ((operation.phase !== "recipient-issued" && operation.phase !== "ready") || !isTelegramWorkspaceRestoreRecipient(observed) ||
+                            observed.sessionId !== operation.request.binding.sessionId)
+                            return false;
+                        operation.phase = "ready";
+                        operation.readyRecipient = structuredClone(observed);
+                        return true;
+                    });
+                },
+                /** Caller authenticates the exact-generation ACK; stored metadata alone is never readiness proof. */
+                confirmReady(expected, acknowledged, authority) {
+                    return advance(expected, authority, operation => {
+                        if (operation.phase !== "recipient-issued" || !isDeepStrictEqual(operation.recipient, acknowledged))
+                            return false;
+                        operation.phase = "ready";
+                        return true;
+                    });
+                },
+            };
         },
         list() {
             return Array.from(records.values()).map(cloneRecord);
@@ -1550,6 +2947,10 @@ export function createTelegramTopicTargetStore(options) {
             }));
         },
         reserveThread(reservation) {
+            if (workspaceRestore?.operations.some(({ request }) => conflictsWithWorkspaceRestoreProvision(request, reservation)) ||
+                conflictsWithTemporaryThread(workspaceRestore, reservation.target)) {
+                throw new Error("Protected Workspace Restore provisioning conflict.");
+            }
             const next = { ...reservation };
             reservations = reservations.filter((existing) => existing.slot !== next.slot &&
                 !targetMatches(existing.target, next.target));
@@ -1557,6 +2958,10 @@ export function createTelegramTopicTargetStore(options) {
             markDirty();
         },
         upsertPendingProvision(provision) {
+            if (workspaceRestore?.operations.some(({ request }) => conflictsWithWorkspaceRestoreProvision(request, provision)) ||
+                conflictsWithTemporaryThread(workspaceRestore, provision.target)) {
+                throw new Error("Protected Workspace Restore provisioning conflict.");
+            }
             const next = {
                 ...provision,
                 ...(provision.target ? { target: { ...provision.target } } : {}),
@@ -1569,9 +2974,9 @@ export function createTelegramTopicTargetStore(options) {
             const path = getPath();
             const recoveryPath = getRecoveryPath(path);
             await mkdir(dirname(recoveryPath), { recursive: true });
-            withTelegramFileTransaction(`${recoveryPath}.transaction`, () => {
-                const recoveries = readProvisionRecoveries(path);
-                recoveries[provision.id] = {
+            withStoreTransaction(path, () => {
+                const recoveries = readProvisionRecoveries(path, true);
+                const recovery = {
                     instanceId: provision.instanceId,
                     ...(provision.profileKey ? { profileKey: provision.profileKey } : {}),
                     ...(provision.leaderEpoch !== undefined
@@ -1579,6 +2984,12 @@ export function createTelegramTopicTargetStore(options) {
                         : {}),
                     target: { ...target },
                 };
+                if (Object.hasOwn(recoveries, provision.id)) {
+                    if (!isDeepStrictEqual(recoveries[provision.id], recovery))
+                        throw new Error("Conflicting Workspace provisioning recovery evidence.");
+                    return;
+                }
+                recoveries[provision.id] = recovery;
                 const tempPath = `${recoveryPath}.${process.pid}.${randomUUID()}.tmp`;
                 writeFileSync(tempPath, `${JSON.stringify(recoveries, null, 2)}\n`, {
                     encoding: "utf8",
@@ -1627,10 +3038,41 @@ export function createTelegramTopicTargetStore(options) {
             markDirty();
         },
         setStatusSnapshot(snapshot) {
-            if (!loadedPath)
+            if (!loadedPath) {
                 loadedPath = getPath();
+                loadedProfile = activeProfile();
+            }
             statusSnapshot = { ...snapshot };
-            statusRevision += 1;
+        },
+        persistStatus() {
+            if (runtimeProjection)
+                return runtimeProjection.persist({ runtime: statusSnapshot.runtime ?? {},
+                    liveRoster: statusSnapshot.liveRoster ?? {}, diagnostics: statusSnapshot.diagnostics ?? {} }).then(() => undefined);
+            const write = statusQueue.then(async () => {
+                if (options.canPersist && !options.canPersist())
+                    return;
+                const body = { version: 1, source: "snapshot", ...statusSnapshot };
+                // Normalize to wire JSON; object key order and omitted undefined are not changes.
+                const semantic = JSON.parse(JSON.stringify(body));
+                const statusPath = getStatusPath();
+                if (isDeepStrictEqual(semantic, lastStatusSemantic) && statusPath === lastStatusPath)
+                    return;
+                await mkdir(dirname(statusPath), { recursive: true });
+                const tempPath = `${statusPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+                await writeFile(tempPath, `${JSON.stringify({ ...body, writtenAtMs: (options.getNowMs ?? Date.now)() }, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+                try {
+                    renameSync(tempPath, statusPath);
+                    chmodSync(statusPath, 0o600);
+                }
+                catch (error) {
+                    await unlink(tempPath).catch(() => undefined);
+                    throw error;
+                }
+                lastStatusSemantic = semantic;
+                lastStatusPath = statusPath;
+            });
+            statusQueue = write.then(() => undefined, () => undefined);
+            return write;
         },
         getByProfileKey(profileKey) {
             const ownerKey = getTelegramThreadOwnerKey(getTelegramThreadOwnerFromProfileKey(profileKey));
@@ -1701,7 +3143,7 @@ export function createTelegramTopicTargetStore(options) {
         listWorkspaceRetirementIntents() {
             return workspaceRetirements.map(cloneWorkspaceRetirementIntent);
         },
-        commitWorkspaceJournalEvidence(expected, journalBindingKeys, complete) {
+        commitWorkspaceJournalEvidence(expected, journalBindingKeys, complete, journalSources) {
             if (workspaceRetirementCommitInFlight || hasWorkspaceRetirementConflict(expected)) {
                 return undefined;
             }
@@ -1711,15 +3153,23 @@ export function createTelegramTopicTargetStore(options) {
                 !journalBindingKeys.every((bindingKey) => typeof bindingKey === "string" && bindingKey.length > 0 && bindingKey.length <= 512))
                 return undefined;
             const keys = Array.from(new Set(journalBindingKeys));
+            const sources = journalSources === undefined ? current.journalSources ?? [] : normalizeWorkspaceJournalSources(journalSources);
+            if (!sources || sources.some(source => !(current.journalSources ?? []).some(retained => isDeepStrictEqual(retained, source))))
+                return undefined;
             if ((current.journalBindingsComplete === true) === complete &&
-                isDeepStrictEqual(current.journalBindingKeys ?? [], keys)) {
+                isDeepStrictEqual(current.journalBindingKeys ?? [], keys) && isDeepStrictEqual(current.journalSources ?? [], sources)) {
                 return cloneWorkspaceBinding(current);
             }
             const next = { ...current, updatedAtMs: getNowMs() };
-            if (keys.length)
+            // A complete empty set stays explicit so persisted completeness survives a lossless reload.
+            if (keys.length || complete)
                 next.journalBindingKeys = keys;
             else
                 delete next.journalBindingKeys;
+            if (sources.length)
+                next.journalSources = sources.map(source => ({ ...source }));
+            else
+                delete next.journalSources;
             if (complete)
                 next.journalBindingsComplete = true;
             else
@@ -1727,6 +3177,15 @@ export function createTelegramTopicTargetStore(options) {
             workspaceBindings.set(key, next);
             markDirty();
             return cloneWorkspaceBinding(next);
+        },
+        async persistWorkspaceJournalEvidence(expected, isCurrent) {
+            const path = getPath();
+            const frameCurrent = () => getPath() === path && isCurrent() && isDeepStrictEqual(workspaceBindings.get(getWorkspaceBindingMapKey(expected)), expected);
+            if (!frameCurrent())
+                return false;
+            const current = () => frameCurrent() && options.canPersist?.() !== false;
+            const published = await persistSnapshot(undefined, current);
+            return published && current();
         },
         upsertWorkspaceRetirementIntent(intent) {
             const next = normalizeWorkspaceRetirementIntent(intent);
@@ -2314,6 +3773,18 @@ export function createTelegramTopicTargetStore(options) {
             let claim = workspaceClaims.get(nextMapKey);
             const replacedTargetBinding = Array.from(workspaceBindings.values()).find((existing) => existing.bindingKey !== next.bindingKey &&
                 targetMatches(existing.target, next.target));
+            const retainedSources = [
+                ...(workspaceBindings.get(nextMapKey)?.journalSources ?? []),
+                ...(replacedTargetBinding?.journalSources ?? []),
+                ...(next.journalSources ?? []),
+            ];
+            if (retainedSources.length) {
+                const uniqueSources = Array.from(new Map(retainedSources.map(source => [JSON.stringify(source), source])).values());
+                const journalSources = normalizeWorkspaceJournalSources(uniqueSources);
+                if (!journalSources)
+                    return undefined;
+                next.journalSources = journalSources;
+            }
             if (claimInstanceId && claim?.instanceId === claimInstanceId &&
                 replacedTargetBinding?.slot) {
                 claim = {
@@ -2355,7 +3826,7 @@ export function createTelegramTopicTargetStore(options) {
                     ...(previous.journalBindingKeys ?? []),
                     ...(next.journalBindingKeys ?? []),
                 ]));
-                if (journalBindingKeys.length)
+                if (journalBindingKeys.length || previous.journalBindingsComplete)
                     next.journalBindingKeys = journalBindingKeys;
                 else
                     delete next.journalBindingKeys;
@@ -2665,49 +4136,7 @@ function isTelegramTopicTargetSlotOccupied(slot, records, reservations = [], pen
     }
     return false;
 }
-export function normalizeTelegramTopicTargetThreadName(threadName) {
-    return threadName.replace(/\s+/g, " ").trim().slice(0, 96);
-}
-function getGraphemeSegments(value) {
-    const segmenter = Intl.Segmenter;
-    if (!segmenter)
-        return Array.from(value);
-    return Array.from(new segmenter(undefined, { granularity: "grapheme" }).segment(value), (part) => part.segment);
-}
-export function getTelegramTopicIdentityName(threadName) {
-    return getGraphemeSegments(normalizeTelegramTopicTargetThreadName(threadName))
-        .join("")
-        .trim();
-}
-const TELEGRAM_THREAD_NAME_PALETTE = {
-    A: ["Atlas", "Aster", "Aurora", "Anchor", "Ashen"],
-    B: ["Beacon", "Briar", "Boreal", "Birch", "Bison"],
-    C: ["Cedar", "Comet", "Cipher", "Coral", "Cinder"],
-    D: ["Delta", "Dawn", "Drift", "Dune", "Dagger"],
-    E: ["Ember", "Echo", "Eagle", "Eden", "Elder"],
-    F: ["Falcon", "Fjord", "Flint", "Forest", "Fable"],
-    G: ["Grove", "Glade", "Glyph", "Garnet", "Gale"],
-    H: ["Harbor", "Hawk", "Hazel", "Helix", "Haven"],
-    I: ["Iris", "Ivory", "Iron", "Isle", "Idea"],
-    J: ["Jade", "Juno", "Jolt", "Jewel", "Jasper"],
-    K: ["Kite", "Karma", "Kernel", "Kodiak", "Kelp"],
-    L: ["Lumen", "Laurel", "Lynx", "Lotus", "Lagoon"],
-    M: ["Maple", "Meteor", "Meadow", "Marble", "Moss"],
-    N: ["Nimbus", "Nova", "Nectar", "North", "Noble"],
-    O: ["Orion", "Onyx", "Opal", "Orbit", "Olive"],
-    P: ["Pine", "Pulse", "Praxis", "Pebble", "Prism"],
-    Q: ["Quartz", "Quill", "Quasar", "Quest", "Quiver"],
-    R: ["River", "Raven", "Rune", "Reef", "Ridge"],
-    S: ["Spruce", "Solar", "Signal", "Stone", "Sable"],
-    T: ["Timber", "Talon", "Terra", "Torch", "Tide"],
-    U: ["Umber", "Unity", "Ursa", "Uplink", "Ulmus"],
-    V: ["Violet", "Vector", "Vista", "Vale", "Vortex"],
-    W: ["Willow", "Warden", "Wave", "Winter", "Wisp"],
-    X: ["Xenon", "Xylem", "Xavier", "Xylo", "Xerus"],
-    Y: ["Yarrow", "Yonder", "Yukon", "Yale", "Yogi"],
-    Z: ["Zenith", "Zephyr", "Zircon", "Zebra", "Zion"],
-};
-export function listOccupiedTelegramThreadIdentities(input) {
+function listOccupiedTelegramThreadIdentities(input) {
     const occupied = new Set();
     const add = (threadName) => {
         if (!threadName)
@@ -2740,35 +4169,6 @@ export function listOccupiedTelegramThreadIdentities(input) {
     }
     return Array.from(occupied);
 }
-export function chooseTelegramThreadName(input) {
-    if (!input.slot || !/^[A-Z]$/.test(input.slot))
-        return undefined;
-    const names = TELEGRAM_THREAD_NAME_PALETTE[input.slot];
-    if (!names || names.length === 0)
-        return undefined;
-    const occupied = new Set((input.occupied ?? []).map((name) => getTelegramTopicIdentityName(name)));
-    const start = input.getRandom
-        ? Math.max(0, Math.min(names.length - 1, Math.floor(input.getRandom() * names.length)))
-        : getTelegramThreadNameEntropyIndex(input.entropy, names.length);
-    for (let offset = 0; offset < names.length; offset += 1) {
-        const name = names[(start + offset) % names.length];
-        if (!occupied.has(getTelegramTopicIdentityName(name)))
-            return name;
-    }
-    for (const paletteSlot of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
-        for (const name of TELEGRAM_THREAD_NAME_PALETTE[paletteSlot] ?? []) {
-            if (!occupied.has(getTelegramTopicIdentityName(name)))
-                return name;
-        }
-    }
-    return undefined;
-}
-function getTelegramThreadNameLeadingSlot(threadName) {
-    if (!threadName)
-        return undefined;
-    const first = getTelegramTopicIdentityName(threadName)[0];
-    return first && /^[A-Z]$/.test(first) ? first : undefined;
-}
 function getNextTelegramThreadNamePaletteSlot(records, fallbackSlot) {
     let maxCode = "A".charCodeAt(0) - 1;
     for (const record of records) {
@@ -2786,79 +4186,6 @@ function getNextTelegramThreadNamePaletteSlot(records, fallbackSlot) {
     if (code > "Z".charCodeAt(0))
         code = "A".charCodeAt(0);
     return String.fromCharCode(code);
-}
-function getTelegramThreadNameEntropyIndex(entropy, length) {
-    if (length <= 1)
-        return 0;
-    if (typeof entropy === "number" && entropy < 1_000_000_000_000)
-        return 0;
-    const value = entropy === undefined ? "0" : String(entropy);
-    let hash = 2166136261;
-    for (const char of value) {
-        hash ^= char.codePointAt(0) ?? 0;
-        hash = Math.imul(hash, 16777619) >>> 0;
-    }
-    return hash % length;
-}
-export function getTelegramTopicThreadNameValidationError(threadName, _slot) {
-    const identity = getTelegramTopicIdentityName(threadName);
-    const reasons = [];
-    if (!identity)
-        reasons.push("it is empty after trimming");
-    if (/\s/.test(identity))
-        reasons.push("it contains spaces");
-    if (/[^A-Za-z]/.test(identity)) {
-        reasons.push("it contains characters outside Latin A-Z letters");
-    }
-    if (!/^[A-Z]/.test(identity)) {
-        reasons.push("it does not start with an uppercase Latin letter");
-    }
-    const genericLabels = new Set(["telegram", "leader", "follower"]);
-    if (genericLabels.has(identity.toLowerCase())) {
-        reasons.push("it is a generic role label");
-    }
-    if (/^[A-Z]$/.test(identity))
-        reasons.push("it is only a bare slot letter");
-    if (reasons.length === 0)
-        return undefined;
-    return `Invalid Telegram instance name: ${reasons.join("; ")}. Use exactly one capitalized Latin word with no spaces, punctuation, emoji, non-Latin letters, or digits; it must not be a generic role label or only a bare slot letter.`;
-}
-export function getTelegramManualThreadDisplayNameValidationError(threadName) {
-    const trimmed = threadName.trim();
-    const normalized = trimmed.replace(/\s+/g, " ");
-    const reasons = [];
-    if (!trimmed)
-        reasons.push("it is empty after trimming");
-    if (trimmed && /[^\x20-\x7E]/.test(trimmed)) {
-        reasons.push("it contains characters outside printable ASCII");
-    }
-    if (normalized.length > 96)
-        reasons.push("it is longer than 96 characters");
-    if (/^[A-Z]$/.test(normalized)) {
-        reasons.push("a bare slot letter is reserved for reset to automatic");
-    }
-    if (reasons.length === 0)
-        return undefined;
-    return `Invalid Telegram Thread display name: ${reasons.join("; ")}. Use 1–96 printable ASCII characters.`;
-}
-export function isTelegramTopicThreadNameValidForSlot(threadName, slot) {
-    return !getTelegramTopicThreadNameValidationError(threadName, slot);
-}
-function applyTopicNameTemplate(template, request, slot) {
-    const threadName = request.threadName?.replace(/\s+/g, " ").trim() || request.profileKey;
-    let result = template
-        .replaceAll("{threadName}", threadName)
-        .replaceAll("{profileKey}", request.profileKey)
-        .replaceAll("{instanceId}", request.instanceId);
-    if (slot)
-        result = result.replaceAll("{slot}", slot);
-    return result;
-}
-export function getTelegramTopicName(request, template = "{slot}", slot) {
-    const name = applyTopicNameTemplate(template, request, slot)
-        .replace(/\s+/g, " ")
-        .trim();
-    return (name || slot || "Pi").slice(0, 128);
 }
 function asInteger(value) {
     if (typeof value === "number" && Number.isInteger(value))
@@ -3544,13 +4871,6 @@ export function isTelegramTopicModeUnavailableError(error) {
         message.includes("threaded mode") ||
         message.includes("method is available only for"));
 }
-export function getTelegramTopicTitleForThreadName(threadName, slot, template = "{threadName}") {
-    return getTelegramTopicName({
-        instanceId: "",
-        profileKey: normalizeTelegramTopicTargetThreadName(threadName) || "Pi",
-        threadName,
-    }, template, slot);
-}
 export function createTelegramTopicTargetRenamer(deps) {
     return async (request) => {
         const threadName = normalizeTelegramTopicTargetThreadName(request.threadName);
@@ -3764,7 +5084,7 @@ export function createTelegramTopicTargetProvisioner(deps) {
             if (!projectedTitle?.trim()) {
                 throw new Error("Telegram Thread display identity is missing or ambiguous.");
             }
-            displayTitle = getTelegramTopicName({ ...request, threadName: projectedTitle }, "{threadName}", slot);
+            displayTitle = buildTelegramTopicName({ ...request, threadName: projectedTitle }, "{threadName}", slot);
         }
         const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}`;
         const pendingOwner = request.owner?.kind === "leader" ? "leader" : "manual-follower";
@@ -3789,7 +5109,7 @@ export function createTelegramTopicTargetProvisioner(deps) {
             assertLeaderEpoch("before-createForumTopic");
             const topic = await deps.callApi("createForumTopic", {
                 chat_id: deps.topicChatId,
-                name: displayTitle ?? getTelegramTopicName({
+                name: displayTitle ?? buildTelegramTopicName({
                     ...request,
                     ...(requestThreadName ? { threadName: requestThreadName } : {}),
                 }, deps.topicNameTemplate ??

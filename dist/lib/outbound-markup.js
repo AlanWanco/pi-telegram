@@ -3,6 +3,7 @@
  * Zones: telegram outbound, assistant markup
  * Owns top-level assistant action comment extraction, attribute parsing, and markup stripping shared by voice and outbound delivery
  */
+import { isWireRecord as isTelegramActionPayload } from "./wire.js";
 function getMarkdownLineEnd(markdown, offset) {
     const newlineIndex = markdown.indexOf("\n", offset);
     return newlineIndex === -1 ? markdown.length : newlineIndex + 1;
@@ -117,7 +118,7 @@ export function replaceTopLevelHtmlComments(markdown, replacer) {
     }
     return result + markdown.slice(offset);
 }
-export function findTopLevelOpenOrPartialHtmlCommentIndex(markdown) {
+function findTopLevelOpenOrPartialHtmlCommentIndex(markdown) {
     const { openCommentStart } = collectTopLevelHtmlComments(markdown);
     if (openCommentStart !== undefined)
         return openCommentStart;
@@ -146,21 +147,6 @@ export function findTopLevelOpenOrPartialHtmlCommentIndex(markdown) {
     }
     return -1;
 }
-export function parseTopLevelTelegramComment(comment, command) {
-    let normalizedContent = comment.content.replace(/^\s+/, "");
-    normalizedContent = normalizedContent.replace(/^!/, "");
-    const [rawHead = "", ...bodyLines] = normalizedContent.split(/\r?\n/);
-    let head = rawHead.trimStart();
-    if (!head.startsWith(command))
-        return undefined;
-    const nextChar = head[command.length];
-    if (nextChar !== undefined && !/\s|:/.test(nextChar))
-        return undefined;
-    return {
-        head: head.slice(command.length),
-        ...(bodyLines.length > 0 ? { body: bodyLines.join("\n") } : {}),
-    };
-}
 function parseTolerantTelegramAttributes(source, names) {
     const attributes = {};
     const namePattern = names.join("|");
@@ -171,9 +157,6 @@ function parseTolerantTelegramAttributes(source, names) {
             attributes[match[1]] = value;
     }
     return Object.keys(attributes).length > 0 ? attributes : undefined;
-}
-function isTelegramActionPayload(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function removeTelegramJsonTrailingCommas(source) {
     let normalized = "";
@@ -224,7 +207,7 @@ function parseTelegramJsonObjectCandidate(source) {
 function looksLikeTelegramNamedJsonObject(source, offset) {
     return /^\{\s*"(?:[^"\\]|\\.)*"\s*:/u.test(source.slice(offset));
 }
-export function parseTelegramActionPayload(comment, command) {
+function parseTelegramActionPayload(comment, command) {
     let content = comment.content.replace(/^\s+/, "").replace(/^!/, "");
     if (!content.startsWith(command))
         return undefined;
@@ -628,7 +611,7 @@ export function stripTelegramCommentMarkupForDelivery(markdown) {
 export function stripTelegramVoiceMarkupForPreview(markdown) {
     return stripTelegramCommentMarkupForPreview(markdown);
 }
-function getTelegramActionString(payload, key) {
+export function getTelegramActionString(payload, key) {
     const value = payload[key];
     if (typeof value !== "string")
         return undefined;

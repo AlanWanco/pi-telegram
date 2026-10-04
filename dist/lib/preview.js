@@ -168,7 +168,7 @@ export function createTelegramPreviewController(deps) {
         finalize: (chatId, _replyToMessageId, options) => finalizeTelegramPreview(chatId, getRuntimeDeps(), options),
     };
 }
-export function createTelegramAssistantMessagePreviewHooks(deps) {
+function createTelegramAssistantMessagePreviewHooks(deps) {
     return {
         onMessageStart: async (event) => {
             await handleTelegramAssistantMessagePreviewStart(event.message, deps);
@@ -186,7 +186,7 @@ export function createTelegramAssistantMessagePreviewHooks(deps) {
 export function shouldSuppressPreviewForGuestTurn(turn) {
     return !!turn?.guestQueryId;
 }
-export async function handleTelegramAssistantMessagePreviewStart(message, deps) {
+async function handleTelegramAssistantMessagePreviewStart(message, deps) {
     const turn = deps.getActiveTurn();
     if (!turn || !deps.isAssistantMessage(message))
         return;
@@ -211,7 +211,7 @@ export async function handleTelegramAssistantMessagePreviewStart(message, deps) 
     next.precedingFlush = state?.publicationPromise ?? state?.flushPromise ?? state?.precedingFlush;
     deps.setState(next);
 }
-export async function handleTelegramAssistantMessagePreviewUpdate(message, deps) {
+async function handleTelegramAssistantMessagePreviewUpdate(message, deps) {
     const turn = deps.getActiveTurn();
     if (!turn || !deps.isAssistantMessage(message))
         return;

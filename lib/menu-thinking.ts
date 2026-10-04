@@ -20,7 +20,7 @@ import {
 export interface TelegramThinkingMenuCallbackDeps {
   setThinkingLevel: (level: ThinkingLevel) => void;
   getCurrentThinkingLevel: () => ThinkingLevel;
-  updateStatusMessage: () => Promise<void>;
+  updateThinkingMenuMessage: () => Promise<void>;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -112,7 +112,7 @@ export async function handleTelegramThinkingMenuCallbackAction(
     return true;
   }
   deps.setThinkingLevel(action.level);
-  await deps.updateStatusMessage();
+  await deps.updateThinkingMenuMessage();
   await deps.answerCallbackQuery(
     callbackQueryId,
     `Thinking: ${deps.getCurrentThinkingLevel()}`,

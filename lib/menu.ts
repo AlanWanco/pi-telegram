@@ -255,6 +255,7 @@ export interface TelegramMenuActionRuntimeDeps<
   getActiveModel: (ctx: TContext) => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
   getQueueItemCount?: () => number;
+  getPendingCancellationCount?: () => number;
   buildStatusHtml: (ctx: TContext) => string;
   storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
   isIdle: (ctx: TContext) => boolean;
@@ -702,7 +703,7 @@ export async function handleTelegramMenuCallbackRuntime<
             deps.updateStatus(ctx);
           },
           getCurrentThinkingLevel: deps.getThinkingLevel,
-          updateStatusMessage: () => deps.updateStatusMessage(state, ctx),
+          updateThinkingMenuMessage: () => deps.updateThinkingMenuMessage(state, ctx),
           answerCallbackQuery: deps.answerCallbackQuery,
           isVoiceReplyActive: deps.isVoiceReplyActive,
         },
@@ -782,6 +783,7 @@ export function createTelegramMenuActionRuntimeWithStateBuilder<
     getActiveModel: deps.getActiveModel,
     getThinkingLevel: deps.getThinkingLevel,
     getQueueItemCount: deps.getQueueItemCount,
+    getPendingCancellationCount: deps.getPendingCancellationCount,
     buildStatusHtml: deps.buildStatusHtml,
     storeModelMenuState: deps.storeModelMenuState,
     isIdle: deps.isIdle,
@@ -819,6 +821,7 @@ export function createTelegramMenuActionRuntime<
         deps.getQueueItemCount?.() ?? 0,
         deps.sectionRegistry,
         deps.isVoiceReplyActive?.(),
+        deps.getPendingCancellationCount?.() ?? 0,
       ),
     sendStatusMessage: (chatId, replyToMessageId, ctx, threadId) =>
       openTelegramStatusMenu({
@@ -852,6 +855,7 @@ export function createTelegramMenuActionRuntime<
             queueItemCount,
             deps.sectionRegistry,
             deps.isVoiceReplyActive?.(),
+            deps.getPendingCancellationCount?.() ?? 0,
           ),
         storeModelMenuState: deps.storeModelMenuState,
       }),

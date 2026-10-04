@@ -3,6 +3,8 @@
  * Zones: multi-instance bus, IPC transport, Windows named pipes, Unix sockets
  * Owns endpoint derivation, transport-kind detection, retry/error classification, and small timing policy.
  */
+export type TelegramBusEndpointLayout = "consolidated";
+export declare const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
 export type TelegramBusTransportKind = "pipe" | "socket";
 export type TelegramBusTransportEventRecorder = (phase: string, details: Record<string, unknown>) => void;
 export type TelegramBusTransportEndpointDiagnostics = Record<string, unknown> & {
@@ -19,7 +21,6 @@ export interface TelegramBusTransportRetryPolicyOverrides {
 }
 export type TelegramBusTransportOperation = "registration" | "operation";
 export declare const TELEGRAM_BUS_REGISTRATION_RETRY: TelegramBusTransportRetryPolicy;
-export declare const TELEGRAM_BUS_OPERATION_RETRY: TelegramBusTransportRetryPolicy;
 export declare function getTelegramBusPipePath(input: {
     agentDir: string;
     scope: string;
@@ -36,12 +37,14 @@ export declare function getTelegramBusLeaderEndpoint(input: {
     agentDir: string;
     platform: NodeJS.Platform | string;
     profileName?: string;
+    layout?: TelegramBusEndpointLayout;
 }): string;
 export declare function getTelegramBusFollowerEndpoint(input: {
     agentDir: string;
     platform: NodeJS.Platform | string;
     instanceId: string;
     profileName?: string;
+    layout?: TelegramBusEndpointLayout;
 }): string;
 export interface TelegramBusTransportErrorInfo {
     message: string;

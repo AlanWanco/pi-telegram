@@ -72,6 +72,24 @@ test("Media helpers collect file infos across Telegram message variants", () => 
   );
 });
 
+for (const [flags, extension, mimeType, isImage] of [
+  [{}, ".webp", "image/webp", true],
+  [{ is_video: false, is_animated: false }, ".webp", "image/webp", true],
+  [{ is_video: true }, ".webm", "video/webm", false],
+  [{ is_animated: true }, ".tgs", "application/x-tgsticker", false],
+  [{ is_video: true, is_animated: true }, ".webm", "video/webm", false],
+] as const) {
+  test(`Sticker format flags preserve non-image attachments: ${JSON.stringify(flags)}`, async () => {
+    const messages = [{ message_id: 5, sticker: { file_id: "sticker", ...flags } }];
+    const fileName = `sticker-5${extension}`;
+    assert.deepEqual(collectTelegramFileInfos(messages), [{ file_id: "sticker", fileName, mimeType, kind: "sticker", isImage, source: { kind: "sticker", messageId: 5 } }]);
+    const files = await downloadTelegramMessageFiles(messages, { async downloadFile(id, name) {
+      assert.equal(id, "sticker"); assert.equal(name, fileName); return `/tmp/${name}`;
+    } });
+    assert.deepEqual(files, [{ path: `/tmp/${fileName}`, fileName, mimeType, kind: "sticker", isImage }]);
+  });
+}
+
 test("Media helpers collect embedded Rich Message media", () => {
   const files = collectTelegramFileInfos([
     {
@@ -106,6 +124,8 @@ test("Media helpers collect embedded Rich Message media", () => {
     {
       file_id: "rich-large",
       fileName: "photo-2-1.jpg",
+      index: 1,
+      source: { kind: "photo", messageId: 2, index: 1 },
       mimeType: "image/jpeg",
       kind: "photo",
       isImage: true,
@@ -113,10 +133,24 @@ test("Media helpers collect embedded Rich Message media", () => {
     {
       file_id: "rich-voice",
       fileName: "voice-2-2.ogg",
+      index: 2,
+      source: { kind: "voice", messageId: 2, index: 2 },
       mimeType: "audio/ogg",
       kind: "voice",
       isImage: false,
     },
+  ]);
+});
+
+test("Media downloads forward the message source, chat and sender file name", async () => {
+  const seen: unknown[] = [];
+  await downloadTelegramMessageFiles([
+    { message_id: 3, chat: { id: -1009, type: "supergroup", username: "team" }, document: { file_id: "d", file_name: "report.pdf", mime_type: "application/pdf" } },
+    { message_id: 4, chat: { id: 7, type: "private" }, voice: { file_id: "v", mime_type: "audio/ogg" } },
+  ], { async downloadFile(_id, name, source) { seen.push({ name, source }); return `/tmp/${name}`; } });
+  assert.deepEqual(seen, [
+    { name: "report.pdf", source: { kind: "document", messageId: 3, userFileName: "report.pdf", chat: { id: -1009, type: "supergroup", username: "team" } } },
+    { name: "voice-4.ogg", source: { kind: "voice", messageId: 4, chat: { id: 7, type: "private" } } },
   ]);
 });
 

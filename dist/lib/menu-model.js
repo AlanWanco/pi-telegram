@@ -11,7 +11,7 @@ export const TELEGRAM_MODEL_PAGE_SIZE = 6;
 const TELEGRAM_MODEL_PAGE_PICKER_ROW_SIZE = 4;
 export const MODEL_MENU_TITLE = "<b>🤖 Choose a model:</b>";
 export const MODEL_PAGE_MENU_TITLE = "<b>Choose a page:</b>";
-export const MODEL_DETAIL_MENU_TITLE = "<b>🤖 Model:</b>";
+const MODEL_DETAIL_MENU_TITLE = "<b>🤖 Model:</b>";
 function truncateTelegramButtonLabel(label, maxLength = 56) {
     return label.length <= maxLength
         ? label
@@ -249,7 +249,7 @@ export function getTelegramModelSelection(state, value) {
         return { kind: "missing" };
     return { kind: "selected", selection };
 }
-export function applyTelegramModelDetailSelection(state, value) {
+function applyTelegramModelDetailSelection(state, value) {
     const index = Number(value);
     if (!Number.isFinite(index))
         return "invalid";
@@ -261,7 +261,7 @@ export function applyTelegramModelDetailSelection(state, value) {
     state.mode = "model-detail";
     return "changed";
 }
-export function getTelegramSelectedDetailModel(state) {
+function getTelegramSelectedDetailModel(state) {
     const indexedSelection = getTelegramModelSelection(state, state.selectedModelIndex?.toString());
     if (indexedSelection.kind === "selected") {
         if (!state.selectedModelKey)
@@ -279,11 +279,11 @@ export function getTelegramSelectedDetailModel(state) {
     }
     return indexedSelection;
 }
-export function isTelegramModelScoped(state, model) {
+function isTelegramModelScoped(state, model) {
     const key = getCanonicalModelId(model);
     return state.scopedModels.some((entry) => getCanonicalModelId(entry.model) === key);
 }
-export function focusTelegramModelListPage(state, model, pageSize = TELEGRAM_MODEL_PAGE_SIZE) {
+function focusTelegramModelListPage(state, model, pageSize = TELEGRAM_MODEL_PAGE_SIZE) {
     const key = getCanonicalModelId(model).toLowerCase();
     const index = getModelMenuItems(state).findIndex((entry) => getCanonicalModelId(entry.model).toLowerCase() === key);
     state.page = index < 0 ? 0 : Math.floor(index / pageSize);
@@ -293,7 +293,7 @@ function formatScopedModelPattern(entry) {
     const key = getCanonicalModelId(entry.model);
     return entry.thinkingLevel ? `${key}:${entry.thinkingLevel}` : key;
 }
-export function setTelegramModelScope(state, model, enabled) {
+function setTelegramModelScope(state, model, enabled) {
     const key = getCanonicalModelId(model);
     const lowerKey = key.toLowerCase();
     const scopedModelPatterns = state.scopedModelPatterns ?? [];
@@ -583,7 +583,7 @@ export function buildModelMenuReplyMarkup(state, currentModel, pageSize) {
     ]));
     return { inline_keyboard: rows };
 }
-export function buildModelDetailMenuReplyMarkup(state, currentModel) {
+function buildModelDetailMenuReplyMarkup(state, currentModel) {
     const selection = getTelegramSelectedDetailModel(state);
     if (selection.kind !== "selected") {
         return {
@@ -617,7 +617,7 @@ export function buildModelDetailMenuReplyMarkup(state, currentModel) {
         ],
     };
 }
-export function buildModelDetailMenuText(state) {
+function buildModelDetailMenuText(state) {
     const selection = getTelegramSelectedDetailModel(state);
     if (selection.kind !== "selected")
         return MODEL_DETAIL_MENU_TITLE;

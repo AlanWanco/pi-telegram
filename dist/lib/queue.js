@@ -5,6 +5,7 @@
  */
 import { createHash } from "node:crypto";
 import { isVoiceTurn } from "./voice.js";
+import { isWireRecord as isQueuePayloadRecord } from "./wire.js";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
 export const TELEGRAM_QUEUE_LANE_CONTRACTS = [
     // Control lane intentionally accepts both direct controls and resume prompts.
@@ -30,7 +31,67 @@ export const TELEGRAM_QUEUE_LANE_CONTRACTS = [
     },
 ];
 export const TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024;
-export const TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS = 256;
+const TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS = 256;
+function parseQueuePayloadReceipt(value, kind) {
+    if (!isQueuePayloadRecord(value) || value.queueKind !== kind ||
+        typeof value.receiptId !== "string" || !value.receiptId ||
+        (value.journalBindingKey !== undefined && (typeof value.journalBindingKey !== "string" || !value.journalBindingKey.trim())) ||
+        !Array.isArray(value.sourceUpdateIds) || value.sourceUpdateIds.length === 0 ||
+        value.sourceUpdateIds.some((id, index) => !Number.isSafeInteger(id) || id < 0 ||
+            (index > 0 && id <= value.sourceUpdateIds[index - 1])))
+        return undefined;
+    return { queueKind: kind, receiptId: value.receiptId, sourceUpdateIds: value.sourceUpdateIds,
+        ...(typeof value.journalBindingKey === "string" ? { journalBindingKey: value.journalBindingKey } : {}) };
+}
+/** Data decoder shared by authenticated IPC and cold storage; decoding grants no admission. */
+export function parseTelegramQueueHandoffPayload(value) {
+    if (!isQueuePayloadRecord(value) || (value.kind !== "prompt" && value.kind !== "control"))
+        return undefined;
+    const target = isQueuePayloadRecord(value.target) && typeof value.target.chatId === "number"
+        ? { chatId: value.target.chatId, ...(typeof value.target.threadId === "number" ? { threadId: value.target.threadId } : {}) } : undefined;
+    const transportStamp = isQueuePayloadRecord(value.transportStamp) &&
+        typeof value.transportStamp.profile === "string" && typeof value.transportStamp.generation === "string"
+        ? { profile: value.transportStamp.profile, generation: value.transportStamp.generation } : undefined;
+    if (!Number.isSafeInteger(value.chatId) || (value.target !== undefined && !target) ||
+        (value.transportStamp !== undefined && !transportStamp) || !Number.isSafeInteger(value.replyToMessageId) ||
+        (value.guestQueryId !== undefined && typeof value.guestQueryId !== "string") ||
+        (value.guestInlineMessageId !== undefined && typeof value.guestInlineMessageId !== "string") ||
+        !Number.isSafeInteger(value.queueOrder) || (value.queueLane !== "control" && value.queueLane !== "priority" && value.queueLane !== "default") ||
+        !Number.isSafeInteger(value.laneOrder) || typeof value.statusSummary !== "string" || !Array.isArray(value.admissionReceipts))
+        return undefined;
+    const admissionReceipts = value.admissionReceipts.map(receipt => parseQueuePayloadReceipt(receipt, value.kind));
+    if (admissionReceipts.length === 0 || admissionReceipts.length > TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS ||
+        admissionReceipts.some(receipt => !receipt))
+        return undefined;
+    const base = { chatId: value.chatId, ...(target ? { target } : {}), ...(transportStamp ? { transportStamp } : {}),
+        replyToMessageId: value.replyToMessageId,
+        ...(typeof value.guestQueryId === "string" ? { guestQueryId: value.guestQueryId } : {}),
+        ...(typeof value.guestInlineMessageId === "string" ? { guestInlineMessageId: value.guestInlineMessageId } : {}),
+        queueOrder: value.queueOrder, queueLane: value.queueLane,
+        laneOrder: value.laneOrder, statusSummary: value.statusSummary,
+        admissionReceipts: admissionReceipts };
+    if (value.kind === "control") {
+        return value.queueLane === "control" && (value.controlType === "status" || value.controlType === "model")
+            ? { kind: "control", controlType: value.controlType, ...base } : undefined;
+    }
+    if (value.queueLane === "control" || !Array.isArray(value.sourceMessageIds) || value.sourceMessageIds.some(id => !Number.isSafeInteger(id)) ||
+        !Array.isArray(value.queuedAttachments) || value.queuedAttachments.some(attachment => !isQueuePayloadRecord(attachment) ||
+        typeof attachment.path !== "string" || typeof attachment.fileName !== "string") ||
+        !Array.isArray(value.content) || value.content.some(content => !isQueuePayloadRecord(content) ||
+        (content.type === "text" ? typeof content.text !== "string" : content.type === "image"
+            ? typeof content.data !== "string" || typeof content.mimeType !== "string" : true)) ||
+        typeof value.historyText !== "string" || (value.priorityEmoji !== undefined && typeof value.priorityEmoji !== "string") ||
+        (value.reactionSuppressionEmoji !== undefined && typeof value.reactionSuppressionEmoji !== "string") ||
+        (value.voiceReplyPreferred !== undefined && typeof value.voiceReplyPreferred !== "boolean") ||
+        (value.voiceReplyRequired !== undefined && typeof value.voiceReplyRequired !== "boolean"))
+        return undefined;
+    return { kind: "prompt", ...base, sourceMessageIds: value.sourceMessageIds,
+        queuedAttachments: value.queuedAttachments, content: value.content, historyText: value.historyText,
+        ...(typeof value.priorityEmoji === "string" ? { priorityEmoji: value.priorityEmoji } : {}),
+        ...(typeof value.reactionSuppressionEmoji === "string" ? { reactionSuppressionEmoji: value.reactionSuppressionEmoji } : {}),
+        ...(typeof value.voiceReplyPreferred === "boolean" ? { voiceReplyPreferred: value.voiceReplyPreferred } : {}),
+        ...(typeof value.voiceReplyRequired === "boolean" ? { voiceReplyRequired: value.voiceReplyRequired } : {}) };
+}
 export function createTelegramQueueAdmissionReceipt(options) {
     if (options.sourceUpdateIds.length === 0)
         return undefined;
@@ -100,7 +161,7 @@ export function assertTelegramQueueItemAdmissionValid(item) {
 function getTelegramQueueLaneRank(lane) {
     return getTelegramQueueLaneContract(lane).dispatchRank;
 }
-export function isPendingTelegramTurn(item) {
+function isPendingTelegramTurn(item) {
     return item.kind === "prompt";
 }
 export function createTelegramQueueStore(initialItems = []) {
@@ -148,7 +209,7 @@ export function createTelegramTransportStampedQueueStore(store, getTransportStam
         },
     };
 }
-export function isTelegramQueueItemSkipped(item) {
+function isTelegramQueueItemSkipped(item) {
     return item.kind === "prompt" && Boolean(item.reactionSuppressionEmoji);
 }
 export function countExecutableTelegramQueueItems(items) {
@@ -503,7 +564,7 @@ export function removeTelegramQueueItemsByMessageIds(items, messageIds, scope) {
         removedCount: removedItems.length,
     };
 }
-export function removeTelegramQueuedGuestPromptByOrder(items, queueOrder) {
+function removeTelegramQueuedGuestPromptByOrder(items, queueOrder) {
     const index = items.findIndex((item) => {
         return isPendingTelegramTurn(item) &&
             item.guestQueryId !== undefined &&
@@ -521,7 +582,7 @@ export function removeTelegramQueuedGuestPromptByOrder(items, queueOrder) {
 export function applyTelegramQueuePromptReactionDisposition(items, messageId, disposition, destinationLaneOrder, scope) {
     let nextItems = items;
     for (const [index, item] of items.entries()) {
-        if (!isPendingTelegramTurn(item) ||
+        if (!isPendingTelegramTurn(item) || item.queueLane === "control" ||
             !isTelegramQueueItemInMessageScope(item, scope) ||
             !item.sourceMessageIds.includes(messageId)) {
             continue;
@@ -1489,7 +1550,15 @@ function updateTelegramQueueStatusRuntime(deps) {
     }
 }
 function commitReorderedTelegramQueueItemsRuntime(items, deps) {
-    deps.setQueuedItems([...items].sort(compareTelegramQueueItems));
+    const pendingHead = deps.hasPendingDispatch?.() ? deps.getQueuedItems()[0] : undefined;
+    const ordered = [...items].sort(compareTelegramQueueItems);
+    if (pendingHead) {
+        const index = ordered.findIndex(item => item.queueOrder === pendingHead.queueOrder && item.kind === pendingHead.kind &&
+            item.chatId === pendingHead.chatId && item.replyToMessageId === pendingHead.replyToMessageId);
+        if (index > 0)
+            ordered.unshift(ordered.splice(index, 1)[0]);
+    }
+    deps.setQueuedItems(ordered);
     updateTelegramQueueStatusRuntime(deps);
 }
 function appendTelegramQueueItemRuntime(item, deps) {
@@ -1499,7 +1568,7 @@ function appendTelegramQueueItemRuntime(item, deps) {
         return;
     commitReorderedTelegramQueueItemsRuntime(nextItems, deps);
 }
-export function reorderTelegramQueueItemsRuntime(deps) {
+function reorderTelegramQueueItemsRuntime(deps) {
     commitReorderedTelegramQueueItemsRuntime(deps.getQueuedItems(), deps);
 }
 export function clearTelegramQueueItemsRuntime(deps) {
@@ -1528,7 +1597,7 @@ export function removeTelegramQueueItemsByMessageIdsRuntime(messageIds, deps, sc
     updateTelegramQueueStatusRuntime(deps);
     return removedCount;
 }
-export function removeTelegramQueuedGuestPromptByOrderRuntime(queueOrder, deps) {
+function removeTelegramQueuedGuestPromptByOrderRuntime(queueOrder, deps) {
     const { items, removedItems, removedCount } = removeTelegramQueuedGuestPromptByOrder(deps.getQueuedItems(), queueOrder);
     if (removedCount === 0)
         return false;
@@ -1541,8 +1610,22 @@ export function removeTelegramQueuedGuestPromptByOrderRuntime(queueOrder, deps) 
 }
 export function applyTelegramQueuePromptReactionDispositionRuntime(messageId, disposition, deps, scope) {
     const queuedItems = deps.getQueuedItems();
+    const suppression = disposition.kind === "reaction-transition" ? disposition.suppressionEmoji :
+        disposition.kind === "suppressed" ? disposition.emoji : disposition.kind === "priority-suppressed" ? disposition.suppressionEmoji : undefined;
+    // Source-addressed control-lane prompts are explicit continuations. Synthetic model-switch turns have no source IDs.
+    // A Pi-owned dispatched head cannot be removed: agent_start must consume that exact item, not its successor.
+    const cancelled = suppression && deps.hasPendingDispatch ? queuedItems.filter((item, index) => isPendingTelegramTurn(item) && item.queueLane === "control" && isTelegramQueueItemInMessageScope(item, scope) &&
+        item.sourceMessageIds.includes(messageId) && !(index === 0 && deps.hasPendingDispatch())) : [];
+    if (cancelled.length) {
+        if (cancelled.some(item => (item.admissionReceipts?.length ?? 0) > 0) && !deps.onItemsDiscarded)
+            return false;
+        deps.onItemsDiscarded?.(cancelled, deps.ctx);
+        deps.setQueuedItems(queuedItems.filter(item => !cancelled.includes(item)));
+        updateTelegramQueueStatusRuntime(deps);
+        return true;
+    }
     const changesLane = queuedItems.some((item) => {
-        if (!isPendingTelegramTurn(item) ||
+        if (!isPendingTelegramTurn(item) || item.queueLane === "control" ||
             !isTelegramQueueItemInMessageScope(item, scope) ||
             !item.sourceMessageIds.includes(messageId)) {
             return false;
@@ -1639,7 +1722,7 @@ export async function executeTelegramControlItemRuntime(item, deps) {
  * Production debounce for deferred queue dispatch; the factory defaults to this
  * so the entrypoint wires ports instead of policy constants.
  */
-export const TELEGRAM_DEFERRED_DISPATCH_DELAY_MS = 50;
+const TELEGRAM_DEFERRED_DISPATCH_DELAY_MS = 50;
 export function createTelegramDeferredQueueDispatchRuntime(deps = {}) {
     let boundContext;
     let generation = 0;
@@ -2004,7 +2087,7 @@ export function createTelegramQueueDispatchController(deps) {
                 const announcementGeneration = nextDispatchAnnouncementGeneration;
                 const dispatchGeneration = deps.getDispatchGeneration?.();
                 deps.updateStatus(ctx);
-                void deps.sendTextReply(dispatchPlan.item.chatId, dispatchPlan.item.replyToMessageId, "<b>⏩ Dispatching next queued turn.</b>", { target: dispatchPlan.item.target }).catch((error) => {
+                void deps.sendTextReply(dispatchPlan.item.chatId, dispatchPlan.item.replyToMessageId, "<b>⏩ Dispatching next queued turn.</b>", { target: dispatchPlan.item.target, parseMode: "HTML" }).catch((error) => {
                     deps.recordRuntimeEvent?.("dispatch", error, {
                         phase: "next-announcement",
                     });

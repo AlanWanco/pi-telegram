@@ -15,12 +15,6 @@ export declare function collectTopLevelHtmlComments(markdown: string): {
 };
 export declare function replaceTelegramButtonFences(markdown: string, replace: (payload: string, closed: boolean) => string): string;
 export declare function replaceTopLevelHtmlComments(markdown: string, replacer: (comment: TelegramTopLevelHtmlComment) => string): string;
-export declare function findTopLevelOpenOrPartialHtmlCommentIndex(markdown: string): number;
-export declare function parseTopLevelTelegramComment(comment: TelegramTopLevelHtmlComment, command: string): {
-    head: string;
-    body?: string;
-} | undefined;
-export declare function parseTelegramActionPayload(comment: TelegramTopLevelHtmlComment, command: string): Record<string, unknown> | undefined;
 export declare function parseTelegramButtonPayloadRows(source: string): Record<string, unknown>[][] | undefined;
 export declare function parseTelegramActionPayloadRows(comment: TelegramTopLevelHtmlComment, command: string): Record<string, unknown>[][] | undefined;
 export declare function normalizeMarkdownAfterVoiceExtraction(markdown: string): string;
@@ -39,4 +33,5 @@ export interface TelegramVoiceReplyPlan {
     lang?: string;
     rate?: string;
 }
+export declare function getTelegramActionString(payload: Record<string, unknown>, key: string): string | undefined;
 export declare function planTelegramVoiceReply(markdown: string): TelegramVoiceReplyPlan;

@@ -82,6 +82,7 @@ export interface TelegramMenuActionRuntimeDeps<TContext, TModel extends MenuMode
     getActiveModel: (ctx: TContext) => TModel | undefined;
     getThinkingLevel: () => ThinkingLevel;
     getQueueItemCount?: () => number;
+    getPendingCancellationCount?: () => number;
     buildStatusHtml: (ctx: TContext) => string;
     storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
     isIdle: (ctx: TContext) => boolean;

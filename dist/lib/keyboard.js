@@ -3,8 +3,8 @@
  * Zones: telegram ui, shared structure
  * Owns the shared Bot API reply-markup shape while feature domains own their button semantics
  */
-export const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
-export function getTelegramCallbackDataByteLength(value) {
+const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
+function getTelegramCallbackDataByteLength(value) {
     return new TextEncoder().encode(value).byteLength;
 }
 export function assertTelegramCallbackData(callbackData, context = "Telegram callback_data") {

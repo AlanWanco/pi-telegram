@@ -94,9 +94,6 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
     workspaceOperationKind?: string;
     getNowMs?: () => number;
 }
-export declare function markTelegramConfigSyncChange<TSyncState extends TelegramSyncState>(state: TSyncState, action: string, options?: {
-    nowMs?: number;
-}): TSyncState;
 export declare function createTelegramPreservedLeaderQuitHandler(deps: {
     instanceId: string;
     topicTargetStore: Pick<TelegramTopicTargetStore, "load" | "list" | "listPendingCleanups" | "detachTargetOwner">;
@@ -109,7 +106,6 @@ export declare function createTelegramPreservedLeaderQuitHandler(deps: {
 export interface TelegramSessionRestartThreadCleanupDeps<TSyncState extends TelegramSyncState> extends Omit<TelegramManualThreadDisconnectDeps<TSyncState>, "stopPolling"> {
     suspendPolling: () => Promise<void>;
 }
-export declare function createTelegramSessionRestartThreadCleanupHandler<TSyncState extends TelegramSyncState>(deps: TelegramSessionRestartThreadCleanupDeps<TSyncState>): () => Promise<string>;
 export interface TelegramThreadDisconnectAssembly {
     disconnect: () => Promise<string>;
     cleanupForSessionRestart: () => Promise<string>;
@@ -141,7 +137,6 @@ export declare function createTelegramStaleTopicApiErrorRecoveryRuntime<TSyncSta
 export declare function settleStaleTelegramTopicExecutionFailure<TSyncState extends TelegramSyncState>(error: unknown, deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState>): Promise<boolean>;
 export declare function recoverStaleTelegramTopicApiError<TSyncState extends TelegramSyncState>(apiBody: unknown, error: unknown, deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState>): Promise<boolean>;
 export declare function ensureTelegramLeaderThreadBinding(deps: TelegramLeaderThreadSyncDeps): Promise<TelegramOwnTopicProvisionResult | undefined>;
-export declare const TELEGRAM_SYNC_SLICE_TARGET_BINDINGS = "target-bindings";
 export declare const TELEGRAM_SYNC_SLICES: readonly ["bot-identity", "bot-capabilities", "pairing", "allowed-user", "topic-capability", "topic-state", "target-bindings", "reservations", "transport-health"];
 export type TelegramSyncSlice = (typeof TELEGRAM_SYNC_SLICES)[number];
 export type TelegramSyncTrigger = "startup" | "reload" | "topic-lifecycle" | "stale-api-error" | "setup-change" | "pairing-change" | "follower-register" | "follower-prune" | "status-request" | "leader-health-tick" | "ordinary-message" | "ordinary-send";

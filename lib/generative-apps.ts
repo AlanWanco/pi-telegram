@@ -44,28 +44,6 @@ export type GenerativeAppJsonValue =
   | GenerativeAppJsonValue[]
   | { [key: string]: GenerativeAppJsonValue };
 
-export interface GenerativeAppProcessInput {
-  command: string;
-  args?: string[];
-  cwd: string;
-  timeoutMs?: number;
-}
-
-export interface GenerativeAppProcessResult {
-  code: number;
-  killed: boolean;
-  stderr: string;
-  stdout: string;
-}
-
-export interface GenerativeAppMethodContext {
-  argument?: GenerativeAppJsonValue;
-  revision: number;
-  run: (input: GenerativeAppProcessInput) => Promise<GenerativeAppProcessResult>;
-  signal: AbortSignal;
-  state?: GenerativeAppJsonValue;
-}
-
 export interface GenerativeAppMethodResult {
   output: string;
   refreshAfterMs?: number;

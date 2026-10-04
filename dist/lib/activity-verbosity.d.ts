@@ -5,13 +5,9 @@
  */
 import type { TelegramActivityEvent, TelegramActivityPublicationRuntime } from "./activity.ts";
 import type { TelegramEditMessageTextBody, TelegramInputRichMessage, TelegramSendMessageBody, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
-import type { TelegramTarget } from "./target.ts";
-export declare const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1200;
-export declare const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3900;
+import { type TelegramTarget } from "./target.ts";
 export declare const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
-export declare const TELEGRAM_REASONING_MESSAGE_MAX_FRAMES = 24;
 export declare const TELEGRAM_REASONING_BUFFER_MAX_CHARS = 1200;
-export declare const TELEGRAM_REASONING_MIN_INTERVAL_MS = 2000;
 export declare const TELEGRAM_TOOL_UPDATE_MAX_ENTRIES = 4;
 interface ToolActivity {
     id: string;

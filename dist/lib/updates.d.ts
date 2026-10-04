@@ -6,7 +6,7 @@
 import { type TelegramTarget } from "./target.ts";
 import type { TelegramBusEnvelope, TelegramBusFollowerView, TelegramBusForwardOwnership, TelegramBusForeignUpdateSettlement, TelegramProcessLiveness } from "./bus.ts";
 import type { TelegramMessageOwnershipStore } from "./ownership.ts";
-import { TELEGRAM_UPDATE_JOURNAL_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, type TelegramInputJournalReceipt, type TelegramInputJournalSourceReference, type TelegramInputJournalStore, type TelegramJournaledUpdate, type TelegramUpdateJournalDeadQueueOwnerRecoveryResult, type TelegramUpdateJournalAppendResult, type TelegramUpdateJournalInputClaim, type TelegramUpdateJournalOperatorDispositionInput, type TelegramUpdateJournalOperatorDispositionResult, type TelegramUpdateJournalQueueDiscardResult, type TelegramUpdateJournalQueueHandoffAcceptResult, type TelegramUpdateJournalQueueHandoffCancelResult, type TelegramUpdateJournalQueueHandoffInput, type TelegramUpdateJournalQueueHandoffOfferResult, type TelegramUpdateJournalQueueOwner, type TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
+import { TELEGRAM_UPDATE_JOURNAL_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, type TelegramUpdateJournalEntryDigest, type TelegramUpdateJournalSourceCompletion, type TelegramUpdateJournalQueuedCompletion, type TelegramUpdateJournalQueuedReceiptEvidence, type TelegramInputJournalReceipt, type TelegramInputJournalSourceReference, type TelegramInputJournalStore, type TelegramJournaledUpdate, type TelegramUpdateJournalDeadQueueOwnerRecoveryResult, type TelegramUpdateJournalAppendResult, type TelegramUpdateJournalInputClaim, type TelegramUpdateJournalOperatorDispositionInput, type TelegramUpdateJournalOperatorDispositionResult, type TelegramUpdateJournalPendingAbandonmentInput, type TelegramUpdateJournalPendingAbandonmentResult, type TelegramUpdateJournalPendingRetentionEvidence, type TelegramUpdateJournalEntry, type TelegramUpdateJournalRoutingInput, type TelegramRoutingInputJournal, type TelegramRoutingInputExpiryResult, type TelegramUpdateJournalQueueDiscardResult, type TelegramUpdateJournalQueueHandoffAcceptResult, type TelegramUpdateJournalQueueHandoffCancelResult, type TelegramUpdateJournalQueueHandoffInput, type TelegramUpdateJournalQueueHandoffOfferResult, type TelegramUpdateJournalQueueOwner, type TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
 import { type PendingTelegramControlItem, type TelegramControlQueueHandoffPayload, type TelegramQueueAdmissionReceipt, type TelegramQueueHandoffPayload, type TelegramQueueHandoffStageResult, type TelegramQueueReactionDisposition, type TelegramQueueHandoffStagingRuntime, type TelegramQueueItem } from "./queue.ts";
 import { type TelegramAuthorizationState, type TelegramUserPairingRuntimeDeps } from "./config.ts";
 export interface TelegramReactionTypeEmoji {
@@ -68,7 +68,6 @@ export interface TelegramUpdateDeletion {
 }
 export declare function normalizeTelegramReactionEmoji(emoji: string): string;
 export declare function collectTelegramReactionEmojis(reactions: TelegramReactionType[]): Set<string>;
-export declare function getTelegramQueueReactionDisposition(reactions: TelegramReactionType[]): TelegramQueueReactionDisposition;
 export declare function extractDeletedTelegramMessageIds(update: TelegramUpdateDeletion): number[];
 export interface TelegramUser {
     id: number;
@@ -108,6 +107,8 @@ export interface TelegramGuestMessage {
     from?: TelegramUser;
     message_id?: number;
     text?: string;
+    /** Text sent together with a photo, document or other media. */
+    caption?: string;
     reply_to_message?: TelegramUpdateMessage;
 }
 export declare function getTelegramMessageTarget(message: TelegramUpdateMessage): TelegramTarget | undefined;
@@ -147,18 +148,6 @@ export interface TelegramForeignOwnedUpdateForwarder<TContext, TReactionUpdate e
         ctx: TContext;
     }) => Promise<TelegramBusForeignUpdateSettlement> | TelegramBusForeignUpdateSettlement;
 }
-type TelegramForeignUpdateSettlementFailure = Exclude<TelegramBusForeignUpdateSettlement, {
-    status: "accepted";
-}> | {
-    status: "terminal-rejected";
-    failureClass: "forwarder-unavailable";
-    message: string;
-    sourceUpdateId?: number;
-};
-export declare class TelegramForeignUpdateSettlementError extends Error {
-    readonly settlement: TelegramForeignUpdateSettlementFailure;
-    constructor(operation: string, settlement: TelegramForeignUpdateSettlementFailure);
-}
 export interface TelegramMessageReactionUpdated {
     chat: {
         id?: number;
@@ -177,26 +166,98 @@ export interface TelegramUpdateFlow extends TelegramUpdateRouting, TelegramUpdat
 }
 export type TelegramUpdateAdmissionOutcome = {
     kind: "complete";
+    expectedSource?: TelegramDeferredSourceEvidence;
 } | {
     kind: "deferred";
+    routingReview?: true;
 } | {
     kind: "queued";
     queueKind: "prompt" | "control";
     receiptId: string;
     sourceUpdateIds: readonly number[];
 };
+export type TelegramDeferredUpdateAbandonmentAuthority = Pick<TelegramUpdateJournalPendingAbandonmentInput, "operatorAuthorityId" | "isCurrent">;
+export interface TelegramDeferredAbandonmentRecoveryRequest {
+    journalBindingKey: string;
+    afterUpdateId?: number;
+    isCurrent: () => boolean;
+}
+/** A generation-owned post-drain hint for the new-world restart; never execution, completion or deletion authority by itself. */
+export interface TelegramHeldSourcePreparation<TContext> {
+    ctx: TContext;
+    journalBindingKey: string;
+    /** Exact prepared worker owner, context, key and authority; the consumer adds its own domain fences. */
+    isCurrent: () => boolean;
+    signal: AbortSignal;
+    /** Chooser-clock sources that must survive cold spending until their fixed expiry. */
+    routingSourceIds?: readonly number[];
+}
+export interface TelegramDeferredAbandonmentRecoveryPage {
+    sources: {
+        /** Detached original evidence, not proof of current eligibility or archive integrity. */
+        original: TelegramUpdateJournalEntry;
+        retry: (authority: TelegramDeferredUpdateAbandonmentAuthority) => TelegramUpdateJournalPendingAbandonmentResult | undefined;
+    }[];
+    nextAfterUpdateId?: number;
+}
+type TelegramHistoricalInputPredicate = (original: TelegramUpdateJournalEntry) => boolean;
+/** Read-only exact-source observation by its live worker; not an acceptance or removal grant. */
+export interface TelegramDeferredSourceEvidence extends TelegramUpdateJournalEntryDigest {
+    journalBindingKey: string;
+    /** Supplied only after caller-owned acceptance publication; requires a durable removal ACK. */
+    completionSha256?: string;
+}
 interface TelegramUpdateAdmissionBinding {
     sourceUpdateId: number;
     report: (outcome: TelegramUpdateAdmissionOutcome) => void;
+    abandon?: (authority: TelegramDeferredUpdateAbandonmentAuthority) => TelegramUpdateJournalPendingAbandonmentResult | undefined;
+    armRoutingInput?: (operatorUserId: number, sourceUpdateIds: readonly number[]) => TelegramUpdateJournalRoutingInput | undefined;
+    acquireRouting?: (select?: boolean, sourceUpdateIds?: readonly number[]) => () => void;
+    inspectSource?: () => TelegramDeferredSourceEvidence | undefined;
+    supportsAbandonment?: (journalBindingKey: string) => boolean;
+    inspectAbandoning?: (request: TelegramDeferredAbandonmentRecoveryRequest) => TelegramDeferredAbandonmentRecoveryPage | undefined;
+    inspectHistorical?: (request: TelegramDeferredAbandonmentRecoveryRequest) => TelegramDeferredAbandonmentRecoveryPage | undefined;
+    isHistorical?: (matchesOriginal?: TelegramHistoricalInputPredicate) => boolean;
+    isHistoricalReviewHeld?: () => boolean;
 }
 export type TelegramQueueAdmissionReceiptLike = TelegramQueueAdmissionReceipt;
 export declare function bindTelegramUpdateAdmissionSource<TUpdate extends TelegramUpdateFlow & {
     update_id: number;
-}>(update: TUpdate, report: TelegramUpdateAdmissionBinding["report"]): TUpdate;
+}>(update: TUpdate, report: TelegramUpdateAdmissionBinding["report"], controls?: Pick<TelegramUpdateAdmissionBinding, "abandon" | "armRoutingInput" | "acquireRouting" | "inspectSource" | "supportsAbandonment" | "inspectAbandoning" | "inspectHistorical" | "isHistorical" | "isHistoricalReviewHeld">): TUpdate;
+/**
+ * Conservative read-only census: any retained entry naming this Thread, in any nested Telegram object or state,
+ * is unresolved custody. It cannot see updates still in transit before journal append.
+ */
+export declare function collectTelegramJournalThreadUpdateIds(entries: readonly {
+    updateId: number;
+    update: unknown;
+}[], target: {
+    chatId: number;
+    threadId: number;
+}): number[];
 export declare function collectTelegramAdmissionSourceUpdateIds(values: readonly unknown[]): number[];
+/** Observe the original journal entry, never the mutable routed carrier, through current worker authority. */
+export declare function inspectTelegramDeferredSource(value: unknown): TelegramDeferredSourceEvidence | undefined;
+/** A route-owned pre-disposition acceptance publisher; wraps only this carrier, never the shared worker binding. */
+export declare function bindTelegramUpdateCompletionAcceptance<TValue>(value: TValue, publish: () => TelegramDeferredSourceEvidence): TValue;
 /** Report source completion; true means reported, not a durable settlement acknowledgement. */
-export declare function reportTelegramUpdateCompleted(value: unknown): boolean;
+export declare function reportTelegramUpdateCompleted(value: unknown, expectedSource?: TelegramDeferredSourceEvidence): boolean;
 export declare function reportTelegramUpdateDeferred(value: unknown): boolean;
+/** Exact source-bound cancellation; undefined means no eligible attempt was made. */
+export declare function abandonTelegramDeferredUpdate(value: unknown, authority: TelegramDeferredUpdateAbandonmentAuthority): TelegramUpdateJournalPendingAbandonmentResult | undefined;
+/** Capability for chooser publication; the eventual action still requires exact deferred authority. */
+export declare function supportsTelegramDeferredAbandonment(value: unknown, journalBindingKey: string): boolean;
+/** Observe protected attempts through a current carrier; the UI still owns human authorization. */
+export declare function inspectTelegramAbandoningUpdates(value: unknown, request: TelegramDeferredAbandonmentRecoveryRequest): TelegramDeferredAbandonmentRecoveryPage | undefined;
+/** Historical inspection is not human confirmation or permission to stop delivery. */
+export declare function inspectTelegramHistoricalInputs(value: unknown, request: TelegramDeferredAbandonmentRecoveryRequest): TelegramDeferredAbandonmentRecoveryPage | undefined;
+export declare function isTelegramHistoricalInput(value: unknown, matchesOriginal?: TelegramHistoricalInputPredicate): boolean;
+/** Routing's last-boundary hold when ownership changed after early classification. */
+export declare function reportTelegramHistoricalRoutingReview(value: unknown): boolean;
+/** Arm only a positively published chooser; the journal owns the immutable hour deadline. */
+export declare function armTelegramRoutingInputs(values: readonly unknown[], operatorUserId: number): TelegramUpdateJournalRoutingInput | undefined;
+/** Reserve source execution; an actual choice must also freeze its durable TTL before any effect. */
+export declare function acquireTelegramUpdateRouting(value: unknown, select?: boolean, sourceUpdateIds?: readonly number[]): () => void;
 export declare function reportTelegramQueueAdmission(values: readonly unknown[], receipts: readonly TelegramQueueAdmissionReceiptLike[]): boolean;
 export type TelegramUpdateFlowAction<TReactionUpdate extends TelegramMessageReactionUpdated = TelegramMessageReactionUpdated, TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery, TMessage extends TelegramUpdateMessage = TelegramUpdateMessage, TGuestMessage extends TelegramGuestMessage = TelegramGuestMessage> = {
     kind: "ignore";
@@ -367,9 +428,6 @@ export interface AuthorizedTelegramReactionUpdateDeps<TContext> {
 }
 export declare function handleAuthorizedTelegramReactionUpdate<TContext>(reactionUpdate: TelegramMessageReactionUpdated, deps: AuthorizedTelegramReactionUpdateDeps<TContext>): Promise<void>;
 export declare function executeTelegramUpdatePlan<TContext = unknown, TReactionUpdate extends TelegramMessageReactionUpdated = TelegramMessageReactionUpdated, TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery, TMessage extends TelegramUpdateMessage = TelegramUpdateMessage>(plan: TelegramUpdateExecutionPlan<TReactionUpdate, TCallbackQuery, TMessage>, deps: TelegramUpdateRuntimeDeps<TContext, TReactionUpdate, TCallbackQuery, TMessage>): Promise<void>;
-export declare const TELEGRAM_UPDATE_RETRY_BASE_DELAY_MS = 1000;
-export declare const TELEGRAM_UPDATE_RETRY_MAX_DELAY_MS = 60000;
-export declare const TELEGRAM_UPDATE_WORKER_BATCH_SIZE = 64;
 export type TelegramUpdateWorkerPhase = "stopped" | "idle" | "executing" | "retry-wait" | "failed" | "deferred" | "queued" | "blocked";
 export type TelegramUpdateWorkerBlockedReason = "authority-lost" | "authority-check" | "journal-read" | "journal-write" | "execution" | "input-custody" | "prior-generation-executing" | "invalid-outcome";
 export interface TelegramUpdateWorkerStateSnapshot {
@@ -386,6 +444,10 @@ export interface TelegramUpdateWorkerStateSnapshot {
     journalSerializedBytes: number;
     oldestAdmittedAtMs?: number;
     deferredClaimCount: number;
+    /** Protected cancellation attempts, not proof of a committed discard. */
+    abandoningClaimCount?: number;
+    /** Historical sources held before routing, not evidence of prior non-delivery. */
+    historicalClaimCount?: number;
     queuedClaimCount: number;
     foreignQueuedCount: number;
     foreignQueuedOwner?: TelegramUpdateJournalQueueOwner;
@@ -416,6 +478,7 @@ export interface TelegramUpdateWorkerJournalSnapshot {
         update: TelegramJournaledUpdate;
         readonly preApprovalExcluded?: boolean;
         admittedAtMs: number;
+        routingInput?: TelegramUpdateJournalRoutingInput;
         state: "pending" | "retry-wait" | "queued" | "failed";
         inputClaim?: TelegramUpdateJournalInputClaim;
         queueKind?: "prompt" | "control";
@@ -439,10 +502,21 @@ export interface TelegramUpdateWorkerJournalSnapshot {
     }[];
     serializedBytes: number;
 }
+export interface TelegramRoutingInputExpirySource {
+    original: TelegramUpdateJournalEntry;
+    journalBindingKey: string;
+    isCurrent(): boolean;
+    expire(): TelegramRoutingInputExpiryResult | undefined;
+}
 export interface TelegramUpdateWorkerJournalPort {
+    routingInputs?: TelegramRoutingInputJournal;
     read: () => TelegramUpdateWorkerJournalSnapshot;
+    inspectPendingRetention?: (entry: TelegramUpdateJournalEntry) => TelegramUpdateJournalPendingRetentionEvidence | undefined;
+    abandonPending?: (input: TelegramUpdateJournalPendingAbandonmentInput) => TelegramUpdateJournalPendingAbandonmentResult;
     /** Optional strict observation; it must not recover, repair or grant new receipt authority. */
     isQueueReceiptCurrent?: (receipt: TelegramQueueAdmissionReceiptLike, owner: TelegramUpdateJournalQueueOwner) => boolean;
+    /** Strict full-group origin observation for prepared partial scopes; no writer or readiness acquisition. */
+    inspectQueuedReceipt?: (expected: TelegramUpdateJournalQueuedCompletion) => TelegramUpdateJournalQueuedReceiptEvidence | undefined;
     markQueued: (receipt: {
         queueKind: "prompt" | "control";
         receiptId: string;
@@ -461,6 +535,15 @@ export interface TelegramUpdateWorkerJournalPort {
     }[]) => {
         removedUpdateIds: readonly number[];
     };
+    completeQueuedExact?: (receipts: readonly {
+        queueKind: "prompt" | "control";
+        receiptId: string;
+        sourceUpdateIds: readonly number[];
+        queueOwner: TelegramUpdateJournalQueueOwner;
+    }[], completions: readonly TelegramUpdateJournalSourceCompletion[]) => {
+        removedUpdateIds: readonly number[];
+        sourceCompletions?: readonly TelegramUpdateJournalSourceCompletion[];
+    };
     markExecutionFailure: (input: {
         updateId: number;
         expectedAttemptCount: number;
@@ -476,7 +559,16 @@ export interface TelegramUpdateWorkerJournalPort {
     removeCompleted: (updateIds: readonly number[]) => {
         removedUpdateIds: readonly number[];
     };
+    /** No ID-only fallback is allowed for a guarded completion report. */
+    removeCompletedExact?: (updateIds: readonly number[], expectedSources: readonly TelegramUpdateJournalEntryDigest[], completions?: readonly TelegramUpdateJournalSourceCompletion[]) => {
+        removedUpdateIds: readonly number[];
+        sourceCompletions?: readonly TelegramUpdateJournalSourceCompletion[];
+    };
+    inspectSourceCompletion?: (expected: TelegramUpdateJournalSourceCompletion) => TelegramUpdateJournalSourceCompletion | undefined;
 }
+export type TelegramQueueSourceCompletion = TelegramDeferredSourceEvidence & {
+    completionSha256: string;
+};
 export interface TelegramUpdateRetryPolicy {
     baseDelayMs: number;
     maxDelayMs: number;
@@ -493,10 +585,17 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     hasAuthority: (ctx: TContext) => boolean;
     getJournalBindingKey?: () => string | undefined;
     getRecipientBindingKey?: () => string | undefined;
+    /** True selects legacy historical review/spending; retain protects unsupported originals without disposition authority. */
+    shouldReviewHistoricalInput?: (entry: TelegramUpdateJournalEntry, ctx: TContext, signal: AbortSignal) => boolean | "retain" | Promise<boolean | "retain">;
+    /** New-world restart: spend unclocked classified routing input without delivery, copy or completion. Chooser clocks wait for expiry; interrupted private abandonment keeps exact recovery. */
+    spendHistoricalInput?: boolean;
+    /** Holds protected live or retry sources before execution; never cancels or disposes them. */
+    shouldHoldPendingInput?: (entry: TelegramUpdateJournalEntry, ctx: TContext, signal: AbortSignal) => boolean | Promise<boolean>;
     getQueueOwnerIdentity?: (ctx: TContext) => TelegramUpdateJournalQueueOwnerIdentity;
     isContextCurrent?: (ctx: TContext) => boolean;
     createAbortController?: () => AbortController;
     getNowMs?: () => number;
+    expireRoutingInput?: (source: TelegramRoutingInputExpirySource, ctx: TContext, signal: AbortSignal) => Promise<void> | void;
     retryPolicy?: Partial<TelegramUpdateRetryPolicy>;
     classifyExecutionFailure?: (error: unknown) => TelegramUpdateExecutionFailureClassification;
     settleTerminalExecutionFailure?: (error: unknown) => Promise<boolean>;
@@ -505,8 +604,14 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     batchSize?: number;
     yieldToEventLoop?: () => Promise<void>;
     onStateChange?: (state: TelegramUpdateWorkerStateSnapshot) => void;
+    /** One nonblocking hint after a quiescent validated startup projection, never execution or deletion authority. */
+    onHeldSourcesPrepared?: (input: TelegramHeldSourcePreparation<TContext>) => Promise<void> | void;
+    /** Prepared readiness barrier after durable queue admission; never authorizes replay or source removal. */
+    beforeQueueReceiptPublished?: (receipt: TelegramQueueAdmissionReceiptLike, queueOwner: TelegramUpdateJournalQueueOwner, ctx: TContext, isCurrent: () => boolean) => Promise<void | readonly TelegramQueueSourceCompletion[]> | void | readonly TelegramQueueSourceCompletion[];
+    /** Post-ACK hint only; it must not request Pi dispatch or inherit a Workspace admission lease. */
+    onQueueReceiptCompleted?: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext) => void;
     onQueueReceiptCommitted?: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext) => void;
-    onUpdateCompleted?: (updateId: number, ctx: TContext) => void;
+    onUpdateCompleted?: (updateId: number, ctx: TContext, journalBindingKey?: string) => void;
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
 export type TelegramQueueReceiptCompletionReason = "prompt-handoff" | "control-settlement" | "discard";
@@ -518,6 +623,46 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
         outcome: TelegramUpdateAdmissionOutcome;
         signal: AbortSignal;
     }) => void;
+    armRoutingInput?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+        operatorUserId: number;
+        sourceUpdateIds: readonly number[];
+    }) => TelegramUpdateJournalRoutingInput | undefined;
+    selectRoutingInput?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+        operatorUserId: number;
+        sourceUpdateIds: readonly number[];
+    }) => boolean;
+    isRoutingInputCurrent?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+    }) => boolean;
+    supportsDeferredAbandonment?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+        journalBindingKey: string;
+    }) => boolean;
+    inspectAbandoning?: (input: TelegramDeferredAbandonmentRecoveryRequest & {
+        signal: AbortSignal;
+    }) => TelegramDeferredAbandonmentRecoveryPage | undefined;
+    inspectHistorical?: (input: TelegramDeferredAbandonmentRecoveryRequest & {
+        signal: AbortSignal;
+    }) => TelegramDeferredAbandonmentRecoveryPage | undefined;
+    inspectDeferredSource?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+    }) => TelegramDeferredSourceEvidence | undefined;
+    isHistoricalSource?: (input: {
+        updateId: number;
+        signal: AbortSignal;
+        matchesOriginal?: TelegramHistoricalInputPredicate;
+    }) => boolean;
+    abandonDeferred?: (input: TelegramDeferredUpdateAbandonmentAuthority & {
+        updateId: number;
+        signal: AbortSignal;
+    }) => TelegramUpdateJournalPendingAbandonmentResult | undefined;
     settleCustodied: (input: {
         updateId: number;
         result: TelegramCustodiedExecutionResult;
@@ -525,17 +670,18 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
     }) => void;
     isQueueReceiptCommitted: (receipt: TelegramQueueAdmissionReceiptLike) => boolean;
     getQueueReceiptOwner: (receipt: TelegramQueueAdmissionReceiptLike) => TelegramUpdateJournalQueueOwner | undefined;
+    /** Completion-only owner observation; issued attempts are never dispatch readiness. */
+    getQueueReceiptSettlementOwner?: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext, reason: TelegramQueueReceiptCompletionReason) => TelegramUpdateJournalQueueOwner | undefined;
     completeQueueReceipts: (input: {
         receipts: readonly TelegramQueueAdmissionReceiptLike[];
         ctx: TContext;
         reason: TelegramQueueReceiptCompletionReason;
+        /** Prepared immutable scopes for every source; the exact receipt owner still authorizes disposal. */
+        sourceCompletions?: readonly TelegramQueueSourceCompletion[];
     }) => boolean;
     stop: () => Promise<void>;
     waitForDrain: () => Promise<void>;
     getState: () => TelegramUpdateWorkerStateSnapshot;
-}
-export declare class TelegramUpdateAdmissionOutcomeError extends Error {
-    constructor(message: string);
 }
 export declare function createTelegramUpdateWorkerRuntime<TContext>(deps: TelegramUpdateWorkerRuntimeDeps<TContext>): TelegramUpdateWorkerRuntime<TContext>;
 /**
@@ -601,6 +747,15 @@ export interface TelegramUpdateAdmissionHandleDeps<TUpdate extends TelegramUpdat
         signal: AbortSignal;
     }) => void | Promise<void>;
     onLateOutcomeError?: (error: unknown, updateId: number) => void;
+    abandonDeferred?: TelegramUpdateWorkerRuntime<TContext>["abandonDeferred"];
+    armRoutingInput?: TelegramUpdateWorkerRuntime<TContext>["armRoutingInput"];
+    selectRoutingInput?: TelegramUpdateWorkerRuntime<TContext>["selectRoutingInput"];
+    isRoutingInputCurrent?: TelegramUpdateWorkerRuntime<TContext>["isRoutingInputCurrent"];
+    supportsDeferredAbandonment?: TelegramUpdateWorkerRuntime<TContext>["supportsDeferredAbandonment"];
+    inspectAbandoning?: TelegramUpdateWorkerRuntime<TContext>["inspectAbandoning"];
+    inspectHistorical?: TelegramUpdateWorkerRuntime<TContext>["inspectHistorical"];
+    inspectDeferredSource?: TelegramUpdateWorkerRuntime<TContext>["inspectDeferredSource"];
+    isHistoricalSource?: TelegramUpdateWorkerRuntime<TContext>["isHistoricalSource"];
 }
 export type TelegramCustodiedExecutionResult = {
     status: "completed";
@@ -987,7 +1142,7 @@ export declare function executeTelegramCustodiedInput(input: {
 export declare function createTelegramUpdateAdmissionHandle<TUpdate extends TelegramUpdateFlow & {
     update_id: number;
 }, TContext>(deps: TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>): (update: TUpdate, ctx: TContext, signal: AbortSignal) => Promise<TelegramUpdateAdmissionOutcome>;
-export declare function createTelegramCustodiedUpdateAdmissionHandle<TUpdate extends TelegramJournaledUpdate & TelegramUpdateFlow, TContext>(deps: Omit<TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>, "onLateOutcome" | "onLateOutcomeError"> & {
+export declare function createTelegramCustodiedUpdateAdmissionHandle<TUpdate extends TelegramJournaledUpdate & TelegramUpdateFlow, TContext>(deps: Omit<TelegramUpdateAdmissionHandleDeps<TUpdate, TContext>, "onLateOutcome" | "onLateOutcomeError" | "abandonDeferred" | "armRoutingInput" | "selectRoutingInput" | "isRoutingInputCurrent" | "supportsDeferredAbandonment" | "inspectAbandoning" | "inspectHistorical" | "inspectDeferredSource" | "isHistoricalSource"> & {
     journal: TelegramCustodyExecutionJournal;
     recipientBindingKey: string;
     onLateOutcomeError(error: unknown, updateId: number): void;
@@ -1001,6 +1156,7 @@ export interface TelegramQueueAdmissionItemLike {
 }
 export interface TelegramQueueAdmissionSettlementRuntime<TContext> {
     isItemReady: (item: TelegramQueueAdmissionItemLike) => boolean;
+    getQueueReceiptSettlementOwner?: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext, reason: TelegramQueueReceiptCompletionReason) => TelegramUpdateJournalQueueOwner | undefined;
     getQueueReceiptOwner: (receipt: TelegramQueueAdmissionReceiptLike) => TelegramUpdateJournalQueueOwner | undefined;
     onPromptHandedOff: (item: TelegramQueueAdmissionItemLike, ctx: TContext) => boolean;
     onControlSettled: (item: TelegramQueueAdmissionItemLike, ctx: TContext) => boolean;
@@ -1125,7 +1281,7 @@ export interface TelegramQueueHandoffReconciliationRuntimeAssemblyDeps<TContext>
     isBusEnabled: () => boolean;
     canHandoffWithLeader?: () => boolean;
     listFollowers: () => readonly TelegramBusFollowerView[];
-    createRecipientJournalResolver: (profileKey: string) => (() => {
+    createRecipientJournalResolver: (profileKey: string, sessionId: string) => (() => {
         recoveryKey: string;
     } | undefined);
     queueStore: {
@@ -1167,6 +1323,8 @@ export interface TelegramUpdateAdmissionLifecycleRuntimeDeps<TContext> {
     getQueueOwnerIdentity?: (ctx: TContext) => TelegramUpdateJournalQueueOwnerIdentity;
     createWorker: (journal: TelegramUpdateWorkerJournalPort, binding: TelegramUpdateAdmissionLifecycleJournalBinding) => TelegramUpdateWorkerRuntime<TContext>;
     acquireSourceReference?: (binding: TelegramUpdateAdmissionLifecycleJournalBinding) => () => void;
+    /** Runs after the previous worker stopped and before the replacement worker exists; throwing refuses binding. */
+    prepareBinding?: (binding: TelegramUpdateAdmissionLifecycleJournalBinding) => void;
     recordRuntimeEvent?: TelegramUpdateWorkerRuntimeDeps<TContext>["recordRuntimeEvent"];
 }
 export interface TelegramUpdateAdmissionLifecycleRuntime<TContext> extends TelegramQueueAdmissionSettlementRuntime<TContext> {
@@ -1207,8 +1365,8 @@ export interface TelegramUpdateAdmissionLifecycleRuntime<TContext> extends Teleg
 }
 export interface TelegramUpdateWorkerOwnerRuntime<TContext> {
     getQueueOwnerIdentity: () => TelegramUpdateJournalQueueOwnerIdentity;
-    onQueueReceiptCommitted: (receipt: unknown, ctx: TContext) => void;
-    onUpdateCompleted: (updateId: number, ctx: TContext) => void;
+    onQueueReceiptCommitted: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext) => void;
+    onUpdateCompleted: (updateId: number, ctx: TContext, journalBindingKey?: string) => void;
 }
 export interface TelegramUpdateWorkerOwnerRuntimeDeps<TContext> {
     instanceId: string;
@@ -1218,7 +1376,8 @@ export interface TelegramUpdateWorkerOwnerRuntimeDeps<TContext> {
     isContextCurrent: (ctx: TContext) => boolean;
     dispatchNext: (ctx: TContext) => void;
     requestQueueHandoffReconciliation: (ctx: TContext) => void;
-    afterUpdateCompleted?: (updateId: number) => void;
+    afterQueueReceiptCommitted?: (receipt: TelegramQueueAdmissionReceiptLike, ctx: TContext) => void;
+    afterUpdateCompleted?: (updateId: number, ctx: TContext, journalBindingKey?: string) => void;
 }
 export declare function createTelegramUpdateWorkerOwnerRuntime<TContext>(deps: TelegramUpdateWorkerOwnerRuntimeDeps<TContext>): TelegramUpdateWorkerOwnerRuntime<TContext>;
 export interface TelegramUpdateAdmissionRuntimeBinding<TContext> {
@@ -1259,6 +1418,10 @@ export interface TelegramUpdateAdmissionLifecycleAssemblyDeps<TUpdate extends Te
         isRegistered: () => boolean;
         getGeneration: () => string | undefined;
         prepareUpdateForExecution: (update: TUpdate) => TUpdate;
+        /** Session succession before worker creation, under the exact generation-fenced binding. */
+        prepareBinding?: (binding: TelegramUpdateAdmissionLifecycleJournalBinding & {
+            hasAuthority?: () => boolean;
+        }) => void;
     };
     recordRuntimeEvent?: TelegramUpdateWorkerRuntimeDeps<TContext>["recordRuntimeEvent"];
 }

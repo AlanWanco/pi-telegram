@@ -43,7 +43,7 @@ function normalizeCommandTemplateDefaults(defaults) {
     }
     return normalized;
 }
-export function resolveInheritedDefaultReferences(ownDefaults, inheritedDefaults, runtimeValues = {}) {
+function resolveInheritedDefaultReferences(ownDefaults, inheritedDefaults, runtimeValues = {}) {
     if (!ownDefaults || !inheritedDefaults)
         return ownDefaults;
     const resolved = { ...ownDefaults };
@@ -59,7 +59,7 @@ export function resolveInheritedDefaultReferences(ownDefaults, inheritedDefaults
     }
     return resolved;
 }
-export function resolveCommandTemplateRepeat(value, values = {}) {
+function resolveCommandTemplateRepeat(value, values = {}) {
     if (value === undefined)
         return undefined;
     if (typeof value === "number") {
@@ -228,7 +228,7 @@ function getLeafCommandTemplateWarnings(config) {
 function pad(value, width) {
     return String(value).padStart(width, "0");
 }
-export function getCommandTemplateRepeatDefaults(index, repeat) {
+function getCommandTemplateRepeatDefaults(index, repeat) {
     const prev = (index - 1 + repeat) % repeat;
     const next = (index + 1) % repeat;
     const values = {
@@ -329,7 +329,7 @@ function parseCommandTemplatePlaceholderContent(content) {
         ...(match[2] !== undefined ? { inlineDefault: match[2] } : {}),
     };
 }
-export function getCommandTemplateDefaults(config) {
+function getCommandTemplateDefaults(config) {
     const normalizedConfig = config
         ? normalizeCommandTemplateConfig(config)
         : undefined;
@@ -406,7 +406,7 @@ export function splitCommandTemplate(input) {
         words.push(current);
     return words;
 }
-export function expandCommandTemplateExecutable(command, cwd) {
+function expandCommandTemplateExecutable(command, cwd) {
     if (command === "~")
         return homedir();
     if (command.startsWith("~/"))

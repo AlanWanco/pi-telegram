@@ -136,9 +136,9 @@ async function createPiPrintFixtureExtension(tempDir: string): Promise<string> {
       `export default function (pi) {\n` +
       `  const agentDir = process.env.PI_CODING_AGENT_DIR;\n` +
       `  if (process.env.PI_TELEGRAM_TEST_LOCK_MODE === "owner" && agentDir) {\n` +
-      `    const ownersDir = join(agentDir, "tmp", "telegram");\n` +
+      `    const ownersDir = join(agentDir, "tmp", "pi-telegram");\n` +
       `    mkdirSync(ownersDir, { recursive: true });\n` +
-      `    writeFileSync(join(ownersDir, "owners.json"), JSON.stringify({ default: { pid: process.pid } }) + "\\n");\n` +
+      `    writeFileSync(join(ownersDir, "state.json"), JSON.stringify({ version: 2, profiles: { default: { transport: { pid: process.pid } } } }) + "\\n", { mode: 0o600 });\n` +
       `  }\n` +
       `  pi.on("session_start", (_event, ctx) => {\n` +
       `    const forcedMode = process.env.PI_TELEGRAM_TEST_CTX_MODE;\n` +
@@ -203,12 +203,12 @@ async function createPiPrintAgentDir(
     JSON.stringify(config, null, "\t") + "\n",
     "utf8",
   );
-  const ownersDir = join(agentDir, "tmp", "telegram");
+  const ownersDir = join(agentDir, "tmp", "pi-telegram");
   await mkdir(ownersDir, { recursive: true });
   await writeFile(
-    join(ownersDir, "owners.json"),
-    JSON.stringify(locks, null, "\t") + "\n",
-    "utf8",
+    join(ownersDir, "state.json"),
+    JSON.stringify({ version: 2, profiles: Object.fromEntries(Object.entries(locks).map(([profile, transport]) => [profile, { transport }])) }, null, "\t") + "\n",
+    { encoding: "utf8", mode: 0o600 },
   );
   return agentDir;
 }
@@ -260,11 +260,12 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
     const markerPath = process.env.PI_TELEGRAM_TEST_METHOD_MARKER;
     const stopPath = process.env.PI_TELEGRAM_TEST_STOP_PATH;
     const cwd = "/repo/parent-owner";
-    const ownersDir = join(agentDir, "tmp", "telegram");
+    const ownersDir = join(agentDir, "tmp", "pi-telegram");
     mkdirSync(ownersDir, { recursive: true });
     writeFileSync(
-      join(ownersDir, "owners.json"),
-      JSON.stringify({ default: { pid: process.pid, cwd } }) + "\\n",
+      join(ownersDir, "state.json"),
+      JSON.stringify({ version: 2, profiles: { default: { transport: { pid: process.pid, cwd } } } }) + "\\n",
+      { mode: 0o600 },
     );
     globalThis.fetch = async (input, init = {}) => {
       const method = String(input).split("/").at(-1);
@@ -701,12 +702,12 @@ test("Extension session shutdown lets an active polling owner process exit", asy
       JSON.stringify({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 }) + "\\n",
       "utf8",
     );
-    const ownersDir = join(agentDir, "tmp", "telegram");
+    const ownersDir = join(agentDir, "tmp", "pi-telegram");
     await mkdir(ownersDir, { recursive: true });
     await writeFile(
-      join(ownersDir, "owners.json"),
-      JSON.stringify({ default: { pid: process.pid, cwd } }) + "\\n",
-      "utf8",
+      join(ownersDir, "state.json"),
+      JSON.stringify({ version: 2, profiles: { default: { transport: { pid: process.pid, cwd } } } }) + "\\n",
+      { encoding: "utf8", mode: 0o600 },
     );
 
     globalThis.fetch = async (input, init = {}) => {

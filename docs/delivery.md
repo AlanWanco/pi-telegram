@@ -53,7 +53,7 @@ export interface TelegramDeliveryView {
 
 `plain` is the default. Operational activity should prefer `plain` or explicit `html`. `markdown` exists for extension-authored content that naturally owns Markdown; the bridge converts it through the existing UI/compat Markdown-to-HTML renderer rather than entering the native assistant final-reply pipeline.
 
-`replyMarkup` accepts only structural keyboard data. Callback ownership stays with Sections or a registered raw update handler. The documented issue #126 consumer shape uses Sections for interactive Settings toggles and keeps delivered activity rows non-interactive, so a second managed callback registry would duplicate token, answer, edit, navigation, and cleanup ownership without a proven use case. Revisit only when a public-import-only consumer must generate managed callbacks independently of a registered Section context for arbitrary delivered messages.
+`replyMarkup` accepts only structural keyboard data. Callback ownership stays with Sections or a registered raw update handler. The documented external consumer shape uses Sections for interactive Settings toggles and keeps delivered activity rows non-interactive, so a second managed callback registry would duplicate token, answer, edit, navigation, and cleanup ownership without a proven use case. Revisit only when a public-import-only consumer must generate managed callbacks independently of a registered Section context for arbitrary delivered messages.
 
 ### Target scopes
 

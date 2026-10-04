@@ -40,7 +40,7 @@ export async function handleTelegramThinkingMenuCallbackAction(callbackQueryId, 
         return true;
     }
     deps.setThinkingLevel(action.level);
-    await deps.updateStatusMessage();
+    await deps.updateThinkingMenuMessage();
     await deps.answerCallbackQuery(callbackQueryId, `Thinking: ${deps.getCurrentThinkingLevel()}`);
     return true;
 }

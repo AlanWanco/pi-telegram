@@ -121,7 +121,7 @@ function normalizeCommandTemplateDefaults(
   return normalized;
 }
 
-export function resolveInheritedDefaultReferences(
+function resolveInheritedDefaultReferences(
   ownDefaults: Record<string, unknown> | undefined,
   inheritedDefaults: Record<string, unknown> | undefined,
   runtimeValues: Record<string, unknown> = {},
@@ -142,7 +142,7 @@ export function resolveInheritedDefaultReferences(
   return resolved;
 }
 
-export function resolveCommandTemplateRepeat(
+function resolveCommandTemplateRepeat(
   value: number | string | undefined,
   values: Record<string, unknown> = {},
 ): number | undefined {
@@ -367,7 +367,7 @@ function pad(value: number, width: number): string {
   return String(value).padStart(width, "0");
 }
 
-export function getCommandTemplateRepeatDefaults(
+function getCommandTemplateRepeatDefaults(
   index: number,
   repeat: number,
 ): Record<string, string> {
@@ -516,7 +516,7 @@ function parseCommandTemplatePlaceholderContent(
   };
 }
 
-export function getCommandTemplateDefaults(
+function getCommandTemplateDefaults(
   config: CommandTemplateConfig | undefined,
 ): Record<string, string> {
   const normalizedConfig = config
@@ -588,7 +588,7 @@ export function splitCommandTemplate(input: string): string[] {
   return words;
 }
 
-export function expandCommandTemplateExecutable(
+function expandCommandTemplateExecutable(
   command: string,
   cwd: string,
 ): string {

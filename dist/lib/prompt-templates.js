@@ -63,7 +63,7 @@ export function substitutePromptTemplateArgs(content, args) {
     const allArgs = args.join(" ");
     return result.replace(/\$ARGUMENTS/g, allArgs).replace(/\$@/g, allArgs);
 }
-export function isTelegramPromptTemplateCommandName(name) {
+function isTelegramPromptTemplateCommandName(name) {
     return TELEGRAM_BOT_COMMAND_NAME_PATTERN.test(name);
 }
 export function mapPiPromptTemplateNameToTelegramCommandName(name) {

@@ -4,15 +4,15 @@
  * Owns hidden settings-menu rendering, settings callbacks, and persisted toggle wiring
  */
 import { getTelegramExtensionSettingsRows, } from "./sections.js";
-export const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
-export const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE = "<b>🧹 Thread cleanup:</b>";
-export const INACTIVE_THREAD_REVIEW_TITLE = "<b>🔎 Inactive tabs review:</b>";
-export const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
-export const ASSISTANT_RENDERING_SETTINGS_TITLE = "<b>🧾 Assistant rendering:</b>";
-export const ACTIVITY_VERBOSITY_SETTINGS_TITLE = "<b>🔬 Activity:</b>";
-export const TIME_INJECTION_MODE_SETTINGS_TITLE = "<b>🕒 Time injection mode:</b>";
-export const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
-export const THREAD_DISPLAY_SETTINGS_TITLE = "<b>🧵 Thread display:</b>";
+const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
+const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE = "<b>🧹 Thread cleanup:</b>";
+const INACTIVE_THREAD_REVIEW_TITLE = "<b>🔎 Inactive tabs review:</b>";
+const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
+const ASSISTANT_RENDERING_SETTINGS_TITLE = "<b>🧾 Assistant rendering:</b>";
+const ACTIVITY_VERBOSITY_SETTINGS_TITLE = "<b>🔬 Activity:</b>";
+const TIME_INJECTION_MODE_SETTINGS_TITLE = "<b>🕒 Time injection mode:</b>";
+const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
+const THREAD_DISPLAY_SETTINGS_TITLE = "<b>🧵 Thread display:</b>";
 function getVoiceReplyModeLabel(mode) {
     return mode;
 }
@@ -51,7 +51,7 @@ export function buildAutomaticThreadCleanupSettingsText(enabled) {
         "Review inactive tabs checks current owner and work evidence. Review never deletes tabs.",
     ].join("\n");
 }
-export function buildInactiveThreadReviewText(count) {
+function buildInactiveThreadReviewText(count) {
     return [INACTIVE_THREAD_REVIEW_TITLE, "",
         `${count} proven inactive tab${count === 1 ? "" : "s"}.`,
         "No tabs were deleted.",
@@ -185,7 +185,7 @@ export function buildTelegramSettingsMenuReplyMarkup(draftPreviewsEnabled, assis
     rows.push(...settingsButtons.map((button) => [button]));
     return { inline_keyboard: rows };
 }
-export async function openTelegramSettingsMenu(deps, sectionRegistry) {
+async function openTelegramSettingsMenu(deps, sectionRegistry) {
     const state = await deps.getModelMenuState();
     const messageId = await deps.sendSettingsMenu(state, buildTelegramSettingsMenuText(), buildTelegramSettingsMenuReplyMarkup(deps.areDraftPreviewsEnabled(), deps.getAssistantRenderingMode(), deps.getVoiceReplyMode(), deps.getTimeInjectionMode(), sectionRegistry, deps.isVoiceReplyModeConfigured(), deps.isAutomaticThreadCleanupEnabled(), deps.getActivityVerbosity(), deps.getThreadDisplayMode?.(), deps.isThreadDisplayCustom?.() ?? false));
     if (messageId === undefined)
@@ -307,30 +307,30 @@ export function buildVoiceReplyModeSettingsReplyMarkup(mode, configured = true) 
         ],
     };
 }
-export async function updateTelegramSettingsMenuMessage(deps, sectionRegistry) {
+async function updateTelegramSettingsMenuMessage(deps, sectionRegistry) {
     await deps.updateSettingsMessage(buildTelegramSettingsMenuText(), buildTelegramSettingsMenuReplyMarkup(deps.areDraftPreviewsEnabled(), deps.getAssistantRenderingMode(), deps.getVoiceReplyMode(), deps.getTimeInjectionMode(), sectionRegistry, deps.isVoiceReplyModeConfigured(), deps.isAutomaticThreadCleanupEnabled(), deps.getActivityVerbosity(), deps.getThreadDisplayMode?.(), deps.isThreadDisplayCustom?.() ?? false));
 }
-export async function updateAutomaticThreadCleanupSettingsMessage(deps) {
+async function updateAutomaticThreadCleanupSettingsMessage(deps) {
     const enabled = deps.isAutomaticThreadCleanupEnabled();
     await deps.updateSettingsMessage(buildAutomaticThreadCleanupSettingsText(enabled), buildAutomaticThreadCleanupSettingsReplyMarkup(enabled, !!deps.reviewInactiveThreads));
 }
-export async function updateDraftPreviewsSettingsMessage(deps) {
+async function updateDraftPreviewsSettingsMessage(deps) {
     const enabled = deps.areDraftPreviewsEnabled();
     await deps.updateSettingsMessage(buildDraftPreviewsSettingsText(enabled), buildDraftPreviewsSettingsReplyMarkup(enabled));
 }
-export async function updateAssistantRenderingSettingsMessage(deps) {
+async function updateAssistantRenderingSettingsMessage(deps) {
     const mode = deps.getAssistantRenderingMode();
     await deps.updateSettingsMessage(buildAssistantRenderingSettingsText(mode), buildAssistantRenderingSettingsReplyMarkup(mode));
 }
-export async function updateActivityVerbositySettingsMessage(deps) {
+async function updateActivityVerbositySettingsMessage(deps) {
     const verbosity = deps.getActivityVerbosity();
     await deps.updateSettingsMessage(buildActivityVerbositySettingsText(verbosity), buildActivityVerbositySettingsReplyMarkup(verbosity));
 }
-export async function updateTimeInjectionModeSettingsMessage(deps) {
+async function updateTimeInjectionModeSettingsMessage(deps) {
     const mode = deps.getTimeInjectionMode();
     await deps.updateSettingsMessage(buildTimeInjectionModeSettingsText(mode), buildTimeInjectionModeSettingsReplyMarkup(mode));
 }
-export async function updateVoiceReplyModeSettingsMessage(deps) {
+async function updateVoiceReplyModeSettingsMessage(deps) {
     const mode = deps.getVoiceReplyMode();
     const configured = deps.isVoiceReplyModeConfigured();
     await deps.updateSettingsMessage(buildVoiceReplyModeSettingsText(mode, configured), buildVoiceReplyModeSettingsReplyMarkup(mode, configured));

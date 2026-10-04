@@ -24,6 +24,7 @@ import {
   callTelegramMultipart,
   cleanupTelegramTempFiles,
   createDefaultTelegramBridgeApiRuntime,
+  createTelegramAttachmentFileName,
   createTelegramApiClient,
   createTelegramApiTargetActivityRuntime,
   createTelegramApiTargetTrackingClient,
@@ -1085,33 +1086,39 @@ test("Telegram API helper fetches bot identity through IPv4 fallback", async () 
   }
 });
 
-test("Telegram temp cleanup removes only stale UUID-prefixed scratch files", async () => {
+test("Telegram temp cleanup removes stale attachment files by age and keeps directories", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-cleanup-"));
-  const oldFile = join(
-    tempDir,
-    "00000000-0000-4000-8000-000000000001-old.txt",
-  );
-  const freshFile = join(
-    tempDir,
-    "00000000-0000-4000-8000-000000000002-fresh.txt",
-  );
-  const journalFile = join(tempDir, "inbox.json");
+  const oldFile = join(tempDir, "voice-mybot-1.ogg");
+  const stalePart = join(tempDir, "voice-mybot-2.ogg.00000000-0000-4000-8000-000000000001.part");
+  const freshFile = join(tempDir, "voice-mybot-3.ogg");
   const nestedDir = join(tempDir, "nested");
   await writeFile(oldFile, "old", "utf8");
+  await writeFile(stalePart, "partial", "utf8");
   await writeFile(freshFile, "fresh", "utf8");
-  await writeFile(journalFile, "durable", "utf8");
   await mkdir(nestedDir);
   await writeFile(join(nestedDir, "keep.txt"), "keep", "utf8");
   await utimes(oldFile, new Date(1_000), new Date(1_000));
-  await utimes(journalFile, new Date(1_000), new Date(1_000));
+  await utimes(stalePart, new Date(1_000), new Date(1_000));
   await utimes(freshFile, new Date(10_000), new Date(10_000));
-  assert.equal(await cleanupTelegramTempFiles(tempDir, 5_000, 11_000), 1);
-  assert.deepEqual((await readdir(tempDir)).sort(), [
-    "00000000-0000-4000-8000-000000000002-fresh.txt",
-    "inbox.json",
-    "nested",
-  ]);
+  assert.equal(await cleanupTelegramTempFiles(tempDir, 5_000, 11_000), 2);
+  assert.deepEqual((await readdir(tempDir)).sort(), ["nested", "voice-mybot-3.ogg"]);
 });
+
+for (const [name, source, scope, expected] of [
+  ["private chat uses the bot username", { kind: "voice", messageId: 174576, chat: { id: 7, type: "private" } }, "@my_bot", "voice-my_bot-174576.ogg"],
+  ["private chat falls back to the bot id", { kind: "voice", messageId: 4, chat: { id: 7, type: "private" } }, "8502475096", "voice-8502475096-4.ogg"],
+  ["public group uses its username", { kind: "photo", messageId: 9, chat: { id: -1001, type: "supergroup", username: "Team_Chat" } }, "@my_bot", "photo-Team_Chat-9.ogg"],
+  ["anonymous group uses its unsigned id with a single dash", { kind: "photo", messageId: 9, chat: { id: -1001234567890, type: "supergroup" } }, "@my_bot", "photo-1001234567890-9.ogg"],
+  ["titles never name files", { kind: "voice", messageId: 1, chat: { id: -5, type: "group" } }, "@my_bot", "voice-5-1.ogg"],
+  ["rich message index", { kind: "photo", messageId: 2, index: 3, chat: { id: 7, type: "private" } }, "mybot", "photo-mybot-2-3.ogg"],
+  ["sender file names stay a readable suffix", { kind: "document", messageId: 6, userFileName: "my report?.pdf", chat: { id: 7, type: "private" } }, "mybot", "document-mybot-6-my_report_.pdf"],
+  ["unknown chat and scope omit the segment", { kind: "voice", messageId: 8 }, undefined, "voice-8.ogg"],
+] as const) {
+  test(`Attachment names are kind-scope-messageId without UUIDs (${name})`, () => {
+    assert.equal(createTelegramAttachmentFileName(source, "generated.ogg", scope), expected);
+    assert.doesNotMatch(expected, /--|[0-9a-f]{8}-[0-9a-f]{4}-/u);
+  });
+}
 
 test("Telegram temp preparation creates the directory and removes stale scratch files", async () => {
   const parentDir = await mkdtemp(
@@ -1612,7 +1619,7 @@ test("Telegram multipart 5xx reports commit unknown without replay", async () =>
   }
 });
 
-test("Telegram file downloads use unique sanitized temp file names", async () => {
+test("Telegram file downloads use deterministic sanitized names published by rename", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-"));
   const restoreFetch = setApiTestFetch(async (input) => {
     const url = getApiTestFetchUrl(input);
@@ -1628,8 +1635,9 @@ test("Telegram file downloads use unique sanitized temp file names", async () =>
       "bad name?.txt",
       tempDir,
     );
-    assert.match(path, /[0-9a-f-]{36}-bad_name_\.txt$/);
+    assert.equal(path, join(tempDir, "bad_name_.txt"));
     assert.equal(await readFile(path, "utf8"), "hello");
+    assert.deepEqual(await readdir(tempDir), ["bad_name_.txt"], "no partial file remains after publication");
     if (process.platform !== "win32") {
       assert.equal((await stat(tempDir)).mode & 0o777, 0o700);
       assert.equal((await stat(path)).mode & 0o777, 0o600);
@@ -1886,7 +1894,7 @@ test("Default Telegram bridge API runtime applies optional Workspace admission",
 test("Default Telegram bridge API runtime honors PI_CODING_AGENT_DIR for temp files", async () => {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-agent-dir-"));
-  const tempDir = resolve(agentDir, "tmp", "telegram");
+  const tempDir = resolve(agentDir, "tmp", "pi-telegram", "attachments");
   process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
     const runtime = createDefaultTelegramBridgeApiRuntime({
@@ -1921,6 +1929,44 @@ test("Telegram bridge API runtime prepares its configured temp directory", async
   });
   assert.equal(await runtime.prepareTempDir(), 1);
   assert.deepEqual(await readdir(tempDir), []);
+});
+
+test("Telegram bridge API runtime names attachments from their source and the live bot scope", async () => {
+  const names: string[] = [];
+  let scope: string | undefined = "@my_bot";
+  const runtime = createTelegramBridgeApiRuntime({
+    tempDir: "/tmp/pi-telegram/attachments",
+    maxFileSizeBytes: 123,
+    tempFileMaxAgeMs: 60_000,
+    getBotScope: () => scope,
+    recordRuntimeEvent: () => {},
+    client: createApiRuntimeClient({
+      downloadFile: async (_fileId, suggestedName) => { names.push(suggestedName); return `/tmp/${suggestedName}`; },
+    }),
+  });
+  await runtime.downloadFile("a", "voice-1.ogg", { kind: "voice", messageId: 1, chat: { id: 7, type: "private" } });
+  scope = "8502475096";
+  await runtime.downloadFile("b", "voice-1.ogg", { kind: "voice", messageId: 1, chat: { id: 7, type: "private" } });
+  await runtime.downloadFile("c", "voice-1.ogg", { kind: "voice", messageId: 1, chat: { id: -1009, type: "supergroup", username: "team" } });
+  await runtime.downloadFile("d", "legacy.bin");
+  assert.deepEqual(names, ["voice-my_bot-1.ogg", "voice-8502475096-1.ogg", "voice-team-1.ogg", "legacy.bin"]);
+});
+
+test("Concurrent downloads of one message publish one complete file", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-download-race-"));
+  const restoreFetch = setApiTestFetch(async (input) => {
+    const url = getApiTestFetchUrl(input);
+    if (url.includes("/getFile")) return createApiJsonResponse({ file_path: "files/demo" });
+    return new Response("complete payload", { status: 200 });
+  });
+  try {
+    const paths = await Promise.all([1, 2, 3].map(() => downloadTelegramFile("123:abc", "file-id", "voice-bot-9.ogg", tempDir)));
+    assert.deepEqual(new Set(paths), new Set([join(tempDir, "voice-bot-9.ogg")]));
+    assert.equal(await readFile(paths[0]!, "utf8"), "complete payload");
+    assert.deepEqual(await readdir(tempDir), ["voice-bot-9.ogg"], "no partial file remains");
+  } finally {
+    restoreFetch();
+  }
 });
 
 test("Telegram bridge API runtime records structured failures", async () => {

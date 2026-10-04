@@ -10,8 +10,10 @@ import {
 } from "./bus.ts";
 import {
   buildTelegramAnswerGuestQueryBody,
+  formatTelegramCallbackAnswerText,
   isTelegramMessageNotModifiedError,
 } from "./telegram-api.ts";
+import type { TelegramAttachmentSource } from "./media.ts";
 import type {
   TelegramAnswerGuestQueryOptions,
   TelegramApiCallOptions,
@@ -125,12 +127,14 @@ export function createTelegramBusAwareApiRuntime(
             options,
           ]) as Promise<TResponse>);
     },
-    downloadFile(fileId: string, suggestedName: string): Promise<string> {
+    downloadFile(fileId: string, suggestedName: string, source?: TelegramAttachmentSource): Promise<string> {
+      // The source names the file (kind-scope-message); dropping it falls back to the bare generated name.
       return deps.ownsDirect()
-        ? deps.directRuntime.downloadFile(fileId, suggestedName)
+        ? deps.directRuntime.downloadFile(fileId, suggestedName, source)
         : (deps.callFollowerApi("downloadFile", [
             fileId,
             suggestedName,
+            ...(source ? [source] : []),
           ]) as Promise<string>);
     },
     deleteWebhook(signal?: AbortSignal): Promise<boolean> {
@@ -318,15 +322,16 @@ export function createTelegramBusAwareApiRuntime(
       callbackQueryId: string,
       text?: string,
     ): Promise<void> {
+      const answer = formatTelegramCallbackAnswerText(text);
       if (deps.ownsDirect()) {
-        await deps.directRuntime.answerCallbackQuery(callbackQueryId, text);
+        await deps.directRuntime.answerCallbackQuery(callbackQueryId, answer);
         return;
       }
       await deps.callFollowerApi("call", [
         "answerCallbackQuery",
         {
           callback_query_id: callbackQueryId,
-          ...(text !== undefined ? { text } : {}),
+          ...(answer !== undefined ? { text: answer } : {}),
         },
       ]);
     },

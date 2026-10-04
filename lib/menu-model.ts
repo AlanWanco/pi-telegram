@@ -267,7 +267,7 @@ export const TELEGRAM_MODEL_PAGE_SIZE = 6;
 const TELEGRAM_MODEL_PAGE_PICKER_ROW_SIZE = 4;
 export const MODEL_MENU_TITLE = "<b>🤖 Choose a model:</b>";
 export const MODEL_PAGE_MENU_TITLE = "<b>Choose a page:</b>";
-export const MODEL_DETAIL_MENU_TITLE = "<b>🤖 Model:</b>";
+const MODEL_DETAIL_MENU_TITLE = "<b>🤖 Model:</b>";
 
 function truncateTelegramButtonLabel(label: string, maxLength = 56): string {
   return label.length <= maxLength
@@ -647,7 +647,7 @@ export function getTelegramModelSelection<TModel extends MenuModel = MenuModel>(
   return { kind: "selected", selection };
 }
 
-export function applyTelegramModelDetailSelection(
+function applyTelegramModelDetailSelection(
   state: TelegramModelMenuState,
   value: string | undefined,
 ): TelegramMenuMutationResult {
@@ -661,7 +661,7 @@ export function applyTelegramModelDetailSelection(
   return "changed";
 }
 
-export function getTelegramSelectedDetailModel<
+function getTelegramSelectedDetailModel<
   TModel extends MenuModel = MenuModel,
 >(state: TelegramModelMenuState<TModel>): TelegramMenuSelectionResult<TModel> {
   const indexedSelection = getTelegramModelSelection(
@@ -687,7 +687,7 @@ export function getTelegramSelectedDetailModel<
   return indexedSelection;
 }
 
-export function isTelegramModelScoped(
+function isTelegramModelScoped(
   state: TelegramModelMenuState,
   model: MenuModel,
 ): boolean {
@@ -697,7 +697,7 @@ export function isTelegramModelScoped(
   );
 }
 
-export function focusTelegramModelListPage(
+function focusTelegramModelListPage(
   state: TelegramModelMenuState,
   model: MenuModel,
   pageSize = TELEGRAM_MODEL_PAGE_SIZE,
@@ -715,7 +715,7 @@ function formatScopedModelPattern(entry: ScopedTelegramModel): string {
   return entry.thinkingLevel ? `${key}:${entry.thinkingLevel}` : key;
 }
 
-export function setTelegramModelScope(
+function setTelegramModelScope(
   state: TelegramModelMenuState,
   model: MenuModel,
   enabled: boolean,
@@ -1062,7 +1062,7 @@ export function buildModelMenuReplyMarkup(
   return { inline_keyboard: rows };
 }
 
-export function buildModelDetailMenuReplyMarkup(
+function buildModelDetailMenuReplyMarkup(
   state: TelegramModelMenuState,
   currentModel: MenuModel | undefined,
 ): TelegramReplyMarkup {
@@ -1100,7 +1100,7 @@ export function buildModelDetailMenuReplyMarkup(
   };
 }
 
-export function buildModelDetailMenuText(
+function buildModelDetailMenuText(
   state: TelegramModelMenuState,
 ): string {
   const selection = getTelegramSelectedDetailModel(state);

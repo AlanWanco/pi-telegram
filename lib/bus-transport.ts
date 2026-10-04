@@ -6,7 +6,17 @@
 
 import { createHash } from "node:crypto";
 import { createConnection } from "node:net";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { resolveTelegramTempDir, resolveTelegramRuntimeDir } from "./paths.ts";
+
+export type TelegramBusEndpointLayout = "consolidated";
+export const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
+
+function requireConsolidatedUnixEndpoint(path: string): string {
+  if (!isAbsolute(path) || resolve(path) !== path) throw new Error("Consolidated Telegram IPC requires an exact absolute runtime path.");
+  // Over-budget logical paths keep their identity; socket resolution applies the bounded private external fallback.
+  return path;
+}
 
 export type TelegramBusTransportKind = "pipe" | "socket";
 
@@ -41,7 +51,7 @@ export const TELEGRAM_BUS_REGISTRATION_RETRY: TelegramBusTransportRetryPolicy =
     delayMs: 150,
   };
 
-export const TELEGRAM_BUS_OPERATION_RETRY: TelegramBusTransportRetryPolicy = {
+const TELEGRAM_BUS_OPERATION_RETRY: TelegramBusTransportRetryPolicy = {
   attempts: 3,
   delayMs: 100,
 };
@@ -103,7 +113,15 @@ export function getTelegramBusLeaderEndpoint(input: {
   agentDir: string;
   platform: NodeJS.Platform | string;
   profileName?: string;
+  layout?: TelegramBusEndpointLayout;
 }): string {
+  if (input.layout !== undefined && input.layout !== "consolidated") throw new Error("Telegram IPC layout is invalid.");
+  if (input.layout === "consolidated") {
+    const scope = createHash("sha256").update(JSON.stringify([input.profileName ?? "default"])).digest("hex").slice(0, 16);
+    return input.platform === "win32"
+      ? getTelegramBusPipePath({ agentDir: input.agentDir, scope: `bus-${scope}` })
+      : requireConsolidatedUnixEndpoint(join(resolveTelegramRuntimeDir(input.agentDir), `bus.${scope}.sock`));
+  }
   const profileScope = input.profileName
     ? normalizeTelegramBusEndpointScope(input.profileName)
     : undefined;
@@ -113,9 +131,7 @@ export function getTelegramBusLeaderEndpoint(input: {
         scope: profileScope ? `bus-${profileScope}` : "bus",
       })
     : join(
-        input.agentDir,
-        "tmp",
-        "telegram",
+        resolveTelegramTempDir(input.agentDir),
         profileScope ? `bus.${profileScope}.sock` : "bus.sock",
       );
 }
@@ -125,7 +141,15 @@ export function getTelegramBusFollowerEndpoint(input: {
   platform: NodeJS.Platform | string;
   instanceId: string;
   profileName?: string;
+  layout?: TelegramBusEndpointLayout;
 }): string {
+  if (input.layout !== undefined && input.layout !== "consolidated") throw new Error("Telegram IPC layout is invalid.");
+  if (input.layout === "consolidated") {
+    const scope = createHash("sha256").update(JSON.stringify([input.profileName ?? "default", input.instanceId])).digest("hex").slice(0, 16);
+    return input.platform === "win32"
+      ? getTelegramBusPipePath({ agentDir: input.agentDir, scope: `follower-${scope}` })
+      : requireConsolidatedUnixEndpoint(join(resolveTelegramRuntimeDir(input.agentDir), `f.${scope}.sock`));
+  }
   const instanceScope = normalizeTelegramBusEndpointScope(input.instanceId);
   const profileScope = input.profileName
     ? normalizeTelegramBusEndpointScope(input.profileName)
@@ -138,9 +162,7 @@ export function getTelegramBusFollowerEndpoint(input: {
           : `follower-${instanceScope}`,
       })
     : join(
-        input.agentDir,
-        "tmp",
-        "telegram",
+        resolveTelegramTempDir(input.agentDir),
         "followers",
         ...(profileScope ? [profileScope] : []),
         `${instanceScope}.sock`,

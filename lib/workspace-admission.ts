@@ -15,6 +15,7 @@ import {
   type PathLike,
 } from "node:fs";
 import { dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   getTelegramProcessLiveness,
@@ -23,8 +24,12 @@ import {
 import {
   renameTelegramPathWithRetry,
   withTelegramFileTransaction,
+  readTelegramRuntimeState,
+  mutateTelegramRuntimeStateSection,
+  TelegramRuntimeStateError,
 } from "./locks.ts";
-import type { TelegramTarget } from "./target.ts";
+import { areTelegramTargetsEqual as areTargetsEqual, type TelegramTarget } from "./target.ts";
+import { isWireRecord as isRecord, isNonNegativeWireInteger as isSafeTimestamp } from "./wire.ts";
 
 const TELEGRAM_WORKSPACE_ADMISSION_VERSION = 1;
 const TELEGRAM_WORKSPACE_ADMISSION_MAX_LEASES = 4096;
@@ -41,7 +46,7 @@ export type TelegramWorkspaceAdmissionScope =
   | { kind: "chat"; chatId: number }
   | { kind: "profile" };
 
-export interface TelegramWorkspaceAdmissionLease {
+interface TelegramWorkspaceAdmissionLease {
   operationId: string;
   operationKind: string;
   profileKey: string;
@@ -50,7 +55,7 @@ export interface TelegramWorkspaceAdmissionLease {
   acquiredAtMs: number;
 }
 
-export type TelegramWorkspaceDestructiveFenceKind =
+type TelegramWorkspaceDestructiveFenceKind =
   | "pressure-retirement"
   | "manual-thread-cleanup"
   | "journal-writer-closure";
@@ -58,7 +63,7 @@ export type TelegramWorkspaceDestructiveFenceKind =
 export type TelegramWorkspaceDeletionFenceKind = Exclude<
   TelegramWorkspaceDestructiveFenceKind, "journal-writer-closure">;
 
-export interface TelegramWorkspaceJournalWriterClosureFence {
+interface TelegramWorkspaceJournalWriterClosureFence {
   destructiveKind: "journal-writer-closure";
   phase: "fenced";
   operationId: string;
@@ -87,7 +92,7 @@ export function normalizeTelegramWorkspaceJournalWriterClosureFence(
     owner, requestedAtMs: value.requestedAtMs, acquiredAtMs: value.acquiredAtMs };
 }
 
-export interface TelegramWorkspaceJournalWriterProtocolMode {
+interface TelegramWorkspaceJournalWriterProtocolMode {
   version: 1;
   protocol: "custody-v3";
   profileKey: string;
@@ -183,16 +188,11 @@ interface TelegramWorkspaceAdmissionState {
   writerProtocolMode?: TelegramWorkspaceJournalWriterProtocolMode;
 }
 
-export type TelegramWorkspaceAdmissionBlockReason =
-  | "retirement-fenced"
-  | "admission-active"
-  | "retirement-active";
-
-export type TelegramWorkspaceAdmissionAcquireResult =
+type TelegramWorkspaceAdmissionAcquireResult =
   | { kind: "acquired"; lease: TelegramWorkspaceAdmissionLease; resumed: boolean }
   | { kind: "blocked"; reason: "retirement-fenced" };
 
-export type TelegramWorkspaceRetirementFenceAcquireResult =
+type TelegramWorkspaceRetirementFenceAcquireResult =
   | {
       kind: "acquired";
       fence: TelegramWorkspaceRetirementFence;
@@ -203,16 +203,16 @@ export type TelegramWorkspaceRetirementFenceAcquireResult =
       reason: "admission-active" | "retirement-active";
     };
 
-export type TelegramWorkspaceJournalWriterProtocolInstallResult = {
+type TelegramWorkspaceJournalWriterProtocolInstallResult = {
   mode: TelegramWorkspaceJournalWriterProtocolMode;
   resumed: boolean;
 };
 
-export type TelegramWorkspaceJournalWriterClosureAcquireResult =
+type TelegramWorkspaceJournalWriterClosureAcquireResult =
   | { kind: "acquired"; fence: TelegramWorkspaceJournalWriterClosureFence; resumed: boolean }
   | { kind: "blocked"; reason: "admission-active" | "retirement-active" };
 
-export type TelegramWorkspaceDeletionPermitResult =
+type TelegramWorkspaceDeletionPermitResult =
   | {
       kind: "issued";
       fence: TelegramWorkspaceRetirementFence;
@@ -220,19 +220,21 @@ export type TelegramWorkspaceDeletionPermitResult =
     }
   | { kind: "already-issued"; fence: TelegramWorkspaceRetirementFence };
 
-export interface TelegramWorkspaceAdmissionLedgerSnapshot {
+interface TelegramWorkspaceAdmissionLedgerSnapshot {
   profileKey: string;
   leases: TelegramWorkspaceAdmissionLease[];
   fence?: TelegramWorkspaceDestructiveFence;
   writerProtocolMode?: TelegramWorkspaceJournalWriterProtocolMode;
 }
 
-export type TelegramWorkspaceAdmissionPublicationBoundary =
+type TelegramWorkspaceAdmissionPublicationBoundary =
   | "before-write"
   | "after-write-before-rename";
 
-export interface TelegramWorkspaceAdmissionLedgerOptions {
+interface TelegramWorkspaceAdmissionLedgerOptions {
   path: string;
+  /** Explicit logical section identity for the consolidated root; absent means the standalone ledger adapter. */
+  stateProfile?: string;
   profileKey: string;
   owner: TelegramWorkspaceAdmissionOwner;
   getNowMs?: () => number;
@@ -354,14 +356,6 @@ function invalidState(message: string, cause?: unknown): never {
 
 function authorityChanged(message: string): never {
   throw new TelegramWorkspaceAdmissionError("authority-changed", message);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isSafeTimestamp(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function isBoundedText(value: unknown): value is string {
@@ -508,8 +502,9 @@ function normalizeFence(
   if (value.phase === "deletion-rejected" &&
       (value.destructiveKind === undefined || value.destructiveKind === "pressure-retirement") &&
       isSafeTimestamp(value.deletionIssuedAtMs) && isSafeTimestamp(value.rejectionConfirmedAtMs)) {
-    return { ...base, destructiveKind: value.destructiveKind, phase: "deletion-rejected",
-      deletionIssuedAtMs: value.deletionIssuedAtMs, rejectionConfirmedAtMs: value.rejectionConfirmedAtMs };
+    const { destructiveKind: _kind, ...pressureBase } = base;
+    return { ...pressureBase, ...(value.destructiveKind === "pressure-retirement" ? { destructiveKind: "pressure-retirement" as const } : {}),
+      phase: "deletion-rejected", deletionIssuedAtMs: value.deletionIssuedAtMs, rejectionConfirmedAtMs: value.rejectionConfirmedAtMs };
   }
   if (
     value.phase === "commit-ready" &&
@@ -587,9 +582,29 @@ function readState(
   } catch (error) {
     invalidState("Telegram Workspace admission state is malformed.", error);
   }
-  if (!isRecord(parsed)) {
-    invalidState("Telegram Workspace admission state is invalid.");
-  }
+  return normalizeAdmissionState(parsed, profileKey);
+}
+
+function isConsolidatedAdmissionKey(value: unknown, profile: string): boolean {
+  if (!isBoundedText(value)) return false;
+  try {
+    const key: unknown = JSON.parse(value);
+    return isRecord(key) && Object.keys(key).length === 3 && key.version === TELEGRAM_WORKSPACE_ADMISSION_VERSION && key.profile === profile &&
+      isRecord(key.bot) && Object.keys(key.bot).length === 1 && typeof key.bot.tokenSha256 === "string" && /^[a-f0-9]{64}$/u.test(key.bot.tokenSha256);
+  } catch { return false; }
+}
+/** Pure damage check for one consolidated admission section under its own stored profile key; throws when invalid. */
+export function assertTelegramConsolidatedAdmissionSection(value: unknown, stateProfile: string): void {
+  if (value === undefined) return;
+  normalizeAdmissionState(value, isRecord(value) && typeof value.profileKey === "string" ? value.profileKey : "", stateProfile);
+}
+
+function normalizeAdmissionState(parsed: unknown, profileKey: string, stateProfile?: string): TelegramWorkspaceAdmissionState {
+  if (parsed === undefined) return { version: TELEGRAM_WORKSPACE_ADMISSION_VERSION, profileKey, leases: [] };
+  if (!isRecord(parsed)) invalidState("Telegram Workspace admission state is invalid.");
+  if (stateProfile !== undefined && (Object.keys(parsed).some(key => !["version", "profileKey", "leases", "fence", "writerProtocolMode"].includes(key)) ||
+      !isConsolidatedAdmissionKey(parsed.profileKey, stateProfile)))
+    invalidState("Telegram consolidated admission section identity is invalid.");
   if (
     parsed.version !== TELEGRAM_WORKSPACE_ADMISSION_VERSION ||
     !Array.isArray(parsed.leases) ||
@@ -627,6 +642,9 @@ function readState(
     invalidState("Telegram Workspace writer protocol mode is invalid.");
   if (fence && writerProtocolMode)
     invalidState("Telegram Workspace destructive fence conflicts with writer protocol mode.");
+  if (stateProfile !== undefined && (!isDeepStrictEqual(parsed.leases, normalizedLeases) ||
+      !isDeepStrictEqual(parsed.fence, fence) || !isDeepStrictEqual(parsed.writerProtocolMode, writerProtocolMode)))
+    invalidState("Telegram consolidated admission evidence cannot drop unknown fields.");
   return {
     version: TELEGRAM_WORKSPACE_ADMISSION_VERSION,
     profileKey,
@@ -677,13 +695,6 @@ function writeState(
       // A successful atomic rename consumes the temporary path.
     }
   }
-}
-
-function areTargetsEqual(
-  left: TelegramTarget & { threadId: number },
-  right: TelegramTarget & { threadId: number },
-): boolean {
-  return left.chatId === right.chatId && left.threadId === right.threadId;
 }
 
 function scopesConflict(
@@ -810,6 +821,8 @@ function validateOptions(options: TelegramWorkspaceAdmissionLedgerOptions): void
   if (!normalizeOwner(options.owner)) {
     invalidInput("Telegram Workspace admission owner is invalid.");
   }
+  if (options.stateProfile !== undefined && (!isBoundedText(options.stateProfile) || !isConsolidatedAdmissionKey(options.profileKey, options.stateProfile)))
+    invalidInput("Telegram consolidated admission requires an exact bot/profile section identity.");
 }
 
 function validateOperationId(operationId: string): void {
@@ -863,31 +876,34 @@ export function createTelegramWorkspaceAdmissionProfileKey(input: {
   });
 }
 
-export interface TelegramWorkspaceAdmissionRuntimeBinding {
+interface TelegramWorkspaceAdmissionRuntimeBinding {
   resolve: () => TelegramWorkspaceAdmissionLedger | undefined;
 }
 
 export function createTelegramWorkspaceAdmissionRuntimeBinding(input: {
   getProfileName: () => string | undefined;
   getBotToken: () => string | undefined;
-  getPath: (profileName?: string) => string;
   owner: TelegramWorkspaceAdmissionOwner;
   getNowMs?: () => number;
   getProcessLiveness?: (
     owner: TelegramWorkspaceAdmissionOwner,
   ) => TelegramProcessLiveness;
-}): TelegramWorkspaceAdmissionRuntimeBinding {
+} & ({ getPath: (profileName?: string) => string; getStatePath?: never } |
+     { getStatePath: () => string; getPath?: never })): TelegramWorkspaceAdmissionRuntimeBinding {
+  const { getProfileName, getBotToken, getPath, getStatePath } = input;
+  if ((getPath === undefined) === (getStatePath === undefined)) invalidInput("Telegram admission binding must select one storage identity.");
   return {
     resolve() {
-      const botToken = input.getBotToken();
+      const botToken = getBotToken();
       if (!botToken) return undefined;
-      const configuredProfileName = input.getProfileName();
+      const configuredProfileName = getProfileName();
       const profileKey = createTelegramWorkspaceAdmissionProfileKey({
         profileName: configuredProfileName ?? "default",
         botToken,
       });
       return createTelegramWorkspaceAdmissionLedger({
-        path: input.getPath(configuredProfileName),
+        path: getStatePath ? getStatePath() : getPath!(configuredProfileName),
+        ...(getStatePath ? { stateProfile: configuredProfileName ?? "default" } : {}),
         profileKey,
         owner: input.owner,
         getNowMs: input.getNowMs,
@@ -1105,12 +1121,23 @@ export function createTelegramWorkspaceAdmissionLedger(
   options: TelegramWorkspaceAdmissionLedgerOptions,
 ): TelegramWorkspaceAdmissionLedger {
   validateOptions(options);
+  const suppliedOptions = options;
+  if (options.stateProfile !== undefined) options = { ...options, owner: { ...options.owner } };
   const getNowMs = options.getNowMs ?? Date.now;
   const getProcessLiveness =
     options.getProcessLiveness ??
     ((owner: TelegramWorkspaceAdmissionOwner) =>
       getTelegramProcessLiveness(owner));
   const transactionPath = `${options.path}.transaction`;
+  const path = options.path, profileKey = options.profileKey, stateProfile = options.stateProfile, boundOwner = { ...options.owner };
+  const publication = { publishRename: options.publishRename, onPublicationBoundary: options.onPublicationBoundary };
+  const isStorageCurrent = (): boolean => suppliedOptions.path === path && suppliedOptions.profileKey === profileKey &&
+    suppliedOptions.stateProfile === stateProfile && areOwnersEqual(suppliedOptions.owner, boundOwner);
+  const mapStateError = (error: unknown): never => {
+    if (error instanceof TelegramRuntimeStateError) throw new TelegramWorkspaceAdmissionError(
+      error.code === "invalid" ? "invalid-state" : error.code, "Telegram consolidated admission state operation failed.", { cause: error });
+    throw error;
+  };
 
   function transact<T>(
     operation: (state: TelegramWorkspaceAdmissionState) => {
@@ -1118,6 +1145,20 @@ export function createTelegramWorkspaceAdmissionLedger(
       changed: boolean;
     },
   ): T {
+    if (stateProfile !== undefined) {
+      try {
+        return mutateTelegramRuntimeStateSection(path, stateProfile, "admission", current => {
+          const state = normalizeAdmissionState(current, profileKey, stateProfile);
+          const retained = state.leases.filter(lease => getProcessLiveness(lease.owner) !== "dead");
+          const pruned = retained.length !== state.leases.length;
+          state.leases = retained;
+          const outcome = operation(state);
+          return { value: pruned || outcome.changed ? normalizeAdmissionState(state, profileKey, stateProfile) : current, result: outcome.result };
+        }, { isCurrent: isStorageCurrent, publishRename: publication.publishRename, onPublicationBoundary(boundary) {
+          if (boundary !== "after-rename") publication.onPublicationBoundary?.(boundary, path);
+        } });
+      } catch (error) { return mapStateError(error); }
+    }
     return withTelegramFileTransaction(transactionPath, () => {
       const state = readState(options.path, options.profileKey);
       const retainedLeases = state.leases.filter(
@@ -1132,7 +1173,16 @@ export function createTelegramWorkspaceAdmissionLedger(
   }
 
   function read(): TelegramWorkspaceAdmissionLedgerSnapshot {
-    const state = readState(options.path, options.profileKey);
+    let state: TelegramWorkspaceAdmissionState;
+    if (stateProfile !== undefined) {
+      if (!isStorageCurrent()) authorityChanged("Telegram consolidated admission storage authority changed.");
+      try {
+        const file = readTelegramRuntimeState(path);
+        const value = Object.hasOwn(file.profiles, stateProfile) ? file.profiles[stateProfile]?.admission : undefined;
+        state = normalizeAdmissionState(value, profileKey, stateProfile);
+        if (!isStorageCurrent()) authorityChanged("Telegram consolidated admission storage authority changed.");
+      } catch (error) { return mapStateError(error); }
+    } else state = readState(options.path, options.profileKey);
     return {
       profileKey: state.profileKey,
       leases: state.leases.map(cloneLease),
@@ -1675,8 +1725,8 @@ export function createTelegramWorkspaceAdmissionLedger(
   }
 
   return {
-    getProfileKey: () => options.profileKey,
-    getOwner: () => ({ ...options.owner }),
+    getProfileKey: () => stateProfile === undefined ? options.profileKey : profileKey,
+    getOwner: () => ({ ...(stateProfile === undefined ? options.owner : boundOwner) }),
     listReservedSlots: () => {
       const fence = read().fence;
       return fence && isTelegramWorkspaceRetirementFence(fence) ? [fence.slot] : [];

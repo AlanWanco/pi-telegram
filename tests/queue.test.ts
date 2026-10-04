@@ -811,6 +811,42 @@ test("Control-lane items sort before priority and default prompt items", () => {
   );
 });
 
+for (const mode of ["waiting", "dispatched-head", "behind-dispatched-head", "unknown-dispatch", "missing-settlement", "settlement-failure", "positive"] as const) {
+  test(`Continuation reactions cancel only waiting source-owned control prompts (${mode})`, () => {
+    const continuation = createQueueTestPromptTurn({ chatId: 100, replyToMessageId: 12, sourceMessageIds: [12],
+      queueOrder: 2, queueLane: "control", laneOrder: 1, statusSummary: "continue", admissionReceipts: [{ queueKind: "prompt", receiptId: "continue-12", sourceUpdateIds: [1] }] });
+    const synthetic = createQueueTestPromptTurn({ chatId: 100, sourceMessageIds: [], queueOrder: 3, queueLane: "control", laneOrder: 2, statusSummary: "model-resume" });
+    const ordinary = createQueueTestPromptTurn({ chatId: 100, replyToMessageId: 22, sourceMessageIds: [22] });
+    const before = mode === "behind-dispatched-head" ? [ordinary, continuation, synthetic] : [continuation, synthetic, ordinary];
+    let items: TelegramQueueItem<string>[] = [...before], discarded = 0;
+    const mutation = createTelegramQueueMutationController<string>({
+      getQueuedItems: () => items, setQueuedItems: next => { items = next; }, updateStatus() {},
+      ...(mode === "unknown-dispatch" ? {} : { hasPendingDispatch: () => mode === "dispatched-head" || mode === "behind-dispatched-head" }),
+      ...(mode === "missing-settlement" ? {} : { onItemsDiscarded(removed: readonly TelegramQueueItem<string>[]) {
+        assert.deepEqual(removed, [continuation]);
+        assert.deepEqual(items, before, "Durable settlement precedes memory removal");
+        if (mode === "settlement-failure") throw new Error("fixture continuation receipt unavailable");
+        discarded++;
+      } }),
+      allocateLaneOrder() { assert.fail("A continuation reaction never changes its control lane or other FIFO positions"); },
+    });
+    if (mode === "behind-dispatched-head") {
+      items = [ordinary, synthetic]; mutation.append(continuation, "ctx");
+      assert.deepEqual(items, before, "Appending a control continuation cannot displace Pi's pending head");
+    }
+    assert.equal(mutation.applyReactionByMessageId(12, { kind: "suppressed", emoji: "👎" }, "ctx", { chatId: 200 }), false);
+    const reaction = mode === "positive" ? { kind: "priority" as const, emoji: "👍" } : { kind: "suppressed" as const, emoji: "👎" };
+    if (mode === "settlement-failure") assert.throws(() => mutation.applyReactionByMessageId(12, reaction, "ctx", { chatId: 100 }), /receipt unavailable/);
+    else assert.equal(mutation.applyReactionByMessageId(12, reaction, "ctx", { chatId: 100 }), mode === "waiting" || mode === "behind-dispatched-head");
+    const cancelled = mode === "waiting" || mode === "behind-dispatched-head";
+    assert.deepEqual(items, cancelled ? before.filter(item => item !== continuation) : before);
+    assert.equal(discarded, cancelled ? 1 : 0);
+    if (cancelled) assert.equal(mutation.applyReactionByMessageId(12, reaction, "ctx", { chatId: 100 }), false, "Duplicate reactions do not settle again");
+    assert.equal(continuation.queueLane, "control");
+    assert.equal(continuation.reactionSuppressionEmoji, undefined);
+  });
+}
+
 test("Queue mutation helpers remove prompt items by Telegram message id", () => {
   const promptItem: TelegramQueueItem = createQueueTestPromptTurn({
     replyToMessageId: 1,
@@ -5597,6 +5633,7 @@ test("Queue dispatch controller plans prompts and reports dispatch failures", ()
 
 test("Queue dispatch announces the exact selected prompt before one dispatch", async () => {
   const events: string[] = [];
+  let noticeOptions: unknown;
   let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn({
     chatId: 42,
     target: { chatId: 42, threadId: 7 },
@@ -5612,6 +5649,7 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
     canDispatch: () => true,
     updateStatus: () => events.push("status"),
     sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      noticeOptions = options;
       events.push(`notice:${chatId}:${replyToMessageId}:${options?.target?.threadId}:${text}`);
       return 100;
     },
@@ -5624,6 +5662,7 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
   });
   controller.requestNextDispatchAnnouncement();
   controller.dispatchNext("ctx");
+  assert.deepEqual(noticeOptions, { target: { chatId: 42, threadId: 7 }, parseMode: "HTML" });
   assert.deepEqual(events, [
     "status",
     "notice:42:99:7:<b>⏩ Dispatching next queued turn.</b>",

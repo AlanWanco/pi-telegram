@@ -490,6 +490,14 @@ test("Queue binding composes mutation, admission, dispatch, and watchdog ports",
     "discard:1",
     "status",
   ]);
+  runtime.mutation.append({ kind: "prompt", chatId: 7, replyToMessageId: 12, sourceMessageIds: [12],
+    queueOrder: 2, queueLane: "control", laneOrder: 2, statusSummary: "continue", queuedAttachments: [],
+    content: [{ type: "text", text: "continue" }], historyText: "continue",
+    admissionReceipts: [{ queueKind: "prompt", receiptId: "continue-12", sourceUpdateIds: [12] }] }, "ctx");
+  assert.equal(runtime.mutation.applyReactionByMessageId(12, { kind: "suppressed", emoji: "👎" }, "ctx", { chatId: 7 }), true,
+    "Production composition passes the dispatched-head guard to source-owned continuation cancellation");
+  assert.equal(store.getQueuedItems().length, 0);
+  assert.deepEqual(events.slice(-3), ["status", "discard:1", "status"]);
 });
 
 for (const preparation of ["text", "voice", "attachment"] as const) {
@@ -1189,12 +1197,22 @@ test("Named setup preserves a display preference changed while the token form wa
   }
 });
 
-test("Lifecycle binding disconnects only graceful quit and preserves cleanup after failure", async () => {
+test("Lifecycle binding drains diagnostics before quit cleanup and preserves cleanup after failure", async () => {
   const events: string[] = [];
+  let holdDiagnostics = false, current = true;
+  let releaseDiagnostics: (() => void) | undefined;
   let disconnectFails = false;
   let automaticCleanupEnabled = true;
   const harness = createBindingApiHarness();
   const deps = {
+    diagnostics: {
+      onSessionStart() {},
+      onSessionShutdown() {
+        events.push("diagnostics:suspend");
+        return holdDiagnostics ? new Promise<void>(resolve => { releaseDiagnostics = resolve; }) : Promise.resolve();
+      },
+    },
+    isSessionContextActive: () => current,
     pi: harness.api,
     activityRuntime: {
       recordInputSource: () => {},
@@ -1332,18 +1350,21 @@ test("Lifecycle binding disconnects only graceful quit and preserves cleanup aft
   );
 
   assert.deepEqual(events, [
-    "live-surfaces-shutdown",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "disconnect-on-quit",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "disconnect-on-quit",
-    "runtime:automatic-disconnect-on-quit",
-    "composed-shutdown",
-    "live-surfaces-shutdown",
-    "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "disconnect-on-quit", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "disconnect-on-quit",
+    "runtime:automatic-disconnect-on-quit", "composed-shutdown",
+    "diagnostics:suspend", "live-surfaces-shutdown", "composed-shutdown",
   ]);
+  events.length = 0;
+  holdDiagnostics = true;
+  const stopped = shutdown({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext);
+  await Promise.resolve();
+  assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"]);
+  current = false;
+  releaseDiagnostics!();
+  await stopped;
+  assert.deepEqual(events, ["diagnostics:suspend", "live-surfaces-shutdown"], "Retired shutdown cannot continue into a successor after the drain");
 });
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {

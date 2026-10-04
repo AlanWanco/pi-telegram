@@ -98,7 +98,6 @@ export interface PendingTelegramControlItem<TContext = unknown> extends Telegram
 }
 export type TelegramQueueItem<TContext = unknown> = PendingTelegramTurn | PendingTelegramControlItem<TContext>;
 export declare const TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES: number;
-export declare const TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS = 256;
 export interface TelegramQueueHandoffBase {
     chatId: number;
     target?: TelegramQueueTarget;
@@ -132,6 +131,8 @@ export interface TelegramQueueHandoff {
     handoffToken: string;
     payload: TelegramQueueHandoffPayload;
 }
+/** Data decoder shared by authenticated IPC and cold storage; decoding grants no admission. */
+export declare function parseTelegramQueueHandoffPayload(value: unknown): TelegramQueueHandoffPayload | undefined;
 export interface TelegramQueueHandoffStageReceipt {
     status: "staged";
     receiptId: string;
@@ -192,14 +193,12 @@ export declare function getTelegramQueueLaneContract(lane: TelegramQueueLane): T
 export declare function getTelegramQueueItemAdmissionMode(item: Pick<TelegramQueueItem, "queueLane">): TelegramQueueAdmissionMode;
 export declare function isTelegramQueueItemAdmissionValid(item: Pick<TelegramQueueItem, "kind" | "queueLane">): boolean;
 export declare function assertTelegramQueueItemAdmissionValid(item: Pick<TelegramQueueItem, "kind" | "queueLane" | "admissionReceipts">): void;
-export declare function isPendingTelegramTurn<TContext = unknown>(item: TelegramQueueItem<TContext>): item is PendingTelegramTurn;
 export declare function createTelegramQueueStore<TContext = unknown>(initialItems?: TelegramQueueItem<TContext>[]): TelegramQueueStateStore<TContext>;
 export declare function createTelegramTransportStampRuntime(deps: {
     getProfileName(): string | undefined;
     getBotToken(): string | undefined;
 }): TelegramTransportStampRuntime;
 export declare function createTelegramTransportStampedQueueStore<TContext>(store: TelegramQueueStateStore<TContext>, getTransportStamp: () => TelegramTransportStamp): TelegramQueueStateStore<TContext>;
-export declare function isTelegramQueueItemSkipped<TContext = unknown>(item: TelegramQueueItem<TContext>): boolean;
 export declare function countExecutableTelegramQueueItems<TContext = unknown>(items: readonly TelegramQueueItem<TContext>[]): number;
 export declare function createTelegramQueueItemCountGetter<TContext = unknown>(store: Pick<TelegramQueueStore<TContext>, "getQueuedItems">): () => number;
 export declare function createTelegramActiveTurnStore<TTurn extends PendingTelegramTurn = PendingTelegramTurn>(): TelegramActiveTurnStore<TTurn>;
@@ -244,11 +243,6 @@ export interface TelegramQueueMessageScope {
 export declare function removeTelegramQueueItemsByMessageIds<TContext = unknown>(items: TelegramQueueItem<TContext>[], messageIds: number[], scope?: TelegramQueueMessageScope): {
     items: TelegramQueueItem<TContext>[];
     removedItems: TelegramQueueItem<TContext>[];
-    removedCount: number;
-};
-export declare function removeTelegramQueuedGuestPromptByOrder<TContext = unknown>(items: TelegramQueueItem<TContext>[], queueOrder: number): {
-    items: TelegramQueueItem<TContext>[];
-    removedItems: PendingTelegramTurn[];
     removedCount: number;
 };
 export declare function applyTelegramQueuePromptReactionDisposition<TContext = unknown>(items: TelegramQueueItem<TContext>[], messageId: number, disposition: TelegramQueueReactionDisposition, destinationLaneOrder?: number, scope?: TelegramQueueMessageScope): {
@@ -619,11 +613,13 @@ export type TelegramSessionLifecycleHookEvent = unknown;
 export declare function createTelegramSessionStateApplier<TQueueItem, TModel>(deps: TelegramSessionStateApplierDeps<TQueueItem, TModel>): TelegramSessionStateApplier<TQueueItem, TModel>;
 export interface TelegramQueueMutationRuntimeDeps<TContext> extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
     ctx: TContext;
+    hasPendingDispatch?: () => boolean;
     allocateLaneOrder?: () => number;
     onItemsDiscarded?: (items: readonly TelegramQueueItem<TContext>[], ctx: TContext) => void;
     updateStatus: (ctx: TContext) => void;
 }
 export interface TelegramQueueMutationControllerDeps<TContext> extends TelegramQueueStore<TContext>, TelegramRuntimeEventRecorderPort {
+    hasPendingDispatch?: () => boolean;
     allocateLaneOrder?: () => number;
     onItemsDiscarded?: (items: readonly TelegramQueueItem<TContext>[], ctx: TContext) => void;
     updateStatus: (ctx: TContext) => void;
@@ -680,10 +676,8 @@ export declare function createTelegramSessionLifecycleHooks<TContext, TQueueItem
     onSessionShutdown: (_event?: TelegramSessionLifecycleHookEvent, ctx?: TContext) => Promise<void>;
 };
 export declare function createTelegramQueueMutationController<TContext>(deps: TelegramQueueMutationControllerDeps<TContext>): TelegramQueueMutationController<TContext>;
-export declare function reorderTelegramQueueItemsRuntime<TContext>(deps: TelegramQueueMutationRuntimeDeps<TContext>): void;
 export declare function clearTelegramQueueItemsRuntime<TContext>(deps: TelegramQueueMutationRuntimeDeps<TContext>): number;
 export declare function removeTelegramQueueItemsByMessageIdsRuntime<TContext>(messageIds: number[], deps: TelegramQueueMutationRuntimeDeps<TContext>, scope?: TelegramQueueMessageScope): number;
-export declare function removeTelegramQueuedGuestPromptByOrderRuntime<TContext>(queueOrder: number, deps: TelegramQueueMutationRuntimeDeps<TContext>): boolean;
 export declare function applyTelegramQueuePromptReactionDispositionRuntime<TContext>(messageId: number, disposition: TelegramQueueReactionDisposition, deps: TelegramQueueMutationRuntimeDeps<TContext>, scope?: TelegramQueueMessageScope): boolean;
 export declare function enqueueTelegramPromptTurnRuntime<TMessage, TContext = unknown>(messages: TMessage[], deps: TelegramPromptEnqueueRuntimeDeps<TMessage, TContext>): Promise<PendingTelegramTurn>;
 export declare function createTelegramPromptEnqueueController<TMessage, TContext = unknown>(deps: TelegramPromptEnqueueControllerDeps<TMessage, TContext>): TelegramPromptEnqueueController<TMessage, TContext>;
@@ -695,6 +689,7 @@ export interface TelegramControlRuntimeDeps<TContext> extends TelegramRuntimeEve
     ctx: TContext;
     sendTextReply: (chatId: number, replyToMessageId: number, text: string, options?: {
         target?: TelegramQueueTarget;
+        parseMode?: "HTML";
     }) => Promise<number | undefined>;
     onSettled: (item: PendingTelegramControlItem<TContext>) => void;
 }
@@ -712,11 +707,6 @@ export interface TelegramDeferredQueueDispatchRuntime<TContext = unknown> {
     isGenerationActive: (generation: number) => boolean;
     request: (dispatchNextQueuedTelegramTurn: (ctx: TContext) => void) => void;
 }
-/**
- * Production debounce for deferred queue dispatch; the factory defaults to this
- * so the entrypoint wires ports instead of policy constants.
- */
-export declare const TELEGRAM_DEFERRED_DISPATCH_DELAY_MS = 50;
 export declare function createTelegramDeferredQueueDispatchRuntime<TContext = unknown>(deps?: TelegramDeferredQueueDispatchRuntimeDeps): TelegramDeferredQueueDispatchRuntime<TContext>;
 export interface TelegramQueueDispatchWatchdogRuntime<TContext = unknown> {
     start: (ctx: TContext) => void;

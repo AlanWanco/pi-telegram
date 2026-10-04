@@ -3,7 +3,8 @@
  * Zones: telegram threads, workspace lifecycle
  */
 
-import { mkdtemp, mkdir, readdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, symlink, readFile } from "node:fs/promises";
+import { readdirSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
@@ -12,14 +13,19 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import nodeTest from "node:test";
 
-import { captureTelegramInactiveThreadCleanupEvidence,
-  cleanReviewedInactiveThreads, commitTelegramInactiveThreadCleanup,
+import {
+  captureTelegramInactiveThreadCleanupEvidence,
+  cleanReviewedInactiveThreads,
+  commitTelegramInactiveThreadCleanup,
   createTelegramInactiveThreadCleanupReviewRuntime,
   createTelegramInactiveThreadCleanupSettingsPort,
   createTelegramThreadCleanupPermitRuntime,
-  createTelegramThreadCleanupWorkStore, executeTelegramInactiveThreadCleanup,
-  planTelegramInactiveThreadCleanup } from "../lib/thread-cleanup-manager.ts";
+  createTelegramThreadCleanupWorkStore,
+  executeTelegramInactiveThreadCleanup,
+  planTelegramInactiveThreadCleanup,
+} from "../lib/thread-cleanup-manager.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
+import { resolveTelegramServiceJournalStorage, resolveTelegramTempDir } from "../lib/paths.ts";
 
 const binding = {
   cwd: "/repo/a", workspaceKey: "workspace:a", instanceSlot: "a", slot: "A", bindingKey: "binding:a",
@@ -41,6 +47,64 @@ const clear = {
   liveOwner: "clear" as const, acceptedWork: "clear" as const,
   deliveryAuthority: "clear" as const,
 };
+
+test("Consolidated cleanup storage retains issued one-shot work and puts guards/staging only under runtime", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-cleanup-layout-"));
+  try {
+    const storage = resolveTelegramServiceJournalStorage("thread-cleanup", dir, "work");
+    let now = 100, staged = false;
+    const options = { ...storage, profileName: "work", tokenSha256: "a".repeat(64), getNowMs: () => now,
+      onPublicationBoundary(boundary: "after-write-before-rename" | "after-rename") {
+        if (boundary === "after-write-before-rename") {
+          staged = true;
+          assert.equal(readdirSync(storage.runtimeDir).filter(name => name.endsWith(".tmp")).length, 1);
+          assert.equal(readdirSync(join(resolveTelegramTempDir(dir), "journals")).some(name => name.endsWith(".tmp") || name.includes("transaction")), false);
+        }
+      } };
+    const store = createTelegramThreadCleanupWorkStore(options);
+    const candidate = planTelegramInactiveThreadCleanup({ profileName: "work", bindings: [binding], protection: [clear] })[0]!;
+    store.prepare("cleanup-1", [candidate]);
+    now = 110;
+    const permit = { destructiveKind: "manual-thread-cleanup" as const, operationId: "permit-op", retirementIntentId: "cleanup-1",
+      profileKey: "work", bindingKey: "binding:a", slot: "A", target: { chatId: -1001, threadId: 7 }, leaderEpoch: 3, issuedAtMs: 105 };
+    store.recordDeletionIssued({ operationId: "cleanup-1", bindingKey: "binding:a", bindingUpdatedAtMs: 20, permit });
+    const reopened = createTelegramThreadCleanupWorkStore({ ...storage, profileName: "work", tokenSha256: "a".repeat(64) });
+    assert.equal(reopened.list()[0]?.entries[0]?.state, "outcome-unknown");
+    assert.equal(reopened.recordDeletionIssued({ operationId: "cleanup-1", bindingKey: "binding:a", bindingUpdatedAtMs: 20, permit }).recorded, false);
+    assert.equal(staged, true);
+    assert.equal((await readdir(storage.runtimeDir)).some(name => name.endsWith(".tmp")), false);
+    assert.deepEqual((await readdir(resolveTelegramTempDir(dir))).sort(), ["journals", "runtime"]);
+    assert.equal((await readdir(join(resolveTelegramTempDir(dir), "journals"))).length, 1);
+    assert.throws(() => createTelegramThreadCleanupWorkStore({ ...storage, profileName: "work", tokenSha256: "a".repeat(64),
+      runtimeDir: join(dir, "foreign-runtime") }), /approved absolute path/u);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ["after-write-before-rename", "after-rename"] as const) {
+  test(`Consolidated cleanup staging fault preserves canonical issued facts at ${boundary}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-cleanup-layout-fault-"));
+    try {
+      const storage = resolveTelegramServiceJournalStorage("thread-cleanup", dir, "work");
+      let inject = false;
+      const store = createTelegramThreadCleanupWorkStore({ ...storage, profileName: "work", tokenSha256: "a".repeat(64), getNowMs: () => 110,
+        onPublicationBoundary(at) { if (inject && at === boundary) throw new Error("lost fixture reply"); } });
+      const candidate = planTelegramInactiveThreadCleanup({ profileName: "work", bindings: [binding], protection: [clear] })[0]!;
+      store.prepare("cleanup-1", [candidate]);
+      const before = await readFile(storage.path, "utf8");
+      inject = true;
+      const permit = { destructiveKind: "manual-thread-cleanup" as const, operationId: "permit-op", retirementIntentId: "cleanup-1",
+        profileKey: "work", bindingKey: "binding:a", slot: "A", target: { chatId: -1001, threadId: 7 }, leaderEpoch: 3, issuedAtMs: 105 };
+      assert.throws(() => store.recordDeletionIssued({ operationId: "cleanup-1", bindingKey: "binding:a", bindingUpdatedAtMs: 20, permit }), /lost fixture reply/u);
+      const reopened = createTelegramThreadCleanupWorkStore({ ...storage, profileName: "work", tokenSha256: "a".repeat(64) });
+      if (boundary === "after-write-before-rename") assert.equal(await readFile(storage.path, "utf8"), before);
+      else {
+        assert.equal(reopened.list()[0]?.entries[0]?.state, "outcome-unknown");
+        assert.equal(reopened.recordDeletionIssued({ operationId: "cleanup-1", bindingKey: "binding:a", bindingUpdatedAtMs: 20, permit }).recorded, false);
+      }
+      assert.equal((await readdir(storage.runtimeDir)).some(name => name.endsWith(".tmp")), false);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Cleanup planner admits only exact fully-clear inactive bindings", () => {
   assert.deepEqual(planTelegramInactiveThreadCleanup({

@@ -10,7 +10,6 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -23,6 +22,8 @@ import {
   classifyTelegramRuntimeRecovery,
   createTelegramPollingStartRecoveryHandler,
   recoverTelegramRuntimeState,
+  removeTelegramLegacyRecoveryStorage,
+  createTelegramSessionFolderSweeper,
 } from "../lib/recovery.ts";
 
 function createRuntimePaths(): {
@@ -235,7 +236,7 @@ test("Runtime recovery classification rejects mismatched transaction generations
   }
 });
 
-test("Runtime recovery quarantines only corrupt disposable artifacts", () => {
+test("Runtime recovery deletes only corrupt disposable artifacts and never quarantines", () => {
   const paths = createRuntimePaths();
   try {
     const configPath = join(paths.dir, "telegram.json");
@@ -273,38 +274,23 @@ test("Runtime recovery quarantines only corrupt disposable artifacts", () => {
       JSON.stringify({ botToken: "preserved" }),
     );
     assert.equal(readFileSync(logsPath, "utf8"), "diagnostic\n");
-    if (result.kind === "recovered") {
-      assert.deepEqual(readdirSync(result.quarantineDir).sort(), [
-        "owners.json",
-        "owners.json.transaction",
-        "state.json",
-      ]);
-    }
+    assert.deepEqual(result.kind === "recovered" ? [...result.deletedPaths].sort() : [],
+      [paths.ownersPath, paths.statePath, paths.transactionPath].sort());
+    assert.equal(existsSync(join(paths.dir, "recovery")), false, "No recovery quarantine is created");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
 });
 
-test("Runtime recovery retries transient Windows quarantine rename failures", () => {
+test("Runtime recovery leaves corruption retryable when deletion fails", () => {
   const paths = createRuntimePaths();
   try {
     writeFileSync(paths.ownersPath, "{truncated");
-    let renameAttempts = 0;
-    const result = recoverTelegramRuntimeState({
-      ownersPath: paths.ownersPath,
-      statePaths: [paths.statePath],
-      isProcessAlive: () => false,
-      quarantineRename: (sourcePath, destinationPath) => {
-        renameAttempts += 1;
-        if (renameAttempts < 3) {
-          throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
-        }
-        renameSync(sourcePath, destinationPath);
-      },
-      quarantineRenameRetryDelayMs: 0,
-    });
-    assert.equal(result.kind, "recovered");
-    assert.equal(renameAttempts, 3);
+    const input = { ownersPath: paths.ownersPath, statePaths: [paths.statePath], isProcessAlive: () => false };
+    assert.throws(() => recoverTelegramRuntimeState({ ...input,
+      removePath() { throw Object.assign(new Error("sharing violation"), { code: "EPERM" }); } }), /sharing violation/u);
+    assert.equal(readFileSync(paths.ownersPath, "utf8"), "{truncated");
+    assert.equal(recoverTelegramRuntimeState(input).kind, "recovered");
     assert.equal(existsSync(paths.ownersPath), false);
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
@@ -383,7 +369,7 @@ test("Polling-start recovery blocks mutation when polling cannot stop safely", a
   const paths = createRuntimePaths();
   try {
     writeFileSync(paths.ownersPath, "{truncated");
-    writeFileSync(paths.statePath, "{truncated");
+    writeFileSync(paths.statePath, "{}");
     const events: Array<{ category: string; phase?: unknown }> = [];
     const recover = createTelegramPollingStartRecoveryHandler({
       getOwnersPath: () => paths.ownersPath,
@@ -404,7 +390,7 @@ test("Polling-start recovery blocks mutation when polling cannot stop safely", a
       /could not stop safely/,
     );
     assert.equal(readFileSync(paths.ownersPath, "utf8"), "{truncated");
-    assert.equal(readFileSync(paths.statePath, "utf8"), "{truncated");
+    assert.equal(readFileSync(paths.statePath, "utf8"), "{}");
     assert.deepEqual(events, [
       { category: "recovery", phase: "suspend-before-reset" },
     ]);
@@ -412,6 +398,27 @@ test("Polling-start recovery blocks mutation when polling cannot stop safely", a
     rmSync(paths.dir, { recursive: true, force: true });
   }
 });
+
+for (const when of ["before-start", "during-suspension", "oversize"] as const) {
+  test(`Polling-start recovery deletes unreadable canonical state as acceptable loss (${when})`, async () => {
+    const paths = createRuntimePaths();
+    try {
+      writeFileSync(paths.ownersPath, "{truncated");
+      const corrupt = when === "oversize" ? JSON.stringify({ workspaceRestore: { future: "x".repeat(8 * 1024 * 1024) } }) : '{"workspaceRestore":{"operations":[';
+      writeFileSync(paths.statePath, when === "during-suspension" ? "{}" : corrupt);
+      let suspended = false;
+      const recover = createTelegramPollingStartRecoveryHandler({
+        getOwnersPath: () => paths.ownersPath, getStatePaths: () => [paths.statePath],
+        async suspendPolling() { suspended = true; writeFileSync(paths.statePath, corrupt); },
+      });
+      const result = await recover();
+      assert.equal(result.kind, "retry");
+      assert.equal(suspended, true, "Polling stops before any deletion");
+      assert.equal(existsSync(paths.statePath), false, "Operator policy: unfinished Restores in unreadable state are acceptable loss");
+      assert.equal(existsSync(join(paths.dir, "recovery")), false);
+    } finally { rmSync(paths.dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Polling-start recovery continues after suspension when corrupt owners prevent release", async () => {
   const paths = createRuntimePaths();
@@ -451,36 +458,6 @@ test("Runtime recovery becomes a no-op after the first successful repair", () =>
     };
     assert.equal(recoverTelegramRuntimeState(input).kind, "recovered");
     assert.deepEqual(recoverTelegramRuntimeState(input), { kind: "not-needed" });
-  } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
-  }
-});
-
-test("Runtime recovery leaves corruption retryable when quarantine creation fails", () => {
-  const paths = createRuntimePaths();
-  try {
-    const invalidQuarantineRoot = join(paths.dir, "not-a-directory");
-    writeFileSync(paths.ownersPath, "{truncated");
-    writeFileSync(invalidQuarantineRoot, "occupied");
-    assert.throws(
-      () =>
-        recoverTelegramRuntimeState({
-          ownersPath: paths.ownersPath,
-          statePaths: [paths.statePath],
-          quarantineRoot: invalidQuarantineRoot,
-          isProcessAlive: () => false,
-        }),
-      /not-a-directory|ENOTDIR|EEXIST/u,
-    );
-    assert.equal(readFileSync(paths.ownersPath, "utf8"), "{truncated");
-    assert.equal(
-      recoverTelegramRuntimeState({
-        ownersPath: paths.ownersPath,
-        statePaths: [paths.statePath],
-        isProcessAlive: () => false,
-      }).kind,
-      "recovered",
-    );
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
@@ -554,7 +531,57 @@ test("Concurrent process recovery elects one mutator for malformed runtime state
     assert.equal(existsSync(paths.ownersPath), false);
     assert.equal(existsSync(paths.statePath), false);
     assert.equal(existsSync(paths.transactionPath), false);
-    assert.equal(readdirSync(join(paths.dir, "recovery")).length, 1);
+    assert.equal(existsSync(join(paths.dir, "recovery")), false);
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("Legacy recovery folders are removed from the runtime root and session folders only", () => {
+  const paths = createRuntimePaths();
+  try {
+    const sessionRecovery = join(paths.dir, "sessions", "session-a", "recovery");
+    mkdirSync(join(paths.dir, "recovery", "1-2-x"), { recursive: true });
+    writeFileSync(join(paths.dir, "recovery", "1-2-x", "owners.json"), "{truncated");
+    mkdirSync(sessionRecovery, { recursive: true });
+    writeFileSync(join(paths.dir, "sessions", "session-a", "journal.0123456789abcdef.json"), "{}");
+    writeFileSync(join(paths.dir, "recovery-note"), "kept");
+    assert.deepEqual(removeTelegramLegacyRecoveryStorage(paths.dir).sort(), [join(paths.dir, "recovery"), sessionRecovery].sort());
+    assert.equal(existsSync(join(paths.dir, "recovery")), false);
+    assert.equal(existsSync(sessionRecovery), false);
+    assert.equal(readFileSync(join(paths.dir, "sessions", "session-a", "journal.0123456789abcdef.json"), "utf8"), "{}");
+    assert.equal(readFileSync(join(paths.dir, "recovery-note"), "utf8"), "kept");
+    assert.deepEqual(removeTelegramLegacyRecoveryStorage(paths.dir), [], "Idempotent");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("Session sweeper removes unbound current-profile journals and empty folders only", () => {
+  const paths = createRuntimePaths();
+  try {
+    const sessions = join(paths.dir, "sessions");
+    const family = (session: string, profileSuffix = "") => {
+      mkdirSync(join(sessions, session, `journal.0123456789abcdef${profileSuffix}.json.segments`), { recursive: true });
+      writeFileSync(join(sessions, session, `journal.0123456789abcdef${profileSuffix}.json`), "{}");
+    };
+    family("bound"); family("unbound"); family("shared"); family("shared", ".other"); family("live");
+    mkdirSync(join(sessions, "%61"), { recursive: true });
+    let now = 0, kept: (string | undefined)[] = ["bound", "live", undefined];
+    const sweeper = createTelegramSessionFolderSweeper({ getSessionsDir: () => sessions, getProfileName: () => "default",
+      getKeptSessionIds: () => kept, getNowMs: () => now, intervalMs: 1000 });
+    const removed = sweeper.sweep();
+    assert.deepEqual(readdirSync(sessions).sort(), ["%61", "bound", "live", "shared"].sort(),
+      "Unbound folder removed; noncanonical names untouched");
+    assert.deepEqual(readdirSync(join(sessions, "shared")).sort(), ["journal.0123456789abcdef.other.json", "journal.0123456789abcdef.other.json.segments"],
+      "Another profile's family keeps the shared folder");
+    assert.ok(removed.includes(join(sessions, "unbound")));
+    kept = ["live"];
+    now = 500;
+    assert.deepEqual(sweeper.sweep(), [], "Throttled between sweeps");
+    now = 1000;
+    sweeper.sweep();
+    assert.deepEqual(readdirSync(sessions).sort(), ["%61", "live", "shared"].sort(), "A session that lost its slot is swept later");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }

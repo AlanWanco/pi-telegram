@@ -4,7 +4,10 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, normalize, relative } from "node:path";
 import test from "node:test";
 
@@ -350,8 +353,9 @@ test("Production journal writers remain scoped or lifecycle-owned", () => {
 
 test("Production profile-only storage callbacks cannot reinterpret profile names as agent directories", () => {
   const source = readFileSync(join(PROJECT_ROOT, "lib/extension.ts"), "utf8");
-  assert.match(source, /getPath: Paths\.resolveTelegramWorkspaceAdmissionPathForProfile/u);
-  assert.match(source, /getLeaderJournalPath: Paths\.resolveTelegramUpdateJournalPathForProfile/u);
+  assert.match(source, /getStatePath: Paths\.resolveTelegramStatePath,/u);
+  assert.match(source, /path: Paths\.resolveTelegramStatePath,/u);
+  assert.match(source, /getLeaderJournalPath: telegramLeaderJournalPath\.resolve,/u);
   assert.doesNotMatch(source, /getPath: Paths\.resolveTelegramWorkspaceAdmissionPath[,\n]/u);
   assert.doesNotMatch(source, /getLeaderJournalPath: Paths\.resolveTelegramUpdateJournalPath[,\n]/u);
 });
@@ -459,10 +463,6 @@ test("Automatic Workspace retirement stays disconnected from production composit
   assert.match(
     compositionSource,
     /createTelegramBusFollowerPromotionHandler[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve[\s\S]*?startLeader/u,
-  );
-  assert.match(
-    compositionSource,
-    /targetReplacement:\s*\{[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve[\s\S]*?getSyncState/u,
   );
   assert.match(
     compositionSource,
@@ -614,4 +614,65 @@ test("Outbound attachment delivery stays decoupled from queue, inbound media, an
   assert.equal(attachmentImports.includes("./queue.ts"), false);
   assert.equal(attachmentImports.includes("./media.ts"), false);
   assert.equal(attachmentImports.includes("./telegram-api.ts"), false);
+});
+
+await test("Export audit resolves aliases, namespace access, public stars and JS consumers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-export-audit-"));
+  try {
+    for (const name of ["lib", "api", "tests", "scripts"]) await mkdir(join(root, name));
+    await writeFile(join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: { module: "NodeNext", moduleResolution: "NodeNext", noEmit: true },
+      include: ["lib/**/*.ts"],
+    }));
+    await writeFile(join(root, "lib/sample.ts"), `
+      export interface Local { ok: boolean }
+      export interface External { ok: boolean }
+      export type Unused = string;
+      export const leaf = 1;
+      export const read = (value: Local) => value.ok ? leaf : 0;
+      export const publicValue = 2;
+      export const namespaceAccess = 3;
+      export const scriptOnly = 4;
+      export const mentionedInText = 5;
+      export const shadow = 6;
+    `);
+    await writeFile(join(root, "lib/public.ts"), "export const publicStar = 1;");
+    await writeFile(join(root, "lib/namespace.ts"), "export const publicNamespaceValue = 1;");
+    await writeFile(join(root, "api/sample.ts"), `
+      export { publicValue as published } from "../lib/sample.ts";
+      export * from "../lib/public.ts";
+      export * as publicNamespace from "../lib/namespace.ts";
+    `);
+    await writeFile(join(root, "tests/consumer.ts"), `
+      import type { External as ConsumerType } from "../lib/sample.ts";
+      import * as sample from "../lib/sample.ts";
+      const value: ConsumerType = { ok: true };
+      console.log(value, sample["namespaceAccess"]);
+      console.log(Object.keys(sample));
+      const shadow = 7;
+      console.log(shadow);
+      const generated = 'import { mentionedInText } from "../lib/sample.ts"';
+      console.log(generated);
+    `);
+    await writeFile(join(root, "scripts/consumer.mjs"), `
+      import { scriptOnly as used } from "../lib/sample.ts";
+      console.log(used);
+    `);
+    const script = join(PROJECT_ROOT, "scripts/audit-exports.mjs");
+    const report = JSON.parse(execFileSync(process.execPath, [script, root], { encoding: "utf8" })) as {
+      scannedSources: number;
+      libExports: number;
+      candidates: Array<{ file: string; name: string; typeOnly: boolean; localReferences: number; namespaceEscapes: string[] }>;
+    };
+    assert.equal(report.scannedSources, 6);
+    assert.equal(report.libExports, 12);
+    assert.deepEqual(report.candidates.map(row => row.name), ["Local", "Unused", "leaf", "read", "mentionedInText", "shadow"]);
+    assert.equal(report.candidates.find(row => row.name === "Local")?.typeOnly, true);
+    assert.equal(report.candidates.find(row => row.name === "leaf")?.localReferences, 1);
+    assert.equal(report.candidates.find(row => row.name === "shadow")?.localReferences, 0);
+    assert.equal(report.candidates.find(row => row.name === "mentionedInText")?.localReferences, 0);
+    assert.ok(report.candidates.every(row => row.namespaceEscapes.length === 1 && row.namespaceEscapes[0] === "tests/consumer.ts"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

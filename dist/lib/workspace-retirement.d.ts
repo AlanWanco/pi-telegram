@@ -4,10 +4,10 @@
  * Owns fail-closed protection, demand-driven pressure retirement, exact-intent admission,
  * successor recovery, and fenced one-shot deletion before durable slot reuse.
  */
-import type { TelegramUpdateJournalDeadQueueOwnerRecoveryInput, TelegramUpdateJournalDeadQueueOwnerRecoveryResult, TelegramUpdateJournalEntry, TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
-import type { TelegramTarget } from "./target.ts";
+import type { TelegramJournalNamespaceInspection, TelegramUpdateJournalDeadQueueOwnerRecoveryInput, TelegramUpdateJournalDeadQueueOwnerRecoveryResult, TelegramUpdateJournalEntry, TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
+import { type TelegramTarget } from "./target.ts";
 import { type TelegramWorkspaceThreadDeletionTransport } from "./telegram-api.ts";
-import type { TelegramTopicTargetStore, TelegramWorkspaceExternalProtectionEvidence, TelegramWorkspaceRetirementIntent, TelegramWorkspaceProtectionState, TelegramWorkspaceThreadBinding } from "./threads.ts";
+import type { TelegramTopicTargetStore, TelegramWorkspaceJournalSource, TelegramWorkspaceExternalProtectionEvidence, TelegramWorkspaceRetirementIntent, TelegramWorkspaceProtectionState, TelegramWorkspaceThreadBinding } from "./threads.ts";
 import { type TelegramWorkspaceAdmissionLedger, type TelegramWorkspaceAdmissionScope, type TelegramWorkspaceDeletionPermit } from "./workspace-admission.ts";
 export interface TelegramWorkspaceOperationGate {
     runExclusive: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -36,18 +36,21 @@ interface TelegramWorkspaceJournalReader {
             entries: readonly {
                 update: unknown;
             }[];
+            exists?: boolean;
         };
     };
     readForProtection?: () => {
         entries: readonly {
             update: unknown;
         }[];
+        exists?: boolean;
     };
 }
 export declare function captureTelegramWorkspaceJournalProtectionSources(input: {
     binding: TelegramWorkspaceThreadBinding;
     resolveLeader: () => TelegramWorkspaceJournalReader | undefined;
     createFollowerResolver: (journalBindingKey: string) => () => TelegramWorkspaceJournalReader | undefined;
+    createSessionResolver?: (recipientBindingKey: string, sessionId: string) => () => TelegramWorkspaceJournalReader | undefined;
     withJournalReference?: <T>(binding: TelegramWorkspaceJournalReader, operation: () => T) => T;
     discovery?: {
         paths: readonly string[];
@@ -63,6 +66,7 @@ export type TelegramWorkspaceJournalProtectionSource = {
         kind: "binding";
         bindingKey: string;
         journalBindingKey: string;
+        sessionId?: string;
     } | {
         kind: "discovered";
         path: string;
@@ -70,6 +74,8 @@ export type TelegramWorkspaceJournalProtectionSource = {
     entries: readonly {
         update: unknown;
     }[];
+    /** Positive filesystem presence is distinct from a complete namespace with a missing historical family. */
+    exists?: boolean;
 } | {
     kind: "unknown";
     scope: {
@@ -78,6 +84,7 @@ export type TelegramWorkspaceJournalProtectionSource = {
         kind: "binding";
         bindingKey: string;
         journalBindingKey: string;
+        sessionId?: string;
     } | {
         kind: "discovered";
         path: string;
@@ -91,19 +98,24 @@ export declare function resolveTelegramWorkspaceAcceptedWorkProtection(input: {
     }[];
     journalSources: readonly TelegramWorkspaceJournalProtectionSource[];
     sourcesComplete: boolean;
+    /** Relocation cannot infer execution ownership from the original Telegram message target. */
+    requireBindingProvenance?: boolean;
 }): TelegramWorkspaceProtectionState;
 export type TelegramWorkspaceJournalPruneResult = {
     kind: "committed";
     binding: TelegramWorkspaceThreadBinding;
     removedKeys: string[];
+    removedSources?: TelegramWorkspaceJournalSource[];
 } | {
     kind: "blocked";
-    reason: "incomplete-evidence" | "writer-not-quiescent" | "state-changed";
+    reason: "incomplete-evidence" | "writer-not-quiescent" | "state-changed" | "publication-refused";
 };
 export declare function pruneTelegramWorkspaceJournalEvidence(input: {
-    store: Pick<TelegramTopicTargetStore, "commitWorkspaceJournalEvidence" | "persist">;
+    store: Pick<TelegramTopicTargetStore, "commitWorkspaceJournalEvidence" | "persistWorkspaceJournalEvidence">;
     binding: TelegramWorkspaceThreadBinding;
-    capture: TelegramWorkspaceJournalProtectionCapture;
+    /** Capture fresh source evidence after admission, not a snapshot taken before the lease. */
+    capture: () => TelegramWorkspaceJournalProtectionCapture;
+    runExclusive: TelegramWorkspaceOperationGate["runExclusive"];
     getJournalWriterProtection: (journalBindingKey: string) => TelegramWorkspaceProtectionState;
     getLeaderEpoch: () => number | string | undefined;
     getProfileKey: () => string;
@@ -113,6 +125,7 @@ export declare function pruneTelegramWorkspaceJournalEvidence(input: {
 }): Promise<TelegramWorkspaceJournalPruneResult>;
 export declare function captureTelegramWorkspaceExternalProtection(input: {
     binding: TelegramWorkspaceThreadBinding;
+    requireBindingProvenance?: boolean;
     getLiveOwnerProtection: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceProtectionState;
     getLocalAcceptedTargets: (binding: TelegramWorkspaceThreadBinding) => {
         targets: readonly TelegramTarget[];
@@ -121,7 +134,7 @@ export declare function captureTelegramWorkspaceExternalProtection(input: {
     captureJournalSources: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceJournalProtectionCapture;
     getDeliveryAuthorityProtection?: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceProtectionState;
 }): TelegramWorkspaceExternalProtectionEvidence;
-export declare function createTelegramWorkspaceExternalProtectionCapture(deps: {
+interface TelegramWorkspaceProtectionObserverDeps {
     listFollowers: () => readonly {
         target?: TelegramTarget;
     }[];
@@ -132,15 +145,35 @@ export declare function createTelegramWorkspaceExternalProtectionCapture(deps: {
     }[];
     resolveLeaderJournal: () => TelegramWorkspaceJournalReader | undefined;
     createFollowerJournalResolver: (journalBindingKey: string) => () => TelegramWorkspaceJournalReader | undefined;
+    createSessionJournalResolver?: (recipientBindingKey: string, sessionId: string) => () => TelegramWorkspaceJournalReader | undefined;
     discoverFollowerJournals?: () => {
         paths: readonly string[];
         complete: boolean;
     };
+    /** Strict read-only namespace evidence; it never substitutes for writer closure. */
+    inspectJournalNamespace?: () => TelegramJournalNamespaceInspection;
     createJournalPathResolver?: (path: string) => () => TelegramWorkspaceJournalReader | undefined;
     withJournalReference?: <T>(binding: TelegramWorkspaceJournalReader, operation: () => T) => T;
     getJournalWriterProtection?: (journalBindingKey: string) => TelegramWorkspaceProtectionState;
     getDeliveryAuthorityProtection?: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceProtectionState;
-}): (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence;
+}
+export interface TelegramWorkspaceProtectionObserver {
+    capture: (binding: TelegramWorkspaceThreadBinding, options?: {
+        requireBindingProvenance?: boolean;
+    }) => TelegramWorkspaceExternalProtectionEvidence;
+    captureJournalSources: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceJournalProtectionCapture;
+    getJournalWriterProtection: (journalBindingKey: string) => TelegramWorkspaceProtectionState;
+}
+/** Shared read-only observer: protection and metadata pruning use the same scoped evidence path. */
+export declare function createTelegramWorkspaceProtectionObserver(deps: TelegramWorkspaceProtectionObserverDeps): TelegramWorkspaceProtectionObserver;
+/** Callable protection view retained for callers that need no metadata observation ports. */
+export declare function createTelegramWorkspaceExternalProtectionCapture(deps: TelegramWorkspaceProtectionObserverDeps): TelegramWorkspaceProtectionObserver["capture"];
+export declare function createTelegramWorkspaceJournalEvidencePruner(deps: TelegramWorkspaceOperationGate & {
+    store: TelegramTopicTargetStore;
+    getAdmission: () => TelegramWorkspaceAdmissionLedger | undefined;
+    getLeaderEpoch: () => number | string | undefined;
+    protection: Pick<TelegramWorkspaceProtectionObserver, "captureJournalSources" | "getJournalWriterProtection">;
+}): (binding: TelegramWorkspaceThreadBinding, isCurrent: () => boolean) => Promise<TelegramWorkspaceJournalPruneResult>;
 export declare function isCurrentTelegramWorkspaceBinding(store: Pick<TelegramTopicTargetStore, "listWorkspaceBindings">, expected: TelegramWorkspaceThreadBinding): boolean;
 export interface TelegramWorkspaceDeadQueueJournalBinding {
     recoveryKey?: string;
@@ -175,6 +208,7 @@ export declare function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps: {
     }[];
     resolveLeaderJournal: () => TelegramWorkspaceDeadQueueJournalBinding | undefined;
     createFollowerJournalResolver: (journalBindingKey: string) => () => TelegramWorkspaceDeadQueueJournalBinding | undefined;
+    createSessionJournalResolver?: (recipientBindingKey: string, sessionId: string) => () => TelegramWorkspaceDeadQueueJournalBinding | undefined;
     discoverFollowerJournals?: () => {
         paths: readonly string[];
         complete: boolean;
@@ -278,6 +312,7 @@ export type TelegramWorkspaceCapacityRunner = <T>(operation: () => Promise<T>) =
 export interface TelegramWorkspaceSlotRotationPorts extends TelegramWorkspaceOperationGate {
     getAdmission: () => TelegramWorkspaceAdmissionLedger | undefined;
     deleteThread: TelegramWorkspaceThreadDeletionTransport;
+    pruneJournalEvidence?: (binding: TelegramWorkspaceThreadBinding, isCurrent: () => boolean) => Promise<TelegramWorkspaceJournalPruneResult>;
     reclaimDeadOwnerQueuedWork?: (binding: TelegramWorkspaceThreadBinding, isCurrent: () => boolean) => Promise<TelegramWorkspaceDeadQueueReclamation>;
 }
 /** Retry allocation once, only after the failed operation released all ordinary leases. */

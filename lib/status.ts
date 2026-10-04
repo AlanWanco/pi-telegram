@@ -1,8 +1,11 @@
 /**
  * Telegram status rendering helpers
  * Zones: telegram ui, pi agent diagnostics, tui
- * Owns status summaries, redacted runtime diagnostics, and compact connection-failure copy
+ * Owns status summaries, redacted diagnostics, projection lifecycle and compact connection-failure copy
+ * Excludes canonical state, transport admission and filesystem policy
  */
+
+import { isDeepStrictEqual } from "node:util";
 
 /** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
 export function formatTelegramConnectionFailure(error: unknown): string {
@@ -463,7 +466,7 @@ function truncateTelegramRuntimeEventText(
   return `${text.slice(0, maxLength).trimEnd()}… [truncated ${text.length - maxLength} chars]`;
 }
 
-export function redactTelegramRuntimeMessage(
+function redactTelegramRuntimeMessage(
   message: string,
   botToken: string | undefined,
 ): string {
@@ -579,7 +582,7 @@ export function registerTelegramStatusLineProvider(
   };
 }
 
-export function getTelegramStatusLineProviderResults(
+function getTelegramStatusLineProviderResults(
   ctx: TelegramStatusLineProviderContext,
 ): TelegramStatusLineProviderResult[] {
   const results: TelegramStatusLineProviderResult[] = [];
@@ -842,13 +845,19 @@ export function createTelegramRuntimeLogScope(input: {
   };
 }
 
-export function createTelegramStatusSnapshot(
-  state: TelegramBridgeStatusLineState,
-): {
+export interface TelegramStatusSnapshot {
   runtime: Record<string, unknown>;
   liveRoster: Record<string, unknown>;
   diagnostics: Record<string, unknown>;
-} {
+}
+export interface TelegramStoredRuntimeProjection extends TelegramStatusSnapshot {
+  version: 1;
+  source: "snapshot";
+  writtenAtMs: number;
+}
+export function createTelegramStatusSnapshot(
+  state: TelegramBridgeStatusLineState,
+): TelegramStatusSnapshot {
   return {
     runtime: {
       busRole: state.busRole,
@@ -869,7 +878,6 @@ export function createTelegramStatusSnapshot(
       ...(state.localBus ? { localBus: state.localBus } : {}),
       topicTargets: state.topicTargets ?? [],
       reservations: state.threadReservations ?? [],
-      syncObservations: state.topicSyncObservations ?? [],
     },
     diagnostics: {
       pendingDispatch: state.pendingDispatch,
@@ -883,17 +891,94 @@ export function createTelegramStatusSnapshot(
   };
 }
 
+function isRuntimeProjection(value: unknown): value is TelegramStoredRuntimeProjection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return record.version === 1 && record.source === "snapshot" && Number.isSafeInteger(record.writtenAtMs) && (record.writtenAtMs as number) >= 0 &&
+    Object.keys(record).every(key => ["version", "source", "writtenAtMs", "runtime", "liveRoster", "diagnostics"].includes(key)) &&
+    ["runtime", "liveRoster", "diagnostics"].every(key => record[key] !== null && typeof record[key] === "object" && !Array.isArray(record[key]));
+}
+export interface TelegramRuntimeProjectionScope {
+  path: string;
+  profile: string;
+}
+export interface TelegramRuntimeProjectionStorage {
+  read: (scope: TelegramRuntimeProjectionScope) => unknown;
+  /** The adapter must enforce exact owner plus the supplied physical/logical scope in one transaction. */
+  publish: (
+    scope: TelegramRuntimeProjectionScope,
+    mutate: (current: unknown) => { value: unknown; changed: boolean },
+    isCurrent: () => boolean,
+  ) => boolean;
+}
+export interface TelegramRuntimeProjectionStoreOptions {
+  getPath: () => string;
+  getProfile: () => string | undefined;
+  /** Capture exact owner/context/session authority at submission, never renew it after the queued await. */
+  captureAuthority: () => (() => boolean) | undefined;
+  storage: TelegramRuntimeProjectionStorage;
+  getNowMs?: () => number;
+}
+/** Observational runtime storage only; Workspace, admission, transport, logs and recovery remain with their owners. */
+export function createTelegramRuntimeProjectionStore(options: TelegramRuntimeProjectionStoreOptions): {
+  read: () => TelegramStoredRuntimeProjection | undefined;
+  persist: (snapshot: TelegramStatusSnapshot) => Promise<boolean>;
+} {
+  let publicationQueue = Promise.resolve();
+  const { getPath, getProfile: readProfile, captureAuthority } = options;
+  const { read, publish } = options.storage;
+  const getNowMs = options.getNowMs ?? Date.now;
+  const getProfile = (): string => readProfile() || TELEGRAM_STATUS_DEFAULT_PROFILE_NAME;
+  return {
+    read() {
+      try {
+        const path = getPath(), profile = getProfile(), value = read({ path, profile });
+        return getPath() === path && getProfile() === profile && isRuntimeProjection(value) ? value : undefined;
+      } catch { return undefined; }
+    },
+    async persist(snapshot) {
+      const path = getPath(), profile = getProfile(), authority = captureAuthority();
+      if (!authority) return false;
+      // Freeze wire content at submission, but do not duplicate the event log in persistent runtime state.
+      const semantic = JSON.parse(JSON.stringify({ version: 1, source: "snapshot", runtime: snapshot.runtime,
+        liveRoster: snapshot.liveRoster, diagnostics: snapshot.diagnostics })) as Omit<TelegramStoredRuntimeProjection, "writtenAtMs">;
+      if (!isRuntimeProjection({ ...semantic, writtenAtMs: 0 })) throw new Error("Telegram runtime projection is malformed.");
+      delete semantic.diagnostics.recentRuntimeEvents;
+      const isCurrent = (): boolean => getPath() === path && getProfile() === profile && authority() === true;
+      const publication = publicationQueue.then(() => {
+        if (!isCurrent()) return false;
+        return publish({ path, profile }, current => {
+          if (isRuntimeProjection(current)) {
+            const { writtenAtMs: _writtenAtMs, ...existing } = current;
+            if (isDeepStrictEqual(existing, semantic)) return { value: current, changed: false };
+          }
+          const writtenAtMs = getNowMs();
+          if (!Number.isSafeInteger(writtenAtMs) || writtenAtMs < 0) throw new Error("Telegram runtime projection timestamp is invalid.");
+          return { value: { ...semantic, writtenAtMs }, changed: true };
+        }, isCurrent) === true;
+      });
+      publicationQueue = publication.then(() => undefined, () => undefined);
+      return publication;
+    },
+  };
+}
+
 const TELEGRAM_DIAGNOSTICS_SNAPSHOT_COALESCE_MS = 100;
 
 export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
-  persistSnapshot: () => Promise<void>;
+  persistSnapshot: (isCurrent: () => boolean) => Promise<void>;
   recordError: (error: unknown) => void;
-  setTimer?: (callback: () => void, ms: number) => { unref?: () => void };
-}): () => void {
+  captureScope?: () => (() => boolean) | undefined;
+  setTimer?: (callback: () => void, ms: number) => { unref?: () => void } | number;
+  clearTimer?: (timer: { unref?: () => void } | number) => void;
+}): (() => void) & { resume(): void; suspend(): Promise<void> } {
   const setTimer = deps.setTimer ?? setTimeout;
-  let timer: { unref?: () => void } | number | undefined;
+  const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+  let generation = 0;
+  let enabled = true;
+  let timer: { token: object; handle: { unref?: () => void } | number } | undefined;
   let persistPromise: Promise<void> | undefined;
-  let pending = false;
+  let pending: (() => boolean) | undefined;
   const recordError = (error: unknown): void => {
     try {
       deps.recordError(error);
@@ -901,30 +986,72 @@ export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps: {
       // Snapshot diagnostics cannot create an unhandled scheduler rejection.
     }
   };
-  const request = (): void => {
-    if (timer || persistPromise) {
-      pending = true;
-      return;
+  const cancelTimer = (): void => {
+    const previous = timer;
+    timer = undefined;
+    if (previous) {
+      try { clearTimer(previous.handle); } catch (error) { recordError(error); }
     }
-    timer = setTimer(() => {
+  };
+  const capture = (): (() => boolean) | undefined => {
+    if (!enabled) return undefined;
+    const expectedGeneration = generation;
+    let scope: (() => boolean) | undefined;
+    try { scope = deps.captureScope ? deps.captureScope() : () => true; }
+    catch (error) { recordError(error); return undefined; }
+    if (!scope) return undefined;
+    return () => {
+      if (!enabled || generation !== expectedGeneration) return false;
+      try { return scope!(); } catch (error) { recordError(error); return false; }
+    };
+  };
+  const arm = (): void => {
+    if (timer || persistPromise || !pending) return;
+    const authority = pending;
+    if (!authority()) { pending = undefined; return; }
+    const token = {};
+    const handle = setTimer(() => {
+      if (timer?.token !== token) return;
       timer = undefined;
+      const publicationAuthority = pending;
+      pending = undefined;
+      if (!authority() || !publicationAuthority?.()) return;
       let tracked: Promise<void>;
       tracked = Promise.resolve()
-        .then(deps.persistSnapshot)
+        .then(() => publicationAuthority() ? deps.persistSnapshot(publicationAuthority) : undefined)
         .catch(recordError)
         .finally(() => {
           if (persistPromise !== tracked) return;
           persistPromise = undefined;
-          if (pending) {
-            pending = false;
-            request();
-          }
+          // Only an explicitly captured new request can arm a successor publication.
+          arm();
         });
       persistPromise = tracked;
     }, TELEGRAM_DIAGNOSTICS_SNAPSHOT_COALESCE_MS);
-    if (typeof timer !== "number") timer?.unref?.();
+    timer = { token, handle };
+    if (typeof handle !== "number") handle.unref?.();
   };
-  return request;
+  const request = (): void => {
+    const authority = capture();
+    if (!authority) return;
+    pending = authority;
+    arm();
+  };
+  return Object.assign(request, {
+    resume() {
+      generation += 1;
+      cancelTimer();
+      pending = undefined;
+      enabled = true;
+    },
+    suspend() {
+      enabled = false;
+      generation += 1;
+      cancelTimer();
+      pending = undefined;
+      return persistPromise ?? Promise.resolve();
+    },
+  });
 }
 
 export function getTelegramStatusBarProcessingStatus(state: {
@@ -1386,16 +1513,9 @@ function buildTelegramBridgeCompactStatusLines(
     : state.activeSourceMessageIds?.length
       ? "active"
       : "idle";
-  const diagnosticsProfileName =
-    state.activeProfileName === TELEGRAM_STATUS_DEFAULT_PROFILE_NAME
-      ? undefined
-      : state.activeProfileName;
-  const profileSuffix = diagnosticsProfileName
-    ? `.${diagnosticsProfileName.replace(/[^a-zA-Z0-9._-]+/g, "_")}`
-    : "";
   const diagnosticsPaths = state.diagnosticPaths ?? {
-    state: `~/.pi/agent/tmp/telegram/state${profileSuffix}.json`,
-    logs: `~/.pi/agent/tmp/telegram/logs${profileSuffix}.jsonl`,
+    state: "~/.pi/agent/tmp/pi-telegram/state.json",
+    logs: "~/.pi/agent/tmp/pi-telegram/logs.jsonl",
   };
   return [
     "connection:",
@@ -1447,7 +1567,7 @@ export function buildTelegramBridgeStatusLines(
   return buildTelegramBridgeCompactStatusLines(state);
 }
 
-export function buildTelegramBridgeDiagnosticStatusLines(
+function buildTelegramBridgeDiagnosticStatusLines(
   state: TelegramBridgeStatusLineState,
 ): string[] {
   const controlQueueCount = state.queuedItems.filter(
@@ -1624,7 +1744,7 @@ function buildTelegramStatusRoleSuffix(
   return ` @${state.busRole}`;
 }
 
-export function buildStatusHtml(
+function buildStatusHtml(
   ctx: TelegramStatusContext,
   activeModel: TelegramStatusActiveModel | undefined,
   bridgeStatus?: TelegramBridgeStatusLineState,

@@ -12,7 +12,6 @@ export interface TelegramUpdate {
 }
 export declare const TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT = 10;
 export declare const TELEGRAM_POLLING_RETRY_STOP_LIMIT = 8;
-export declare const TELEGRAM_GET_UPDATES_GRACE_MS = 10000;
 export declare const TELEGRAM_ALLOWED_UPDATES: readonly ["message", "edited_message", "callback_query", "message_reaction", "guest_message"];
 export declare function buildTelegramInitialSyncRequest(): {
     offset: number;
@@ -64,7 +63,6 @@ export interface TelegramPollingControllerState extends TelegramPollingStateSnap
     pollingController?: AbortController;
 }
 export declare function createTelegramPollingControllerState(): TelegramPollingControllerState;
-export declare function getTelegramPollingStateSnapshot(state: TelegramPollingControllerState): TelegramPollingStateSnapshot;
 export declare function createTelegramPollingStateReader(state: TelegramPollingControllerState): () => TelegramPollingStateSnapshot;
 export declare function isTelegramPollingControllerActive(state: TelegramPollingControllerState): boolean;
 export declare function createTelegramPollingActivityReader(state: TelegramPollingControllerState): () => boolean;
@@ -280,11 +278,8 @@ export interface TelegramThreadCapabilityOrchestration<TContext, TOwner> {
 }
 export declare function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapabilityStateRuntime;
 export declare function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(deps: TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner>): TelegramThreadCapabilityOrchestration<TContext, TOwner>;
-export declare function readTelegramThreadCapability(deps: TelegramThreadCapabilityReaderDeps): Promise<boolean | undefined>;
-export declare function probeTelegramStartupThreadCapability(deps: TelegramStartupThreadCapabilityProbeDeps, isCurrent?: () => boolean): Promise<boolean | undefined>;
 export declare function applyTelegramThreadCapability<TContext>(ctx: TContext, threadModeEnabled: boolean, phase: string, deps: TelegramThreadCapabilityRuntimeDeps<TContext>, isCurrent?: () => boolean): Promise<void>;
 export declare function createTelegramThreadAwarePollingPorts<TContext, TOwner>(deps: TelegramThreadAwarePollingDeps<TContext, TOwner>): TelegramThreadAwarePollingPorts<TContext, TOwner>;
-export declare function createTelegramThreadTargetObservationHandler<TContext>(deps: TelegramThreadCapabilityRuntimeDeps<TContext>): TelegramThreadTargetObservationHandler<TContext>;
 export declare function canProbeTelegramThreadCapability<TContext>(ctx: TContext, deps: Pick<TelegramThreadCapabilityRuntimeDeps<TContext>, "ownsLock" | "isFollowerRegistered">): boolean;
 export declare function createTelegramThreadCapabilityMonitor<TContext>(deps: TelegramThreadCapabilityRuntimeDeps<TContext>): TelegramThreadCapabilityMonitor<TContext>;
 export declare class TelegramPollingBatchValidationError extends Error {

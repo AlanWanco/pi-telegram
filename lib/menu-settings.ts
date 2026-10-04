@@ -143,19 +143,19 @@ export interface TelegramSettingsMenuRuntimeDeps<
   ) => Promise<void>;
 }
 
-export const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
-export const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE =
+const SETTINGS_MENU_TITLE = "<b>⚙️ Settings:</b>";
+const AUTOMATIC_THREAD_CLEANUP_SETTINGS_TITLE =
   "<b>🧹 Thread cleanup:</b>";
-export const INACTIVE_THREAD_REVIEW_TITLE = "<b>🔎 Inactive tabs review:</b>";
-export const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
-export const ASSISTANT_RENDERING_SETTINGS_TITLE =
+const INACTIVE_THREAD_REVIEW_TITLE = "<b>🔎 Inactive tabs review:</b>";
+const DRAFT_PREVIEWS_SETTINGS_TITLE = "<b>📝 Draft previews:</b>";
+const ASSISTANT_RENDERING_SETTINGS_TITLE =
   "<b>🧾 Assistant rendering:</b>";
-export const ACTIVITY_VERBOSITY_SETTINGS_TITLE =
+const ACTIVITY_VERBOSITY_SETTINGS_TITLE =
   "<b>🔬 Activity:</b>";
-export const TIME_INJECTION_MODE_SETTINGS_TITLE =
+const TIME_INJECTION_MODE_SETTINGS_TITLE =
   "<b>🕒 Time injection mode:</b>";
-export const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
-export const THREAD_DISPLAY_SETTINGS_TITLE = "<b>🧵 Thread display:</b>";
+const VOICE_REPLY_MODE_SETTINGS_TITLE = "<b>👄 Voice reply mode:</b>";
+const THREAD_DISPLAY_SETTINGS_TITLE = "<b>🧵 Thread display:</b>";
 
 function getVoiceReplyModeLabel(mode: TelegramVoiceReplyMode): string {
   return mode;
@@ -209,7 +209,7 @@ export function buildAutomaticThreadCleanupSettingsText(
   ].join("\n");
 }
 
-export function buildInactiveThreadReviewText(count: number): string {
+function buildInactiveThreadReviewText(count: number): string {
   return [INACTIVE_THREAD_REVIEW_TITLE, "",
     `${count} proven inactive tab${count === 1 ? "" : "s"}.`,
     "No tabs were deleted.",
@@ -393,7 +393,7 @@ export function buildTelegramSettingsMenuReplyMarkup(
   return { inline_keyboard: rows };
 }
 
-export async function openTelegramSettingsMenu<
+async function openTelegramSettingsMenu<
   TModel extends MenuModel = MenuModel,
 >(
   deps: TelegramSettingsMenuOpenDeps<TModel>,
@@ -560,7 +560,7 @@ export function buildVoiceReplyModeSettingsReplyMarkup(
   };
 }
 
-export async function updateTelegramSettingsMenuMessage(
+async function updateTelegramSettingsMenuMessage(
   deps: TelegramSettingsMenuMessageUpdateDeps,
   sectionRegistry?: TelegramSectionRegistry,
 ): Promise<void> {
@@ -581,7 +581,7 @@ export async function updateTelegramSettingsMenuMessage(
   );
 }
 
-export async function updateAutomaticThreadCleanupSettingsMessage(
+async function updateAutomaticThreadCleanupSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const enabled = deps.isAutomaticThreadCleanupEnabled();
@@ -591,7 +591,7 @@ export async function updateAutomaticThreadCleanupSettingsMessage(
   );
 }
 
-export async function updateDraftPreviewsSettingsMessage(
+async function updateDraftPreviewsSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const enabled = deps.areDraftPreviewsEnabled();
@@ -601,7 +601,7 @@ export async function updateDraftPreviewsSettingsMessage(
   );
 }
 
-export async function updateAssistantRenderingSettingsMessage(
+async function updateAssistantRenderingSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const mode = deps.getAssistantRenderingMode();
@@ -611,7 +611,7 @@ export async function updateAssistantRenderingSettingsMessage(
   );
 }
 
-export async function updateActivityVerbositySettingsMessage(
+async function updateActivityVerbositySettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const verbosity = deps.getActivityVerbosity();
@@ -621,7 +621,7 @@ export async function updateActivityVerbositySettingsMessage(
   );
 }
 
-export async function updateTimeInjectionModeSettingsMessage(
+async function updateTimeInjectionModeSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const mode = deps.getTimeInjectionMode();
@@ -631,7 +631,7 @@ export async function updateTimeInjectionModeSettingsMessage(
   );
 }
 
-export async function updateVoiceReplyModeSettingsMessage(
+async function updateVoiceReplyModeSettingsMessage(
   deps: TelegramSettingsMenuCallbackDeps,
 ): Promise<void> {
   const mode = deps.getVoiceReplyMode();

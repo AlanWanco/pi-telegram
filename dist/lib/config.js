@@ -8,6 +8,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, u
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { resolveAgentDir, resolveTelegramConfigPath, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
 export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.js";
+import { isWireRecord as isPlainConfigRecord } from "./wire.js";
 import { withTelegramFileTransaction } from "./locks.js";
 const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
 const CONFIG_REPLACE_RETRY_ATTEMPTS = 5;
@@ -45,7 +46,7 @@ const TELEGRAM_BOT_TOKEN_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * environment-variable references. Any other `$`-prefixed value is malformed
  * rather than a literal secret so a broken reference fails closed.
  */
-export function getTelegramBotTokenReference(value) {
+function getTelegramBotTokenReference(value) {
     const trimmed = value?.trim();
     if (!trimmed)
         return undefined;
@@ -210,9 +211,6 @@ export async function writeTelegramConfig(agentDir, configPath, config) {
     await chmod(tempConfigPath, 0o600);
     await rename(tempConfigPath, configPath);
     await chmod(configPath, 0o600);
-}
-function isPlainConfigRecord(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function cloneTelegramConfig(value) {
     return structuredClone(value);
@@ -628,7 +626,7 @@ export function createTelegramConfigStore(options = {}) {
         },
     };
 }
-export function createTelegramDraftPreviewsChecker(configStore) {
+function createTelegramDraftPreviewsChecker(configStore) {
     return () => {
         const config = configStore.get();
         return (config.assistant?.draftPreviews ??
@@ -637,7 +635,7 @@ export function createTelegramDraftPreviewsChecker(configStore) {
             true);
     };
 }
-export function createTelegramDraftPreviewsSetter(configStore) {
+function createTelegramDraftPreviewsSetter(configStore) {
     return async (enabled) => {
         await loadLatestTelegramConfig(configStore);
         const { draftPreviews: _legacyDraftPreviews, richDraftPreviews: _legacyRichDraftPreviews, ...current } = configStore.get();
@@ -649,14 +647,14 @@ export function createTelegramDraftPreviewsSetter(configStore) {
         await configStore.persist(config);
     };
 }
-export function createTelegramAssistantRenderingModeGetter(configStore) {
+function createTelegramAssistantRenderingModeGetter(configStore) {
     return () => {
         const config = configStore.get();
         const mode = config.assistant?.rendering ?? config.assistantRendering;
         return mode === "html" ? "html" : "rich";
     };
 }
-export function createTelegramAssistantRenderingModeSetter(configStore) {
+function createTelegramAssistantRenderingModeSetter(configStore) {
     return async (mode) => {
         await loadLatestTelegramConfig(configStore);
         const { assistantRendering: _legacyAssistantRendering, ...current } = configStore.get();
@@ -668,7 +666,7 @@ export function createTelegramAssistantRenderingModeSetter(configStore) {
         await configStore.persist(config);
     };
 }
-export function createTelegramActivityVerbosityGetter(configStore) {
+function createTelegramActivityVerbosityGetter(configStore) {
     return () => {
         const assistant = configStore.get().assistant;
         if (assistant?.activity !== undefined) {
@@ -685,10 +683,10 @@ export function createTelegramActivityVerbosityGetter(configStore) {
         return "verbose";
     };
 }
-export function createTelegramActivityVerbosityRefresher(configStore) {
+function createTelegramActivityVerbosityRefresher(configStore) {
     return () => loadLatestTelegramConfig(configStore);
 }
-export function createTelegramActivityVerbositySetter(configStore) {
+function createTelegramActivityVerbositySetter(configStore) {
     return async (verbosity) => {
         await loadLatestTelegramConfig(configStore);
         const current = configStore.get();
@@ -801,10 +799,10 @@ export function createTelegramProactivePushTargetGetter(deps) {
         return typeof chatId === "number" ? { chatId } : undefined;
     };
 }
-export function createTelegramAutomaticThreadCleanupChecker(configStore) {
+function createTelegramAutomaticThreadCleanupChecker(configStore) {
     return () => configStore.get().threads?.automaticCleanup ?? true;
 }
-export function createTelegramAutomaticThreadCleanupResolver(configStore) {
+function createTelegramAutomaticThreadCleanupResolver(configStore) {
     return async () => {
         await loadLatestTelegramConfig(configStore);
         if (configStore.didLastLoadRecoverInvalidConfig?.()) {
@@ -813,7 +811,7 @@ export function createTelegramAutomaticThreadCleanupResolver(configStore) {
         return createTelegramAutomaticThreadCleanupChecker(configStore)();
     };
 }
-export function createTelegramAutomaticThreadCleanupSetter(configStore) {
+function createTelegramAutomaticThreadCleanupSetter(configStore) {
     return async (enabled) => {
         await loadLatestTelegramConfig(configStore);
         const current = configStore.get();

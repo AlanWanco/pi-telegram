@@ -750,7 +750,7 @@ export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
   return lastMessageId;
 }
 
-export async function sendTelegramNativeRichMessage(
+async function sendTelegramNativeRichMessage(
   chatId: number,
   richMessage: TelegramInputRichMessage,
   deps: {
