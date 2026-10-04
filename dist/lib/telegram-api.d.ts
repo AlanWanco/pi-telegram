@@ -5,7 +5,7 @@
  * Wraps bot API calls, file uploads/downloads (including voice messages),
  * multipart sending, runtime transport binding, and Telegram temp-file lifecycle.
  */
-export declare const TELEGRAM_API_BASE = "https://api.telegram.org";
+import type { TelegramAttachmentSource } from "./media.ts";
 export declare const TELEGRAM_FILE_MAX_BYTES: number;
 export declare function getTelegramInboundFileByteLimitFromEnv(env: NodeJS.ProcessEnv, names: string[], defaultValue?: number): number;
 export type TelegramNetworkFamilyPolicy = "auto" | "ipv4" | "ipv6" | "ipv4-fallback";
@@ -415,6 +415,8 @@ export interface TelegramBridgeApiRuntimeDeps {
     tempDir: string;
     maxFileSizeBytes: number;
     tempFileMaxAgeMs: number;
+    /** Bot `@username` (or numeric id) naming private-chat attachments. */
+    getBotScope?: () => string | undefined;
     recordRuntimeEvent: (kind: "api" | "multipart" | "download", error: unknown, details?: Record<string, unknown>) => void;
     now?: () => number;
     chatActionMinIntervalMs?: number;
@@ -423,7 +425,7 @@ export interface TelegramBridgeApiRuntimeDeps {
 export interface TelegramBridgeApiRuntime {
     call: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     callMultipart: <TResponse>(method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions) => Promise<TResponse>;
-    downloadFile: (fileId: string, suggestedName: string) => Promise<string>;
+    downloadFile: (fileId: string, suggestedName: string, source?: TelegramAttachmentSource) => Promise<string>;
     deleteWebhook: (signal?: AbortSignal) => Promise<boolean>;
     getUpdates: (body: Record<string, unknown>, signal?: AbortSignal) => Promise<TelegramUpdate[]>;
     setMyCommands: (commands: readonly {
@@ -462,6 +464,12 @@ export interface TelegramBridgeApiRuntime {
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
     prepareTempDir: () => Promise<number>;
 }
+/** Names follow `<kind>-<scope>-<messageId>[-<index>][-<name>|.<ext>]`. */
+/**
+ * `scope` is the bot `@username` (id fallback) in a private chat and the public chat `@username` (id fallback) elsewhere.
+ * A negative chat id loses its sign, so the name never contains two adjacent dashes.
+ */
+export declare function createTelegramAttachmentFileName(source: TelegramAttachmentSource, generatedName: string, botScope?: string): string;
 export declare class TelegramApiCommitUnknownError extends Error {
     readonly kind: "commit-unknown";
     readonly method: string;
@@ -507,7 +515,6 @@ export declare function fetchTelegramBotIdentity(botToken: string, fetchImpl?: t
 export declare function callTelegramMultipart<TResponse>(botToken: string | undefined, method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string, options?: TelegramApiCallOptions): Promise<TResponse>;
 export declare function downloadTelegramFile(botToken: string | undefined, fileId: string, suggestedName: string, tempDir: string, options?: TelegramFileDownloadOptions): Promise<string>;
 export declare function answerTelegramCallbackQuery(botToken: string | undefined, callbackQueryId: string, text?: string, options?: TelegramAnswerCallbackQueryOptions): Promise<void>;
-export declare function deleteTelegramMessage(botToken: string | undefined, chatId: number, messageId: number): Promise<void>;
 export declare function createTelegramChatActionSender<TAction extends string>(sendChatAction: (chatId: number, action: TAction, options?: {
     message_thread_id?: number;
 }) => Promise<unknown>, action: TAction): (chatId: number, options?: {
@@ -530,6 +537,7 @@ export type TelegramWorkspaceThreadDeletionTransport = (authorize: () => {
 }) => Promise<void>;
 export declare function createDefaultTelegramBridgeApiRuntime(deps: {
     getBotToken: () => string | undefined;
+    getBotScope?: () => string | undefined;
     recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
     captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
     targetActivity?: TelegramApiTargetActivityRuntime;

@@ -21,7 +21,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
@@ -34,18 +34,27 @@ import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerReg
 import { createTelegramBusFollowerSourceReferenceAdmissionRuntime,
   createTelegramBusForwardedUpdateReceiverRuntime } from "../lib/bus-follower.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
+import { resolveTelegramSessionJournalPath, resolveTelegramSessionPollingJournalPath } from "../lib/paths.ts";
 import {
+  TELEGRAM_ROUTING_INPUT_TTL_MS,
   createTelegramUpdateJournalBindingKey,
+  createTelegramUpdateJournalEntryDigest,
   createTelegramUpdateJournalBindingRuntime,
+  TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX,
   createTelegramUpdateJournalLegacyCustodyEvidence,
   normalizeTelegramUpdateJournalLegacyCustodyDispositionAuthority,
   createTelegramUpdateJournalBotIdentity,
   createTelegramUpdateQueueHandoffToken,
   discoverTelegramFollowerJournalPaths,
+  discoverTelegramSessionJournalPaths,
+  discoverTelegramRecipientJournalPaths,
   inspectTelegramUpdateJournalFamily,
   inspectTelegramInputCustodySourceStatus,
   readTelegramUpdateJournalSource,
   inspectTelegramProfileJournalNamespace,
+  inspectTelegramSessionJournalNamespace,
+  isTelegramThreadCleanupJournalNamespaceClear,
+  inspectTelegramUpdateJournalRetention,
   createTelegramUpdateJournalReceiptScope,
   createTelegramUpdateJournalReceiptScopeResolver,
   createTelegramUpdateJournalRuntimeBindingResolver,
@@ -296,6 +305,11 @@ test("Input custody acquires once, fences start and settlement, and preserves ex
   await withInputCustodyFixture(context, async ({ options, setOwner, setBinding, ledger }) => {
     const store = createTelegramInputJournalStore(options);
     assert.equal("removeCompleted" in store, false);
+    assert.equal("removeCompletedExact" in store, false);
+    assert.equal("inspectSourceCompletion" in store, false);
+    assert.equal("abandonPending" in store, false);
+    assert.equal("inspectPendingRetention" in store, false);
+    assert.equal("inspectAbandonedPending" in store, false);
     assert.equal("markQueued" in store, false);
     assert.equal("acquireInput" in createTelegramUpdateJournalStore(options), false);
     store.appendBatch([{ update_id: 10 }, { update_id: 20, message: { text: "original" } }], 20);
@@ -399,10 +413,16 @@ test("Legacy journal mutations honor the optional outer writer admission fence",
     assert.deepEqual(order, ["writer-admission", "pairing-serialization"]);
     allowed = false;
     assert.throws(() => store.removeCompleted([1]), /writer fence closed/);
+    assert.throws(() => store.abandonPending({
+      journalBindingKey: createTelegramUpdateJournalBindingKey(options),
+      entry: { updateId: 1, update: { update_id: 1 }, admittedAtMs: 1, state: "pending" },
+      operatorAuthorityId: "fixture-owner", isCurrent: () => true,
+    }), /writer fence closed/);
     assert.throws(() => store.read(), /writer fence closed/);
+    assert.throws(() => store.inspectPendingRetention({ updateId: 1, update: { update_id: 1 }, admittedAtMs: 1, state: "pending" }), /writer fence closed/);
     allowed = true;
     assert.deepEqual(store.read().entries.map(entry => entry.updateId), [1]);
-    assert.equal(admissions, 5);
+    assert.equal(admissions, 7);
   });
 });
 
@@ -2992,6 +3012,89 @@ test("Strict inspection bounds raw, reconstructed and repeated work and preserve
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("Recipient discovery covers flat and session journals together and retains incomplete-census refusal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-recipient-discovery-"));
+  try {
+    const legacy = join(dir, "follower-inbox-aaaaaaaaaaaaaaaa.json");
+    const folder = join(dir, "sessions", "session");
+    const sessionPath = join(folder, "journal.aaaaaaaaaaaaaaaa.json");
+    await writeFile(legacy, "unchanged legacy");
+    await mkdir(folder, { recursive: true });
+    await mkdir(`${sessionPath}.segments`);
+    assert.deepEqual(discoverTelegramRecipientJournalPaths({ directory: dir }), {
+      paths: [legacy, sessionPath].sort(), complete: true,
+    });
+    assert.deepEqual(discoverTelegramRecipientJournalPaths({ directory: dir, profileName: "work" }), {
+      paths: [], complete: true,
+    });
+    await writeFile(join(folder, "journal.malformed.json"), "unclassified authority");
+    assert.equal(discoverTelegramRecipientJournalPaths({ directory: dir }).complete, false,
+      "Successful legacy discovery cannot mask incomplete session evidence");
+    assert.equal(await readFile(legacy, "utf8"), "unchanged legacy");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Session journal discovery includes snapshot, segment-only and retained-only families without merging sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-discovery-"));
+  try {
+    assert.deepEqual(discoverTelegramSessionJournalPaths({ directory: dir }), { paths: [], complete: true });
+    const first = join(dir, "sessions", "first");
+    const second = join(dir, "sessions", "%41");
+    await mkdir(first, { recursive: true });
+    await mkdir(second);
+    const shared = "journal.aaaaaaaaaaaaaaaa.json";
+    const segmentOnly = "journal.bbbbbbbbbbbbbbbb.json";
+    const retainedOnly = "journal.cccccccccccccccc.work.json";
+    await writeFile(join(first, shared), "untouched, not decoded");
+    await mkdir(join(first, `${shared}.segments`));
+    await mkdir(join(first, `${segmentOnly}.segments`));
+    await writeFile(join(second, shared), "also untouched");
+    await mkdir(join(second, `${retainedOnly}.retained`));
+    assert.deepEqual(discoverTelegramSessionJournalPaths({ directory: dir }), {
+      paths: [join(first, shared), join(first, segmentOnly), join(second, shared)].sort(), complete: true,
+    });
+    assert.deepEqual(discoverTelegramSessionJournalPaths({ directory: dir, profileName: "work" }), {
+      paths: [join(second, retainedOnly)], complete: true,
+    });
+    assert.equal(discoverTelegramSessionJournalPaths({ directory: dir, maxDirectoryEntries: 7 }).complete, true);
+    assert.equal(discoverTelegramSessionJournalPaths({ directory: dir, maxDirectoryEntries: 6 }).complete, false);
+    assert.equal(discoverTelegramSessionJournalPaths({ directory: dir, maxDirectoryEntries: 0 }).complete, false);
+    assert.equal(await readFile(join(first, shared), "utf8"), "untouched, not decoded");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const scenario of ["root-file", "session-alias", "session-file", "unknown-family", "snapshot-directory", "segments-file", "root-link", "session-link", "snapshot-link"] as const) {
+  test(`Session journal discovery refuses ${scenario} without altering evidence`, { skip: scenario.endsWith("link") && process.platform === "win32" }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-discovery-refusal-"));
+    try {
+      const root = join(dir, "sessions");
+      const session = join(root, "safe");
+      const family = join(session, "journal.aaaaaaaaaaaaaaaa.json");
+      const outside = join(dir, "outside");
+      await mkdir(outside);
+      await writeFile(join(outside, "original"), "unchanged");
+      if (scenario === "root-file") await writeFile(root, "unchanged");
+      else if (scenario === "root-link") await symlink(outside, root);
+      else {
+        await mkdir(root);
+        if (scenario === "session-alias") await mkdir(join(root, "%61"));
+        else if (scenario === "session-file") await writeFile(session, "unchanged");
+        else if (scenario === "session-link") await symlink(outside, session);
+        else {
+          await mkdir(session);
+          if (scenario === "unknown-family") await writeFile(join(session, "journal.bad.json"), "unchanged");
+          else if (scenario === "snapshot-directory") await mkdir(family);
+          else if (scenario === "segments-file") await writeFile(`${family}.segments`, "unchanged");
+          else await symlink(join(outside, "original"), family);
+        }
+      }
+      assert.equal(discoverTelegramSessionJournalPaths({ directory: dir }).complete, false);
+      assert.equal(await readFile(join(outside, "original"), "utf8"), "unchanged");
+      assert.equal(await stat(outside).then(value => value.isDirectory()), true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
 test("Strict family inspection preserves legacy failures, queue owners and handoffs", async (context) => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-strict-metadata-")));
   const path = join(dir, "journal.json");
@@ -3030,6 +3133,345 @@ test("Strict family inspection preserves legacy failures, queue owners and hando
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("Session namespace shares budgets, covers segment tails and leaves foreign contents unread", async (context) => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-census-")));
+  const directory = join(agentDir, "tmp", "pi-telegram");
+  const oldPath = resolveTelegramSessionJournalPath("session-old", "manual:recipient", agentDir, "work");
+  const newPath = resolveTelegramSessionJournalPath("A", "manual:recipient", agentDir, "work");
+  const legacy = join(directory, "follower-inbox-aaaaaaaaaaaaaaaa.work.json");
+  const foreign = resolveTelegramSessionJournalPath("A", "manual:foreign", agentDir, "foreign");
+  const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-session-census" });
+  const limits = { maxDirectoryEntries: 32, maxFiles: 16, maxBytes: 100_000, maxEntries: 10, maxWork: 1000 };
+  const input = { directory, profile: "work", botIdentity, limits };
+  const inspect = () => inspectTelegramSessionJournalNamespace(input);
+  const entry = (updateId: number) => ({ updateId, update: { update_id: updateId }, admittedAtMs: 1, state: "pending" });
+  const file = (entries: unknown[]) => JSON.stringify({ version: 1, revision: 1, profile: "work", botIdentity, entries });
+  try {
+    await mkdir(dirname(oldPath), { recursive: true });
+    await mkdir(dirname(newPath), { recursive: true });
+    if (assertUnsupportedStrictInspection({ ...input, path: oldPath }, context, inspect)) return;
+    await writeFile(legacy, file([]));
+    await writeFile(oldPath, file([entry(1)]));
+    await writeFile(newPath, file([]));
+    await mkdir(`${oldPath}.segments`);
+    await writeFile(join(`${oldPath}.segments`, "0000000000000002.json"), JSON.stringify({ version: 1, revision: 2,
+      previousRevision: 1, profile: "work", botIdentity, upsertedEntries: [entry(2)], removedUpdateIds: [] }));
+    await writeFile(foreign, "foreign snapshot is never decoded");
+    await mkdir(`${foreign}.segments`);
+    await writeFile(join(`${foreign}.segments`, "0000000000000001.json"), "foreign segment is never decoded");
+    const paths = [legacy, oldPath, newPath, foreign];
+    const before = await Promise.all(paths.map(path => readFile(path, "utf8")));
+    const originalOpen = fs.openSync;
+    const opened: string[] = [];
+    fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+      opened.push(String(args[0]));
+      return Reflect.apply(originalOpen, fs, args);
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    let result: ReturnType<typeof inspect>;
+    try { result = inspect(); } finally { fs.openSync = originalOpen; syncBuiltinESMExports(); }
+    assert.deepEqual(result.sources.map(source => source.role), ["polling", "follower", "session", "session"]);
+    assert.deepEqual(result.sources.map(source => source.path), [join(directory, "inbox.work.json"), legacy, ...[oldPath, newPath].sort()]);
+    assert.equal(result.sources[0]?.evidence.kind, "absent");
+    const oldEvidence = result.sources.find(source => source.path === oldPath)!.evidence;
+    assert.equal(oldEvidence.kind, "present");
+    if (oldEvidence.kind === "present") assert.deepEqual(oldEvidence.file.entries.map(value => value.updateId), [1, 2]);
+    assert.deepEqual(opened.sort(), [legacy, oldPath, newPath, join(`${oldPath}.segments`, "0000000000000002.json")].sort());
+    assert.equal(result.accounting.directoryEntries, 11, "Both profiles' structural entries count against the common tree bound");
+    assert.equal(result.accounting.files, 4);
+    const exact = { ...limits, maxDirectoryEntries: result.accounting.directoryEntries, maxFiles: result.accounting.files,
+      maxBytes: result.accounting.bytes, maxWork: result.accounting.work, maxEntries: 2 };
+    assert.deepEqual(inspectTelegramSessionJournalNamespace({ ...input, limits: exact }), result);
+    for (const key of ["maxDirectoryEntries", "maxFiles", "maxBytes", "maxWork", "maxEntries"] as const) {
+      assert.throws(() => inspectTelegramSessionJournalNamespace({ ...input, limits: { ...exact, [key]: exact[key] - 1 } }),
+        error => isJournalError(error, "capacity"), `Shared ${key} exhaustion`);
+    }
+    assert.deepEqual(await Promise.all(paths.map(path => readFile(path, "utf8"))), before);
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+test("Temporary cleanup namespace requires present exact references and complete-empty shared evidence", async (context) => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-temporary-census-")));
+  const directory = join(agentDir, "tmp", "pi-telegram"), profile = "work";
+  const pollingPath = resolveTelegramSessionPollingJournalPath("leader", agentDir, profile);
+  const historical = resolveTelegramSessionJournalPath("predecessor", "manual:recipient", agentDir, profile);
+  const current = resolveTelegramSessionJournalPath("current", "manual:recipient", agentDir, profile);
+  const legacy = join(directory, "follower-inbox-aaaaaaaaaaaaaaaa.work.json");
+  const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-temporary-census", botId: 7 });
+  const key = (path: string) => createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity });
+  const paths = [pollingPath, historical, current, legacy];
+  const references = createTelegramUpdateJournalReferenceRegistry();
+  const config = createTelegramConfigStore({ agentDir });
+  const input = { directory, profile, pollingPath, botIdentity,
+    requiredJournalBindingKeys: paths.map(key),
+    limits: { maxDirectoryEntries: 100, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10_000 },
+    withSourceReference<T>(path: string, operation: () => T): T {
+      return references.withReference({ referenceClass: "operator-disposition", recoveryKey: key(path) }, operation);
+    } };
+  const inspect = (overrides: Partial<typeof input> = {}) => config.withSourceSerialization(() =>
+    isTelegramThreadCleanupJournalNamespaceClear({ ...input, ...overrides }));
+  const empty = JSON.stringify({ version: 1, revision: 1, profile, botIdentity, entries: [] });
+  try {
+    for (const path of paths) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, empty); }
+    if (assertUnsupportedStrictInspection({ ...input, path: pollingPath }, context, inspect)) return;
+    const before = await readJournalFixtureTree(directory);
+    const originalOpen = fs.openSync;
+    const opened = new Set<string>();
+    fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+      const path = String(args[0]);
+      if (paths.includes(path)) {
+        assert.deepEqual(references.list(), [{ referenceClass: "operator-disposition", recoveryKey: key(path) }],
+          "Every physical journal read holds its exact participating source reference");
+        opened.add(path);
+      }
+      return Reflect.apply(originalOpen, fs, args);
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    try { assert.equal(inspect(), true); }
+    finally { fs.openSync = originalOpen; syncBuiltinESMExports(); }
+    assert.deepEqual([...opened].sort(), paths.slice().sort());
+    assert.deepEqual(references.list(), []);
+    assert.equal(inspect({ requiredJournalBindingKeys: [...input.requiredJournalBindingKeys, key(current)] }), true,
+      "The journal owner collapses duplicate addresses; composition needs no parallel deduplication");
+    assert.deepEqual(await readJournalFixtureTree(directory), before, "Protection inspection publishes or repairs nothing");
+    await rm(historical);
+    assert.equal(inspect(), false, "A missing predecessor is not complete-empty evidence even when the active journal is empty");
+    await writeFile(historical, empty);
+    for (const update of [{ update_id: 300 }, { update_id: 300, message: { message_thread_id: 999, chat: { id: 7, type: "private" } } }]) {
+      await writeFile(legacy, JSON.stringify({ version: 1, revision: 1, profile, botIdentity,
+        entries: [{ updateId: 300, admittedAtMs: 1, state: "pending", update }] }));
+      assert.equal(inspect(), false, "Unknown and different-target shared sources gain no cleanup exemption");
+    }
+    await writeFile(legacy, empty);
+    assert.throws(() => inspect({ requiredJournalBindingKeys: [createTelegramUpdateJournalBindingKey({
+      path: current, profileName: "foreign", botIdentity,
+    })] }));
+    assert.throws(() => inspect({ requiredJournalBindingKeys: [] }));
+    assert.throws(() => inspect({ limits: { ...input.limits, maxFiles: 1 } }), error => isJournalError(error, "capacity"));
+    await writeFile(historical, "malformed snapshot");
+    assert.throws(inspect, error => isJournalError(error, "io"));
+    assert.equal(await readFile(historical, "utf8"), "malformed snapshot");
+    await writeFile(historical, empty);
+    const unknown = join(dirname(historical), "journal.unknown.json");
+    await writeFile(unknown, "unclassified evidence");
+    assert.throws(inspect, error => isJournalError(error, "invalid"));
+    assert.equal(await readFile(unknown, "utf8"), "unclassified evidence");
+    await rm(unknown);
+    assert.equal(inspect(), true);
+    assert.deepEqual(references.list(), [], "Refusal and success both release observation references");
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+test("Session namespace reads the owners-named polling journal from a session folder", async (context) => {
+  const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-polling-")));
+  const directory = join(agentDir, "tmp", "pi-telegram");
+  const pollingPath = resolveTelegramSessionPollingJournalPath("leader-session", agentDir, "work");
+  const staleRoot = join(directory, "inbox.work.json");
+  const otherPolling = resolveTelegramSessionPollingJournalPath("former", agentDir, "work");
+  const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-session-polling" });
+  const input = { directory, profile: "work", botIdentity, pollingPath,
+    limits: { maxDirectoryEntries: 32, maxFiles: 16, maxBytes: 100_000, maxEntries: 10, maxWork: 1000 } };
+  const entry = (updateId: number) => ({ updateId, update: { update_id: updateId }, admittedAtMs: 1, state: "pending" });
+  const file = (entries: unknown[]) => JSON.stringify({ version: 1, revision: 1, profile: "work", botIdentity, entries });
+  try {
+    await mkdir(dirname(pollingPath), { recursive: true });
+    await mkdir(dirname(otherPolling), { recursive: true });
+    if (assertUnsupportedStrictInspection({ ...input, path: pollingPath }, context, () => inspectTelegramSessionJournalNamespace(input))) return;
+    await writeFile(pollingPath, file([entry(1)]));
+    await writeFile(staleRoot, file([entry(2)]));
+    await writeFile(otherPolling, file([entry(3)]));
+    const result = inspectTelegramSessionJournalNamespace(input);
+    assert.deepEqual(result.sources.map(source => [source.role, source.path]),
+      [["polling", pollingPath], ["session", staleRoot], ["session", otherPolling]],
+      "Unnamed polling journals stay protected custody");
+    assert.throws(() => inspectTelegramSessionJournalNamespace({ ...input, pollingPath: join(directory, "elsewhere", "inbox.work.json") }),
+      error => isJournalError(error, "invalid"));
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+for (const kind of ["alias", "unknown", "retained", "linked-session", "linked-snapshot", "linked-segment", "orphan-segments", "identity-conflict"] as const) {
+  test(`Session namespace rejects unclassified or foreign authority (${kind})`, { skip: kind.startsWith("linked") && process.platform === "win32" }, async (context) => {
+    const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-census-refusal-")));
+    const directory = join(agentDir, "tmp", "pi-telegram");
+    const folder = join(directory, "sessions", kind === "alias" ? "%61" : "session");
+    const path = join(folder, "journal.aaaaaaaaaaaaaaaa.json");
+    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-session-census-refusal" });
+    const input = { directory, profile: "default", botIdentity,
+      limits: { maxDirectoryEntries: 32, maxFiles: 32, maxBytes: 100_000, maxEntries: 10, maxWork: 1000 } };
+    const inspect = () => inspectTelegramSessionJournalNamespace(input);
+    try {
+      await mkdir(join(directory, "sessions"), { recursive: true });
+      if (assertUnsupportedStrictInspection({ ...input, path }, context, inspect)) return;
+      const outside = join(agentDir, "outside");
+      await mkdir(outside);
+      const original = "private outside data stays unread";
+      await writeFile(join(outside, "original"), original);
+      if (kind === "linked-session") await symlink(outside, folder);
+      else {
+        await mkdir(folder);
+        if (kind === "unknown") await writeFile(join(folder, "journal.bad.json"), "unclassified");
+        else if (kind === "retained") await mkdir(`${path}.retained`);
+        else if (kind === "linked-snapshot") await symlink(join(outside, "original"), path);
+        else if (kind === "orphan-segments") await mkdir(`${path}.segments`);
+        else if (kind === "linked-segment") {
+          await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] }));
+          await mkdir(`${path}.segments`);
+          await symlink(join(outside, "original"), join(`${path}.segments`, "0000000000000002.json"));
+        } else if (kind === "identity-conflict") {
+          await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity: { ...botIdentity, botId: 7 }, entries: [] }));
+          await writeFile(join(folder, "journal.bbbbbbbbbbbbbbbb.json"), JSON.stringify({ version: 1, revision: 1,
+            profile: "default", botIdentity: { ...botIdentity, botId: 8 }, entries: [] }));
+        }
+      }
+      const tree = await readdir(directory, { recursive: true });
+      assert.throws(inspect, error => isJournalError(error, kind === "identity-conflict" ? "identity-mismatch" : "invalid"));
+      assert.deepEqual(await readdir(directory, { recursive: true }), tree);
+      assert.equal(await readFile(join(outside, "original"), "utf8"), original);
+    } finally { await rm(agentDir, { recursive: true, force: true }); }
+  });
+}
+
+for (const change of ["segment-body", "legacy-segment-body", "new-session", "foreign-body"] as const) {
+  test(`Session namespace recensus refuses changes after the last family read (${change})`, async (context) => {
+    const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-recensus-")));
+    const directory = join(agentDir, "tmp", "pi-telegram");
+    const path = resolveTelegramSessionJournalPath("session", "manual:recipient", agentDir);
+    const foreign = resolveTelegramSessionJournalPath("session", "manual:foreign", agentDir, "foreign");
+    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-session-recensus" });
+    const input = { directory, profile: "default", botIdentity,
+      limits: { maxDirectoryEntries: 32, maxFiles: 32, maxBytes: 100_000, maxEntries: 10, maxWork: 1000 } };
+    const inspect = () => inspectTelegramSessionJournalNamespace(input);
+    const segmentPath = join(`${path}.segments`, "0000000000000002.json");
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      if (assertUnsupportedStrictInspection({ ...input, path }, context, inspect)) return;
+      await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] }));
+      await mkdir(`${path}.segments`);
+      await writeFile(segmentPath, JSON.stringify({ version: 1, revision: 2, previousRevision: 1,
+        profile: "default", botIdentity, upsertedEntries: [], removedUpdateIds: [] }));
+      await writeFile(foreign, "foreign data");
+      const legacy = join(directory, "follower-inbox-aaaaaaaaaaaaaaaa.json");
+      const legacySegment = join(`${legacy}.segments`, "0000000000000002.json");
+      await writeFile(legacy, await readFile(path));
+      await mkdir(`${legacy}.segments`);
+      await writeFile(legacySegment, await readFile(segmentPath));
+      const original = fs.opendirSync;
+      let rootScans = 0;
+      fs.opendirSync = ((...args: Parameters<typeof fs.opendirSync>) => {
+        if (String(args[0]) === directory && ++rootScans === 2) {
+          if (change === "segment-body" || change === "legacy-segment-body") {
+            const target = change === "segment-body" ? segmentPath : legacySegment;
+            writeFileSync(target, `${fs.readFileSync(target, "utf8")} `);
+          } else if (change === "foreign-body") writeFileSync(foreign, "changed foreign data");
+          else fs.mkdirSync(join(directory, "sessions", "new-session"));
+        }
+        return Reflect.apply(original, fs, args);
+      }) as typeof fs.opendirSync;
+      syncBuiltinESMExports();
+      try { assert.throws(inspect, error => isJournalError(error, "invalid")); }
+      finally { fs.opendirSync = original; syncBuiltinESMExports(); }
+      assert.equal(rootScans, 2);
+      assert.equal(JSON.parse(await readFile(path, "utf8")).revision, 1, "Inspection never compacts or repairs");
+    } finally { await rm(agentDir, { recursive: true, force: true }); }
+  });
+}
+
+test("Session namespace accounts preserved originals across polling, flat and session families", async (context) => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const paths = [path, join(dir, "follower-inbox-aaaaaaaaaaaaaaaa.work.json"),
+      join(dir, "sessions", "session", "journal.aaaaaaaaaaaaaaaa.work.json")];
+    const input = { directory: dir, profile: "work", botIdentity: identity,
+      limits: { maxDirectoryEntries: 100, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10_000 } };
+    if (assertUnsupportedStrictInspection({ ...input, path }, context, () => inspectTelegramSessionJournalNamespace(input))) return;
+    for (const journalPath of paths) {
+      const store = createStore(journalPath);
+      store.appendBatch([{ update_id: 1 }]);
+      store.abandonPending({ entry: store.read().entries[0]!, operatorAuthorityId: "owner:7", isCurrent: () => true,
+        journalBindingKey: createTelegramUpdateJournalBindingKey({ path: journalPath, profileName: "work", botIdentity: identity }) });
+    }
+    const before = await readJournalFixtureTree(dir);
+    const result = inspectTelegramSessionJournalNamespace(input);
+    assert.deepEqual(result.sources.map(source => source.role), ["polling", "follower", "session"]);
+    assert.deepEqual(result.retainedInputs?.map(original => [original.journalPath, original.updateId, original.state]),
+      paths.map(journalPath => [journalPath, 1, "committed"]));
+    const exact = { ...input.limits, maxDirectoryEntries: result.accounting.directoryEntries,
+      maxFiles: result.accounting.files, maxBytes: result.accounting.bytes, maxWork: result.accounting.work };
+    assert.deepEqual(inspectTelegramSessionJournalNamespace({ ...input, limits: exact }), result);
+    for (const key of ["maxDirectoryEntries", "maxFiles", "maxBytes", "maxWork"] as const)
+      assert.throws(() => inspectTelegramSessionJournalNamespace({ ...input, limits: { ...exact, [key]: exact[key] - 1 } }), error => isJournalError(error, "capacity"));
+    assert.deepEqual(await readJournalFixtureTree(dir), before);
+  });
+});
+
+async function readJournalFixtureTree(directory: string): Promise<unknown> {
+  return Promise.all((await readdir(directory, { recursive: true, withFileTypes: true }))
+    .sort((left, right) => join(left.parentPath, left.name).localeCompare(join(right.parentPath, right.name)))
+    .map(async entry => [join(entry.parentPath, entry.name), entry.isFile() ? await readFile(join(entry.parentPath, entry.name)) : "non-file"]));
+}
+
+for (const state of ["committed", "uncommitted", "tampered", "foreign-key", "tombstone-conflict", "missing-snapshot", "unknown-leaf", "linked-leaf"] as const) {
+  test(`Strict private retention inspection verifies exact tombstones (${state})`, { skip: state === "linked-leaf" && process.platform === "win32" }, async (context) => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const input = { directory: dir, path, profile: "work", botIdentity: identity,
+        limits: { maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10_000 } };
+      const inspect = () => inspectTelegramUpdateJournalRetention(input);
+      if (assertUnsupportedStrictInspection(input, context, inspect)) return;
+      const store = createStore(path);
+      store.appendBatch([{ update_id: 1, message: { text: "Original private input" } }]);
+      const entry = store.read().entries[0]!;
+      const beforeCancel = await readFile(path);
+      const segmentsBefore = new Set(existsSync(`${path}.segments`) ? await readdir(`${path}.segments`) : []);
+      const cancellation = store.abandonPending({ entry, operatorAuthorityId: "owner:7", isCurrent: () => true,
+        journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }) });
+      if (state === "uncommitted") {
+        await writeFile(path, beforeCancel);
+        for (const name of existsSync(`${path}.segments`) ? await readdir(`${path}.segments`) : [])
+          if (!segmentsBefore.has(name)) await rm(join(`${path}.segments`, name));
+      } else if (state === "tampered" || state === "foreign-key") {
+        const copy = JSON.parse(await readFile(cancellation.retainedPath, "utf8"));
+        if (state === "tampered") copy.entry.update.message.text = "Changed private input";
+        else copy.journalBindingKey = "foreign:binding";
+        await writeFile(cancellation.retainedPath, JSON.stringify(copy));
+      } else if (state === "tombstone-conflict") {
+        const snapshot = store.read();
+        const disposition = snapshot.operatorDispositions![0]!;
+        assert.ok("operatorAuthorityId" in disposition);
+        disposition.operatorAuthorityId = "other:owner";
+        await writeFile(path, JSON.stringify(snapshot));
+      } else if (state === "missing-snapshot") await rm(path);
+      else if (state === "unknown-leaf") await writeFile(join(`${path}.retained`, "unclassified.json"), "{}");
+      else if (state === "linked-leaf") {
+        const outside = join(dir, "outside.json");
+        await writeFile(outside, await readFile(cancellation.retainedPath));
+        await rm(cancellation.retainedPath);
+        await symlink(outside, cancellation.retainedPath);
+      }
+      const before = await readJournalFixtureTree(dir);
+      if (state === "committed" || state === "uncommitted") {
+        const result = inspect();
+        assert.deepEqual(result.retainedInputs, [{ path: cancellation.retainedPath,
+          journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+          failureId: cancellation.disposition.failureId, updateId: 1, state }]);
+        if (state === "committed") {
+          const restarted = createStore(path);
+          assert.deepEqual(restarted.inspectAbandonedPending(1), { journalBindingKey: result.retainedInputs[0]!.journalBindingKey,
+            updateId: 1, retainedPath: result.retainedInputs[0]!.path, operatorAuthorityId: "owner:7" });
+        }
+        assert.equal(result.evidence.kind, "present");
+        if (result.evidence.kind === "present") {
+          assert.equal(result.evidence.file.entries.length, state === "committed" ? 0 : 1);
+          const exact = { maxFiles: result.evidence.accounting.files, maxBytes: result.evidence.accounting.bytes,
+            maxEntries: 100, maxWork: result.evidence.accounting.work };
+          assert.deepEqual(inspectTelegramUpdateJournalRetention({ ...input, limits: exact }), result);
+          for (const key of ["maxFiles", "maxBytes", "maxWork"] as const)
+            assert.throws(() => inspectTelegramUpdateJournalRetention({ ...input, limits: { ...exact, [key]: exact[key] - 1 } }), error => isJournalError(error, "capacity"));
+        }
+      } else assert.throws(inspect, error => isJournalError(error, "invalid"));
+      assert.deepEqual(await readJournalFixtureTree(dir), before, "No retention, source or disposition is rewritten");
+    });
+  });
+}
 
 test("Canonical namespace inventory shares budgets, orders families and preserves foreign evidence", async (context) => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-inventory-")));
@@ -3084,7 +3526,7 @@ test("Canonical namespace inventory shares budgets, orders families and preserve
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Canonical namespace rejects aliases, residue, foreign links/types and recovery without traversal", async (context) => {
+test("Canonical namespace rejects aliases, residue and foreign links/types without traversal, ignoring legacy recovery", async (context) => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-inventory-reject-")));
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-inventory" });
   const input = { directory: dir, profile: "default", botIdentity,
@@ -3095,19 +3537,25 @@ test("Canonical namespace rejects aliases, residue, foreign links/types and reco
     for (const profile of ["Default", "work-x", "a".repeat(33), "", "work.x"]) {
       assert.throws(() => inspectTelegramProfileJournalNamespace({ ...input, profile }), TelegramUpdateJournalError);
     }
-    for (const name of ["Inbox.json", "inbox.default.json", "inbox.Work.json", "inbox.a-b.json", "inbox.json.tmp", "follower-inbox-bad.json", "follower-inbox-AAAAAAAAAAAAAAAA.json", "recovery", "Recovery"]) {
+    for (const name of ["Inbox.json", "inbox.default.json", "inbox.Work.json", "inbox.a-b.json", "inbox.json.tmp", "follower-inbox-bad.json", "follower-inbox-AAAAAAAAAAAAAAAA.json", "sessions", "Sessions"]) {
       await writeFile(join(dir, name), "unchanged");
       assert.throws(inspect, TelegramUpdateJournalError, name);
       assert.equal(await readFile(join(dir, name), "utf8"), "unchanged");
       await rm(join(dir, name));
     }
-    for (const name of ["inbox.foreign.json", "follower-inbox-aaaaaaaaaaaaaaaa.json", "recovery"]) {
+    for (const name of ["recovery", "Recovery"]) {
+      await mkdir(join(dir, name));
+      await writeFile(join(dir, name, "inbox.json"), "legacy quarantine");
+      assert.doesNotThrow(inspect, "Legacy recovery folders are disposable, never journal authority");
+      await rm(join(dir, name), { recursive: true });
+    }
+    for (const name of ["inbox.foreign.json", "follower-inbox-aaaaaaaaaaaaaaaa.json"]) {
       await symlink(join(dir, "does-not-exist"), join(dir, name));
       assert.throws(inspect, TelegramUpdateJournalError);
       assert.equal(await readlink(join(dir, name)), join(dir, "does-not-exist"));
       await rm(join(dir, name));
     }
-    for (const name of ["inbox.foreign.json", "follower-inbox-aaaaaaaaaaaaaaaa.json.segments"]) {
+    for (const name of ["inbox.foreign.json", "follower-inbox-aaaaaaaaaaaaaaaa.json.segments", "sessions"]) {
       await mkdir(join(dir, name));
       assert.throws(inspect, TelegramUpdateJournalError);
       await rm(join(dir, name), { recursive: true });
@@ -3289,6 +3737,301 @@ function createStore(
 const sourceLimits = { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 };
 const sourceTestOptions = { skip: !fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK };
 
+for (const liveSource of [false, true]) test(`Pending abandonment retains the original privately and atomically publishes a replay veto (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const options = liveSource ? {
+      sourceAccess: { directory: dir, limits: sourceLimits },
+      withSourceSerialization: createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") }).withSourceSerialization,
+    } : {};
+    const store = createStore(path, options);
+    const original = { update_id: 1, message: { message_id: 11, message_thread_id: 99,
+      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "private original" } };
+    store.appendBatch([original, { update_id: 2 }], 2);
+    const entry = store.read().entries[0]!;
+    const request = { journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      entry, operatorAuthorityId: "owner:7", isCurrent: () => true };
+    const before = store.read();
+    assert.equal(store.inspectPendingRetention(entry), undefined);
+    assert.deepEqual(store.read(), before);
+    const result = store.abandonPending(request);
+    assert.equal(result.duplicate, false);
+    assert.equal(result.entryCount, 1);
+    assert.equal(result.disposition.action, "discard");
+    const snapshot = store.read();
+    assert.deepEqual(snapshot.entries.map(item => item.updateId), [2]);
+    assert.equal(snapshot.acceptedThroughUpdateId, 2);
+    assert.deepEqual(snapshot.operatorDispositions, [result.disposition]);
+    assert.equal("failure" in entry, false, "Abandonment must not fabricate an execution failure");
+    const retainedBytes = await readFile(result.retainedPath, "utf8");
+    const retained = JSON.parse(retainedBytes);
+    assert.deepEqual(retained.entry, entry);
+    assert.deepEqual(retained.entry.update, original);
+    assert.deepEqual(retained.requestedDisposition, result.disposition);
+    assert.deepEqual(store.inspectPendingRetention(entry), {
+      journalBindingKey: request.journalBindingKey, retainedPath: result.retainedPath,
+      requestedDisposition: result.disposition,
+    });
+    assert.deepEqual(store.read(), snapshot, "Inspection is not a journal mutation or a current-entry claim");
+    if (process.platform !== "win32") {
+      assert.equal((await stat(result.retainedPath)).mode & 0o777, 0o600);
+      assert.equal((await stat(dirname(result.retainedPath))).mode & 0o777, 0o700);
+    }
+    const restarted = createStore(path, options);
+    assert.equal(restarted.abandonPending(request).duplicate, true);
+    assert.deepEqual(restarted.appendBatch([original]).addedUpdateIds, []);
+    assert.deepEqual(restarted.appendBatch([original]).duplicateUpdateIds, [1]);
+    assert.equal(restarted.read().revision, snapshot.revision, "Duplicate cancel/redelivery must not republish");
+    assert.equal(await readFile(result.retainedPath, "utf8"), retainedBytes);
+  });
+});
+
+for (const scenario of ["committed", "none", "pending", "other-disposition", "missing-retention", "tampered-retention", "foreign-retention", "invalid-id"] as const) {
+  test(`Committed abandonment inspection is strict and read-only (${scenario})`, async () => {
+    await withJournalTempDir(async ({ path }) => {
+      const store = createStore(path);
+      const original = { update_id: 1, message: { message_id: 11, message_thread_id: 99,
+        chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "restore original" } };
+      store.appendBatch([original, { update_id: 2 }], 2);
+      const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity });
+      const entry = store.read().entries[0]!;
+      let retainedPath: string | undefined;
+      if (scenario !== "none" && scenario !== "pending" && scenario !== "other-disposition") {
+        retainedPath = store.abandonPending({ journalBindingKey, entry, operatorAuthorityId: "telegram-owner:7", isCurrent: () => true }).retainedPath;
+      }
+      if (scenario === "pending") {
+        // The pending copy is not abandonment evidence; only the committed tombstone is.
+        assert.equal(store.inspectAbandonedPending(1), undefined);
+      }
+      if (scenario === "other-disposition") {
+        // A terminal failure discard is an operator disposition, not owner abandonment of a pending source.
+        const failed = store.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0, failedAtMs: 1100,
+          failureClass: "synthetic", summary: "synthetic", disposition: "failed", terminalReason: "synthetic" });
+        store.applyOperatorDisposition({ updateId: 1, failureId: failed.entry.terminalFailureId!, action: "discard" });
+        assert.equal(store.read().operatorDispositions?.length, 1);
+      }
+      if (scenario === "missing-retention") await rm(retainedPath!);
+      if (scenario === "tampered-retention" || scenario === "foreign-retention") {
+        const retained = JSON.parse(await readFile(retainedPath!, "utf8"));
+        if (scenario === "tampered-retention") retained.entry.update.message.text = "changed";
+        else retained.journalBindingKey = "foreign";
+        await writeFile(retainedPath!, JSON.stringify(retained));
+      }
+      const snapshot = store.read();
+      const bytes = retainedPath && scenario !== "missing-retention" ? await readFile(retainedPath, "utf8") : undefined;
+      if (scenario === "committed") {
+        assert.deepEqual(store.inspectAbandonedPending(1), { journalBindingKey, updateId: 1, retainedPath, operatorAuthorityId: "telegram-owner:7" });
+        assert.equal(store.inspectAbandonedPending(2), undefined, "another source has no abandonment");
+      } else if (scenario === "invalid-id") {
+        assert.throws(() => store.inspectAbandonedPending(-1), /invalid abandonment update id/);
+      } else if (["missing-retention", "tampered-retention", "foreign-retention"].includes(scenario)) {
+        assert.throws(() => store.inspectAbandonedPending(1), /retained input/);
+      } else assert.equal(store.inspectAbandonedPending(1), undefined);
+      assert.deepEqual(store.read(), snapshot, "inspection never mutates the journal");
+      if (bytes !== undefined) assert.equal(await readFile(retainedPath!, "utf8"), bytes, "inspection never repairs retention");
+    });
+  });
+}
+
+for (const scenario of ["foreign-source", "foreign-profile", "foreign-bot", "changed-entry", "queued", "retry-wait", "failed", "absent", "lost-authority"] as const) {
+  test(`Pending abandonment refuses ${scenario} without writing retention or changing authority`, async () => {
+    await withJournalTempDir(async ({ path }) => {
+      const store = createStore(path);
+      store.appendBatch([{ update_id: 1, message: { text: "private original" } }]);
+      const entry = store.read().entries[0]!;
+      if (scenario === "queued") store.markQueued({ queueKind: "prompt", receiptId: "queued-1",
+        sourceUpdateIds: [1], owner: queueOwnerIdentity });
+      if (scenario === "retry-wait" || scenario === "failed") store.markExecutionFailure({
+        updateId: 1, expectedAttemptCount: 0, failedAtMs: 1000, failureClass: "fixture", summary: "fixture",
+        disposition: scenario, ...(scenario === "failed" ? { terminalReason: "fixture" } : { nextRetryAtMs: 2000 }),
+      });
+      if (scenario === "absent") store.removeCompleted([1]);
+      const before = store.read();
+      const request = { journalBindingKey: createTelegramUpdateJournalBindingKey({
+        path: scenario === "foreign-source" ? `${path}.foreign` : path,
+        profileName: scenario === "foreign-profile" ? "other" : "work",
+        botIdentity: scenario === "foreign-bot" ? createTelegramUpdateJournalBotIdentity({ botToken: "other:bot", botId: 43 }) : identity,
+      }), entry: scenario === "changed-entry" ? { ...entry, admittedAtMs: entry.admittedAtMs + 1 } : entry,
+      operatorAuthorityId: "owner:7", isCurrent: () => scenario !== "lost-authority" };
+      assert.throws(() => store.abandonPending(request), (error) =>
+        isJournalError(error, scenario.startsWith("foreign") ? "identity-mismatch" : "conflict"));
+      if (scenario === "queued" || scenario === "retry-wait" || scenario === "failed") {
+        assert.throws(() => store.abandonPending({ ...request, entry: before.entries[0]! }),
+          error => isJournalError(error, "conflict"));
+      }
+      assert.deepEqual(store.read(), before);
+      assert.equal(existsSync(`${path}.retained`), false);
+    });
+  });
+}
+
+for (const phase of ["retention", "journal"] as const) {
+  for (const boundary of ["before-write", "after-write-before-rename"] as const) {
+    test(`Pending abandonment preserves source authority on ${phase} ${boundary} failure`, async () => {
+      await withJournalTempDir(async ({ path }) => {
+        let interrupt = false;
+        const store = createStore(path, { onPublicationBoundary(point, target) {
+          const isRetention = target.startsWith(`${path}.retained`);
+          if (interrupt && point === boundary && isRetention === (phase === "retention")) throw new Error("fixture publication failure");
+        } });
+        store.appendBatch([{ update_id: 1 }]);
+        const entry = store.read().entries[0]!;
+        const request = { journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+          entry, operatorAuthorityId: "owner:7", isCurrent: () => true };
+        interrupt = true;
+        assert.throws(() => store.abandonPending(request), /mutation failed/);
+        assert.deepEqual(store.read().entries, [entry]);
+        assert.equal(store.read().operatorDispositions, undefined);
+        const copies = existsSync(`${path}.retained`) ? await readdir(`${path}.retained`) : [];
+        assert.equal(copies.length, phase === "retention" ? 0 : 1);
+        interrupt = false;
+        const result = store.abandonPending(request);
+        assert.deepEqual(JSON.parse(await readFile(result.retainedPath, "utf8")).entry, entry);
+        assert.deepEqual(store.read().entries, []);
+      });
+    });
+  }
+}
+
+for (const phase of ["retention", "journal"] as const) test(`Pending abandonment rechecks authority at the ${phase} commit boundary`, async () => {
+  await withJournalTempDir(async ({ path }) => {
+    let interrupt = false;
+    let current = true;
+    const store = createStore(path, { onPublicationBoundary(boundary, target) {
+      if (interrupt && boundary === "after-write-before-rename" &&
+          target.startsWith(`${path}.retained`) === (phase === "retention")) current = false;
+    } });
+    store.appendBatch([{ update_id: 1 }]);
+    const entry = store.read().entries[0]!;
+    interrupt = true;
+    assert.throws(() => store.abandonPending({ entry, operatorAuthorityId: "owner:7",
+      journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      isCurrent: () => current }), error => isJournalError(error, "conflict"));
+    assert.deepEqual(store.read().entries, [entry]);
+    assert.equal(store.read().operatorDispositions, undefined);
+  });
+});
+
+test("Pending abandonment resolves a committed segment after snapshot failure without replay or losing retention", async () => {
+  await withJournalTempDir(async ({ path }) => {
+    let interrupt = false;
+    const store = createStore(path, { onPublicationBoundary(boundary, target) {
+      if (interrupt && target === path && boundary === "after-write-before-rename") throw new Error("fixture snapshot acknowledgement loss");
+    } });
+    store.appendBatch([{ update_id: 1 }]);
+    const entry = store.read().entries[0]!;
+    for (let revision = 1; revision < TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT; revision++) {
+      publishTelegramUpdateJournalSegment(path, { version: 1, revision, previousRevision: revision - 1,
+        profile: "work", botIdentity: identity, upsertedEntries: [], removedUpdateIds: [] });
+    }
+    const request = { journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      entry, operatorAuthorityId: "owner:7", isCurrent: () => true };
+    interrupt = true;
+    const result = store.abandonPending(request);
+    assert.equal(result.duplicate, false, "Exact committed segment resolves the ambiguous snapshot result");
+    assert.equal(store.read().entries.some(item => item.updateId === 1), false);
+    assert.deepEqual(store.read().operatorDispositions, [result.disposition]);
+    interrupt = false;
+    store.appendBatch([{ update_id: 2 }]);
+    const restarted = createStore(path);
+    assert.equal(restarted.abandonPending(request).duplicate, true);
+    assert.deepEqual(restarted.appendBatch([{ update_id: 1 }]).addedUpdateIds, []);
+    assert.deepEqual(JSON.parse(await readFile(result.retainedPath, "utf8")).entry, entry);
+  });
+});
+
+test("Pending abandonment preserves corrupted source and retention evidence instead of repairing or overwriting it", async () => {
+  await withJournalTempDir(async ({ path }) => {
+    let interrupt = false;
+    const store = createStore(path, { onPublicationBoundary(boundary, target) {
+      if (interrupt && !target.startsWith(`${path}.retained`) && boundary === "before-write") throw new Error("fixture source commit failure");
+    }, onRecovery() { assert.fail("Cancellation must not repair source evidence"); } });
+    store.appendBatch([{ update_id: 1 }]);
+    const entry = store.read().entries[0]!;
+    const request = { journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      entry, operatorAuthorityId: "owner:7", isCurrent: () => true };
+    interrupt = true;
+    assert.throws(() => store.abandonPending(request));
+    interrupt = false;
+    const [name] = await readdir(`${path}.retained`);
+    const retainedPath = join(`${path}.retained`, name!);
+    const retained = JSON.parse(await readFile(retainedPath, "utf8"));
+    retained.entry.update = { update_id: 1, message: { text: "contradictory private evidence" } };
+    const corrupt = JSON.stringify(retained);
+    await writeFile(retainedPath, corrupt);
+    assert.throws(() => store.abandonPending(request), error => isJournalError(error, "conflict"));
+    assert.equal(await readFile(retainedPath, "utf8"), corrupt);
+    assert.deepEqual(store.read().entries, [entry]);
+    await writeFile(path, "{corrupt");
+    assert.throws(() => store.abandonPending(request), error => isJournalError(error, "invalid"));
+    assert.equal(await readFile(path, "utf8"), "{corrupt");
+    assert.equal(await readFile(retainedPath, "utf8"), corrupt);
+  });
+});
+
+for (const scenario of ["tampered", "oversized", "symlink"] as const) test(`Pending retention inspection refuses ${scenario} evidence without rewriting it`, { skip: scenario === "symlink" && process.platform === "win32" }, async () => {
+  await withJournalTempDir(async ({ path }) => {
+    const store = createStore(path, { maxBytes: 2048 });
+    store.appendBatch([{ update_id: 1 }]);
+    const entry = store.read().entries[0]!;
+    const result = store.abandonPending({ entry, operatorAuthorityId: "owner:7", isCurrent: () => true,
+      journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }) });
+    const committed = store.read();
+    const original = await readFile(result.retainedPath, "utf8");
+    if (scenario === "tampered") {
+      const copy = JSON.parse(original);
+      copy.entry.update = { update_id: 1, message: { text: "another original" } };
+      await writeFile(result.retainedPath, JSON.stringify(copy));
+    } else if (scenario === "oversized") {
+      await writeFile(result.retainedPath, " ".repeat(2048 + 4096 + 1));
+    } else {
+      await writeFile(`${result.retainedPath}.backup`, original);
+      await rm(result.retainedPath);
+      await symlink(`${result.retainedPath}.backup`, result.retainedPath);
+    }
+    const evidence = await readFile(result.retainedPath, "utf8");
+    assert.throws(() => store.inspectPendingRetention(entry), error => error instanceof TelegramUpdateJournalError);
+    assert.equal(await readFile(result.retainedPath, "utf8"), evidence);
+    assert.deepEqual(store.read(), committed);
+  });
+});
+
+for (const scenario of ["empty-foreign", "missing-snapshot"] as const) test(`Pending abandonment does not reconcile ${scenario} evidence`, async () => {
+  await withJournalTempDir(async ({ path }) => {
+    const store = createStore(path, { onRecovery() { assert.fail("Cancellation is not source reconciliation"); } });
+    store.appendBatch([{ update_id: 1 }]);
+    const entry = store.read().entries[0]!;
+    const foreign = JSON.stringify({ version: 1, profile: "other", botIdentity: identity, entries: [] });
+    if (scenario === "empty-foreign") await writeFile(path, foreign);
+    else {
+      store.removeCompleted([1]);
+      await rm(path);
+    }
+    assert.throws(() => store.abandonPending({ entry, operatorAuthorityId: "owner:7",
+      journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      isCurrent: () => true }), error => isJournalError(error, scenario === "empty-foreign" ? "identity-mismatch" : "invalid"));
+    if (scenario === "empty-foreign") assert.equal(await readFile(path, "utf8"), foreign);
+    else {
+      assert.equal(existsSync(path), false);
+      assert.equal((await readdir(`${path}.segments`)).length, 1);
+    }
+    assert.equal(existsSync(`${path}.retained`), false);
+  });
+});
+
+test("Pending abandonment remains unavailable to exclusion-schema inputs", async () => {
+  await withJournalTempDir(async ({ path }) => {
+    const store = createStore(path, { withPairingAdmission: publish => publish(false) });
+    store.appendBatch([{ update_id: 1 }], 1);
+    const before = store.read();
+    assert.throws(() => store.inspectPendingRetention(before.entries[0]!), error => isJournalError(error, "unsupported-version"));
+    assert.throws(() => store.abandonPending({ entry: before.entries[0]!, operatorAuthorityId: "owner:7",
+      journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      isCurrent: () => true }), error => isJournalError(error, "unsupported-version"));
+    assert.deepEqual(store.read(), before);
+    assert.equal(existsSync(`${path}.retained`), false);
+  });
+});
+
 for (const liveSource of [false, true]) test(`Source serialization gates every store operation once while retaining receipt authority (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
@@ -3444,9 +4187,14 @@ test("Live source refuses references and retained authority before journal stagi
       syncBuiltinESMExports();
       try {
         for (const method of Object.keys(store) as (keyof typeof store)[]) {
+          if (method === "routingInputs") continue;
           assert.throws(() => method === "appendBatch" ? store.appendBatch([{ update_id: 1 }])
             : (store[method] as (input: never) => unknown)({} as never), (error) => error instanceof TelegramUpdateJournalError);
         }
+        for (const method of ["arm", "select"] as const) assert.throws(() => store.routingInputs![method]({} as never), error => error instanceof TelegramUpdateJournalError);
+        assert.throws(() => store.routingInputs!.expire({ journalBindingKey: "fixture", operatorUserId: 7, isCurrent: () => true,
+          entry: { updateId: 1, update: { update_id: 1 }, admittedAtMs: 0, state: "pending",
+            routingInput: { operatorUserId: 7, publishedAtMs: 0, expiresAtMs: TELEGRAM_ROUTING_INPUT_TTL_MS, phase: "waiting" } } }), error => error instanceof TelegramUpdateJournalError);
       } finally { fs.mkdtempSync = original; syncBuiltinESMExports(); }
     };
     for (const [directory, reference] of [[dir, "relative/inbox.json"], [join(dir, "approved"), path],
@@ -3818,11 +4566,16 @@ for (const liveSource of [false, true]) test(`Real config contention excludes ev
       const store = createTelegramUpdateJournalStore({ path: ${JSON.stringify(path)}, profileName: 'work',
         botIdentity: ${JSON.stringify(identity)}, withSourceSerialization: config.withSourceSerialization,
         ${liveSource ? `sourceAccess: ${JSON.stringify({ directory: dir, limits: sourceLimits })},` : ""} });
-      const methods = Object.keys(store);
+      const methods = Object.keys(store).flatMap(method => method === 'routingInputs'
+        ? Object.keys(store.routingInputs).map(key => 'routingInputs.' + key) : [method]);
       for (const method of methods) {
         const before = contentions;
         try {
           if (method === 'appendBatch') store[method]([{ update_id: 1 }]);
+          else if (method.startsWith('routingInputs.')) store.routingInputs[method.split('.')[1]](method.endsWith('.expire')
+            ? { journalBindingKey: 'fixture', operatorUserId: 7, isCurrent: () => true,
+              entry: { updateId: 1, update: { update_id: 1 }, admittedAtMs: 0, state: 'pending',
+                routingInput: { operatorUserId: 7, publishedAtMs: 0, expiresAtMs: 3600000, phase: 'waiting' } } } : {});
           else store[method]({});
           throw new Error('Operation bypassed source serialization: ' + method);
         } catch (error) {
@@ -3839,8 +4592,8 @@ for (const liveSource of [false, true]) test(`Real config contention excludes ev
       assert.equal(child.status, 0, child.stderr);
       const result = JSON.parse(child.stdout);
       assert.ok(result.contentions > 0, "Actual failed acquisitions, not a pre-attempt marker");
-      assert.deepEqual(result.methods.sort(), ["read", "appendBatch", "markQueued", "markExecutionFailure", "applyOperatorDisposition",
-        "applyLegacyCustodyDisposition", "offerQueuedHandoff", "acceptQueuedHandoff", "cancelQueuedHandoff", "completeQueued", "discardQueued", "recoverDeadQueueOwner", "removeCompleted"].sort());
+      assert.deepEqual(result.methods.sort(), ["read", "appendBatch", "abandonPending", "inspectAbandonedPending", "inspectPendingRetention", "markQueued", "markExecutionFailure", "applyOperatorDisposition",
+        "applyLegacyCustodyDisposition", "offerQueuedHandoff", "acceptQueuedHandoff", "cancelQueuedHandoff", "completeQueued", "completeQueuedExact", "discardQueued", "recoverDeadQueueOwner", "removeCompleted", "removeCompletedExact", "inspectSourceCompletion", "inspectQueuedReceipt", "routingInputs.arm", "routingInputs.select", "routingInputs.expire"].sort());
       assert.equal(fs.readFileSync(path, "utf8"), evidence);
       assert.equal(existsSync(`${path}.transaction`), false);
       assert.equal(existsSync(join(dir, "recovery")), false);
@@ -4151,12 +4904,15 @@ test("Workspace protection reads journal evidence without recovery, repair, or p
       assert.equal(existsSync(path), false);
       return;
     }
-    assert.deepEqual(read(), { entries: [] });
+    assert.deepEqual(read(), { entries: [], exists: false });
     assert.equal(existsSync(path), false);
     binding.journal.appendBatch([{ update_id: 1, message: { chat: { id: 7 }, message_thread_id: 42 } }]);
     const before = await readFile(path, "utf8");
     assert.equal(read().entries.length, 1);
+    assert.equal(read().exists, true);
     assert.equal(await readFile(path, "utf8"), before);
+    binding.journal.removeCompleted([1]);
+    assert.deepEqual(read(), { entries: [], exists: true }, "present complete-empty evidence is not an absent family");
     await writeFile(path, "{");
     assert.throws(read);
     assert.equal(await readFile(path, "utf8"), "{");
@@ -4243,6 +4999,278 @@ test("Update journal runtime binding separates worker and process recovery ident
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+for (const queueKind of ["prompt", "control"] as const) {
+  test(`Historical receipt/completion proofs stay scoped across session replacement (${queueKind})`, async context => {
+    await withJournalTempDir(async ({ dir }) => {
+      const config = createTelegramConfigStore({ agentDir: dir });
+      let sessionId: string | undefined = "session-a";
+      const runtimeIdentity = { instanceId: "old-runtime", processId: process.pid, processBirthId: "fixture-birth" };
+      const runtime = createTelegramUpdateJournalBindingRuntime({
+        base: { getProfileName: () => "work", getBotToken: () => "historical-receipt-token", getBotId: () => 7,
+          getQueueRuntimeIdentity: () => runtimeIdentity, withSourceSerialization: config.withSourceSerialization },
+        getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
+        getFollowerJournalPath: (key, profileName, sid) => resolveTelegramSessionJournalPath(sid!, key, dir, profileName),
+        getActiveFollowerBindingKey: () => "manual:same-process", getActiveFollowerSessionId: () => sessionId,
+        isFollowerRegistered: () => true,
+      });
+      const original = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(original.recoveryKey)!;
+      const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "historical-receipt-token", botId: 7 });
+      if (assertUnsupportedStrictInspection({ directory: dir, path, profile: "work", botIdentity,
+        limits: sourceLimits }, context)) return;
+      original.journal.appendBatch([1, 2].map(update_id => ({ update_id, message: { text: "old-session-custody" } })), 2);
+      const group = { queueKind, receiptId: "same-receipt", sourceUpdateIds: [1, 2] };
+      const acquired = original.journal.markQueued({ ...group, owner: { ...runtimeIdentity, sessionGeneration: 1 } });
+      const receipt = { ...group, queueOwner: acquired.queueOwner! };
+      const markers = original.journal.read().entries.map(entry => ({ ...createTelegramUpdateJournalEntryDigest(entry), completionSha256: (entry.updateId === 1 ? "a" : "b").repeat(64) }));
+      const expected = original.journal.inspectQueuedReceipt(receipt)!;
+      sessionId = "session-b";
+      const successor = runtime.resolveActive()!;
+      successor.journal.appendBatch([1, 2].map(update_id => ({ update_id, message: { text: "successor-same-IDs" } })), 2);
+      successor.journal.markQueued({ ...group, owner: { ...runtimeIdentity, sessionGeneration: 2 } });
+      let before = await readJournalFixtureTree(dir);
+      const observed = runtime.inspectQueuedReceipt(original.recoveryKey, receipt)!;
+      assert.deepEqual(observed, expected);
+      observed.receipt.sourceUpdateIds = [...observed.receipt.sourceUpdateIds, 99]; observed.sources[0]!.sourceSha256 = "f".repeat(64);
+      assert.deepEqual(runtime.inspectQueuedReceipt(original.recoveryKey, receipt), expected, "Returned proof has no mutable source aliases");
+      assert.equal(runtime.inspectQueuedReceipt(successor.recoveryKey, receipt), undefined, "Same hash/IDs/receipt name cannot substitute a new owner");
+      assert.equal(runtime.inspectSourceCompletion(original.recoveryKey, markers[0]!), undefined, "Queued presence is not a completion ACK");
+      for (const wrong of [{ ...receipt, sourceUpdateIds: [1] }, { ...receipt, queueOwner: { ...receipt.queueOwner, acquisitionId: "foreign" } },
+        { ...receipt, queueKind: queueKind === "prompt" ? "control" as const : "prompt" as const }])
+        assert.equal(runtime.inspectQueuedReceipt(original.recoveryKey, wrong), undefined);
+      assert.throws(() => runtime.inspectQueuedReceipt(original.recoveryKey, { ...receipt, sourceUpdateIds: [2, 1] }), error => isJournalError(error, "invalid"));
+      assert.deepEqual(await readJournalFixtureTree(dir), before);
+      const recipientOwner = { ...runtimeIdentity, instanceId: "recipient", processId: process.pid + 1, processBirthId: "recipient-birth", sessionGeneration: 1 };
+      const handoffToken = createTelegramUpdateQueueHandoffToken();
+      original.journal.offerQueuedHandoff({ ...group, expectedOwner: receipt.queueOwner, recipientOwner, handoffToken });
+      before = await readJournalFixtureTree(dir);
+      assert.equal(runtime.inspectQueuedReceipt(original.recoveryKey, receipt), undefined, "Offered custody is never ordinary readiness evidence");
+      assert.deepEqual(await readJournalFixtureTree(dir), before);
+      original.journal.cancelQueuedHandoff({ ...group, expectedOwner: receipt.queueOwner, recipientOwner, handoffToken });
+      original.journal.completeQueuedExact([receipt], markers);
+      sessionId = undefined;
+      before = await readJournalFixtureTree(dir);
+      assert.deepEqual(runtime.inspectSourceCompletion(original.recoveryKey, markers[0]!), markers[0], "Durable disposal ACK survives a lost caller reply and unprepared replacement");
+      assert.equal(runtime.inspectQueuedReceipt(original.recoveryKey, receipt), undefined);
+      assert.equal(runtime.inspectSourceCompletion(successor.recoveryKey, markers[0]!), undefined);
+      assert.throws(() => runtime.inspectSourceCompletion(original.recoveryKey, { ...markers[0]!, sourceSha256: "f".repeat(64) }), error => isJournalError(error, "conflict"));
+      assert.throws(() => runtime.inspectSourceCompletion(original.recoveryKey, { ...markers[0]!, completionSha256: "f".repeat(64) }), error => isJournalError(error, "conflict"));
+      assert.equal(runtime.resolveActive(), undefined, "Historical inspection cannot prepare or replay a successor");
+      assert.deepEqual(await readJournalFixtureTree(dir), before);
+    });
+  });
+}
+
+test("Session succession adopts only unclaimed predecessor pending input, committing it away before successor admission", async () => {
+  await withJournalTempDir(async ({ dir }) => {
+    const config = createTelegramConfigStore({ agentDir: dir });
+    const runtimeIdentity = { instanceId: "same-process", processId: process.pid, processBirthId: "fixture-birth" };
+    const runtime = createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => "work", getBotToken: () => "session-adoption-token", getBotId: () => 7,
+        getQueueRuntimeIdentity: () => runtimeIdentity, withSourceSerialization: config.withSourceSerialization },
+      getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
+      getFollowerJournalPath: (key, profileName, sid) => resolveTelegramSessionJournalPath(sid!, key, dir, profileName),
+      getActiveFollowerBindingKey: () => "manual:same-process", getActiveFollowerSessionId: () => "session-b",
+      isFollowerRegistered: () => true,
+    });
+    const key = "manual:same-process";
+    const predecessor = runtime.createRecipientResolver(key, "session-a")()!;
+    const successor = runtime.createRecipientResolver(key, "session-b")()!;
+    const third = runtime.createRecipientResolver(key, "session-c")()!;
+    predecessor.journal.appendBatch([1, 2, 3, 4].map(update_id => ({ update_id, message: { text: `pending-${update_id}` } })));
+    predecessor.journal.markQueued({ queueKind: "prompt", receiptId: "accepted-old-prompt", sourceUpdateIds: [3],
+      owner: { ...runtimeIdentity, sessionGeneration: 1 } });
+    const updates = new Map(predecessor.journal.read().entries.map(entry => [entry.updateId, entry.update]));
+    let current = true;
+    const before = await readJournalFixtureTree(dir);
+    for (const invalid of [{ predecessorSessionId: "session-b" }, { predecessorSessionId: "" }, { isCurrent: () => false }]) {
+      assert.throws(() => runtime.adoptPredecessorPending({ recipientBindingKey: key, predecessorSessionId: "session-a",
+        successorSessionId: "session-b", isCurrent: () => current, ...invalid }), /Telegram session adoption/);
+    }
+    assert.deepEqual(await readJournalFixtureTree(dir), before, "Refused adoption writes nothing");
+    // Authority loss while writing the private copy leaves the executable source in place, uncommitted.
+    let checks = 0;
+    assert.throws(() => runtime.adoptPredecessorPending({ recipientBindingKey: key, predecessorSessionId: "session-a",
+      successorSessionId: "session-b", isCurrent: () => current && ++checks < 4 }), /lost authority/);
+    assert.deepEqual(predecessor.journal.read().entries.map(entry => entry.updateId), [1, 2, 3, 4]);
+    assert.deepEqual(successor.journal.read().entries, []);
+    // Crash after the predecessor commit but before successor admission: preserved privately, never duplicated.
+    const entry4 = predecessor.journal.read().entries.find(entry => entry.updateId === 4)!;
+    predecessor.journal.abandonPending({ journalBindingKey: predecessor.recoveryKey, entry: entry4,
+      operatorAuthorityId: `${TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX}session-b`, isCurrent: () => true });
+    const crashed = runtime.inspectSourceAbandonment(predecessor.recoveryKey, 4)!;
+    assert.equal(crashed.operatorAuthorityId, `${TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX}session-b`);
+    assert.equal(crashed.operatorAuthorityId.startsWith("telegram-owner:"), false, "Owner-cancellation consumers cannot match adoption");
+    const adopted = runtime.adoptPredecessorPending({ recipientBindingKey: key, predecessorSessionId: "session-a",
+      successorSessionId: "session-b", isCurrent: () => current });
+    assert.deepEqual(adopted, { adoptedUpdateIds: [1, 2], retainedUpdateIds: [] }, "Retry reuses the uncommitted private copy");
+    assert.deepEqual(predecessor.journal.read().entries.map(entry => [entry.updateId, entry.state]), [[3, "queued"]],
+      "Accepted queue custody stays with its predecessor owner");
+    assert.deepEqual(successor.journal.read().entries.map(entry => [entry.updateId, entry.state, entry.update]),
+      [[1, "pending", updates.get(1)], [2, "pending", updates.get(2)]]);
+    assert.ok(runtime.inspectSourceAbandonment(predecessor.recoveryKey, 4), "Crash-window original remains privately retained");
+    assert.deepEqual(successor.journal.appendBatch([updates.get(2)!]).duplicateUpdateIds, [2],
+      "A lost-ACK leader retry de-duplicates in the successor journal");
+    assert.deepEqual(runtime.adoptPredecessorPending({ recipientBindingKey: key, predecessorSessionId: "session-a",
+      successorSessionId: "session-b", isCurrent: () => current }), { adoptedUpdateIds: [], retainedUpdateIds: [] });
+    assert.deepEqual(runtime.adoptPredecessorPending({ recipientBindingKey: key, predecessorSessionId: "session-a",
+      successorSessionId: "session-c", isCurrent: () => current }), { adoptedUpdateIds: [], retainedUpdateIds: [] });
+    assert.deepEqual(third.journal.read().entries, [], "A later successor cannot re-adopt committed inputs");
+  });
+});
+
+test("Active follower succession records the first session and advances only after adoption succeeds", async () => {
+  await withJournalTempDir(async ({ dir }) => {
+    const config = createTelegramConfigStore({ agentDir: dir });
+    let sessionId: string | undefined, key = "manual:a";
+    const runtime = createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => "work", getBotToken: () => "session-succession-token", getBotId: () => 7,
+        withSourceSerialization: config.withSourceSerialization },
+      getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
+      getFollowerJournalPath: (bindingKey, profileName, sid) => resolveTelegramSessionJournalPath(sid!, bindingKey, dir, profileName),
+      getActiveFollowerBindingKey: () => key, getActiveFollowerSessionId: () => sessionId, isFollowerRegistered: () => true,
+    });
+    assert.equal(runtime.prepareActiveFollowerSuccession(() => true), undefined, "No session identity, no succession");
+    sessionId = "session-a";
+    runtime.createRecipientResolver(key, "session-a")()!.journal.appendBatch([{ update_id: 5, message: { text: "pending" } }]);
+    assert.equal(runtime.prepareActiveFollowerSuccession(() => true), undefined, "First preparation only records");
+    assert.equal(runtime.prepareActiveFollowerSuccession(() => true), undefined, "Same-session refresh adopts nothing");
+    sessionId = "session-b";
+    assert.throws(() => runtime.prepareActiveFollowerSuccession(() => false), /lost successor authority/);
+    assert.deepEqual(runtime.createRecipientResolver(key, "session-a")()!.journal.read().entries.map(entry => entry.updateId), [5]);
+    assert.deepEqual(runtime.prepareActiveFollowerSuccession(() => true), { adoptedUpdateIds: [5], retainedUpdateIds: [] },
+      "Refused preparation keeps the predecessor and retries");
+    key = "manual:other"; sessionId = "session-c";
+    assert.equal(runtime.prepareActiveFollowerSuccession(() => true), undefined, "Another recipient key never adopts");
+    assert.deepEqual(runtime.createRecipientResolver(key, "session-c")()!.journal.read().entries, []);
+  });
+});
+
+for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", "linked-ancestor", "lost-snapshot", "unprepared", "profile-drift", "release-drift"] as const) {
+  test(`Historical abandonment lookup is exact, read-only and never prepares a successor (${state})`, async context => {
+    await withJournalTempDir(async ({ dir }) => {
+      let sessionId: string | undefined = "session-a", profile = "work";
+      let botId: number | undefined = state === "bot-id-discovery" ? undefined : 7;
+      let drift: "before" | "after" | undefined;
+      let serializations = 0, recoveries = 0;
+      const runtime = createTelegramUpdateJournalBindingRuntime({
+        base: { getProfileName: () => profile, getBotToken: () => "historical-proof-token", getBotId: () => botId,
+          withSourceSerialization(operation) {
+            serializations++;
+            if (drift === "before") profile = "other";
+            const result = operation();
+            if (drift === "after") profile = "other";
+            return result;
+          },
+          onRecovery() { recoveries++; } },
+        getLeaderJournalPath: profileName => join(dir, "tmp", "pi-telegram", `inbox${profileName === "work" ? ".work" : ".other"}.json`),
+        getFollowerJournalPath: (key, profileName, sid) => resolveTelegramSessionJournalPath(sid!, key, dir, profileName),
+        getActiveFollowerBindingKey: () => "manual:same-process", getActiveFollowerSessionId: () => sessionId,
+        isFollowerRegistered: () => true,
+      });
+      const original = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(original.recoveryKey)!;
+      const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "historical-proof-token", botId: 7 });
+      if (assertUnsupportedStrictInspection({ directory: dir, path, profile: "work", botIdentity,
+        limits: { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 } }, context)) return;
+      original.journal.appendBatch([{ update_id: 1, message: { text: "old-session" } }]);
+      const { exists: _exists, serializedBytes: _bytes, ...beforeCancel } = original.journal.read();
+      const cancellation = original.journal.abandonPending({ journalBindingKey: original.recoveryKey, entry: beforeCancel.entries[0]!,
+        operatorAuthorityId: "owner:7", isCurrent: () => true });
+      sessionId = "session-b"; botId = 7;
+      const successor = runtime.resolveActive()!;
+      successor.journal.appendBatch([{ update_id: 1, message: { text: "new-session-same-ID" } }]);
+      if (state === "uncommitted") {
+        await writeFile(path, JSON.stringify(beforeCancel));
+        await rm(`${path}.segments`, { recursive: true, force: true });
+      } else if (state === "damaged") await writeFile(cancellation.retainedPath, "not-json");
+      else if (state === "lost-snapshot") await rm(path);
+      else if (state === "unprepared") sessionId = undefined;
+      else if (state === "profile-drift") drift = "before";
+      else if (state === "release-drift") drift = "after";
+      let lookupKey = original.recoveryKey;
+      if (state === "linked-ancestor") {
+        const linkedDir = join(dirname(dirname(path)), "linked");
+        await symlink(dirname(path), linkedDir, "dir");
+        lookupKey = createTelegramUpdateJournalBindingKey({ path: join(linkedDir, basename(path)), profileName: "work", botIdentity });
+      }
+      const before = await readJournalFixtureTree(dir);
+      serializations = 0;
+      if (state === "damaged" || state === "lost-snapshot" || state === "linked-ancestor")
+        assert.throws(() => runtime.inspectSourceAbandonment(lookupKey, 1), error => isJournalError(error, state === "damaged" ? "io" : "invalid"));
+      else {
+        const proof = runtime.inspectSourceAbandonment(original.recoveryKey, 1);
+        assert.deepEqual(proof, state === "committed" || state === "bot-id-discovery" || state === "unprepared" ? {
+          journalBindingKey: original.recoveryKey, updateId: 1, retainedPath: cancellation.retainedPath, operatorAuthorityId: "owner:7",
+        } : undefined);
+      }
+      assert.equal(serializations, 1);
+      assert.equal(recoveries, 0);
+      if (state === "unprepared") assert.equal(runtime.resolveActive(), undefined, "Historical proof cannot prepare active execution");
+      assert.deepEqual(await readJournalFixtureTree(dir), before, "No journal repair, transaction staging, replay or mutation");
+      profile = "work"; drift = undefined;
+      const calls = serializations;
+      for (const candidate of [JSON.stringify({ ...JSON.parse(original.recoveryKey), unknown: true }),
+        createTelegramUpdateJournalBindingKey({ path, profileName: "other", botIdentity }),
+        createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: { ...botIdentity, botId: 8 } }),
+        createTelegramUpdateJournalBindingKey({ path: join(dir, "tmp", "pi-telegram", "sessions", "%73ession-a", basename(path)), profileName: "work", botIdentity }),
+        createTelegramUpdateJournalBindingKey({ path: join(dir, "tmp", "pi-telegram", "recovery", basename(path)), profileName: "work", botIdentity })])
+        assert.equal(runtime.inspectSourceAbandonment(candidate, 1), undefined);
+      assert.equal(serializations, calls, "Malformed/foreign/out-of-namespace addresses refuse before acquiring or reading");
+      assert.deepEqual(await readJournalFixtureTree(dir), before);
+    });
+  });
+}
+
+test("Session-aware journal bindings keep the same recipient's sessions separate and refuse missing preparation", async () => {
+  await withJournalTempDir(async ({ dir }) => {
+    let sessionId: string | undefined;
+    let follower = true;
+    let pathCalls = 0;
+    const runtime = createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => "work", getBotToken: () => "synthetic-session-token", getBotId: () => 7 },
+      getLeaderJournalPath: () => join(dir, "inbox.work.json"),
+      getFollowerJournalPath(bindingKey, profileName, recipientSessionId) {
+        pathCalls++;
+        return recipientSessionId === undefined ? join(dir, `legacy-${bindingKey}.json`)
+          : resolveTelegramSessionJournalPath(recipientSessionId, bindingKey, dir, profileName);
+      },
+      getActiveFollowerBindingKey: () => "manual:same-process",
+      getActiveFollowerSessionId: () => sessionId,
+      isFollowerRegistered: () => follower,
+    });
+    assert.equal(runtime.resolveFollower(), undefined);
+    assert.equal(runtime.resolveActive(), undefined, "An unprepared registered follower cannot fall back to the polling journal");
+    assert.equal(runtime.getActiveRecoveryKey(), undefined);
+    assert.equal(runtime.createRecipientResolver("manual:same-process")(), undefined);
+    assert.equal(runtime.createRecipientResolver("manual:same-process", "")(), undefined);
+    assert.equal(pathCalls, 0);
+    sessionId = "session-a";
+    const original = runtime.resolveFollower()!;
+    const resolveOriginalRecipient = runtime.createRecipientResolver("manual:same-process", sessionId);
+    const originalPath = resolveTelegramSessionJournalPath(sessionId, "manual:same-process", dir, "work");
+    assert.equal(getTelegramUpdateJournalBindingPath(original.recoveryKey), originalPath);
+    original.journal.appendBatch([{ update_id: 11, message: { text: "old-session-custody" } }]);
+    sessionId = "session-b";
+    const replacement = runtime.resolveActive()!;
+    const replacementPath = resolveTelegramSessionJournalPath(sessionId, "manual:same-process", dir, "work");
+    assert.equal(getTelegramUpdateJournalBindingPath(replacement.recoveryKey), replacementPath);
+    assert.notEqual(original.recoveryKey, replacement.recoveryKey);
+    assert.notEqual(original.runtimeKey, replacement.runtimeKey);
+    replacement.journal.appendBatch([{ update_id: 22, message: { text: "new-session-custody" } }]);
+    assert.deepEqual(resolveOriginalRecipient()!.journal.read().entries.map(entry => entry.updateId), [11],
+      "A captured recipient resolver never follows the caller into a new session");
+    assert.deepEqual(runtime.createRecipientResolver("manual:same-process", "session-b")()!.journal.read().entries.map(entry => entry.updateId), [22]);
+    sessionId = undefined;
+    assert.equal(runtime.resolveActive(), undefined);
+    const legacy = runtime.createLegacyRecipientResolver("manual:same-process")()!;
+    assert.equal(getTelegramUpdateJournalBindingPath(legacy.recoveryKey), join(dir, "legacy-manual:same-process.json"));
+    assert.equal(runtime.resolveActive(), undefined, "Explicit legacy inspection cannot restore active readiness");
+    assert.deepEqual(runtime.createPathResolver(originalPath)()!.journal.read().entries.map(entry => entry.updateId), [11],
+      "Unprepared active state does not erase retained old-session custody");
+    follower = false;
+    assert.equal(getTelegramUpdateJournalBindingPath(runtime.resolveActive()!.recoveryKey), join(dir, "inbox.work.json"));
+  });
 });
 
 test("Update journal binding runtime selects leader, follower, and recipient authority", async () => {
@@ -4668,6 +5696,418 @@ test("Update journal appends batches, deduplicates exact replay, and removes ent
   });
 });
 
+for (const liveSource of [false, true]) {
+  for (const scenario of ["match", "content", "retry", "queued", "failed", "missing", "invalid", "batch-mismatch", "no-guard"] as const) {
+    test(`Exact completed-source removal is atomic and never guesses missing evidence (${scenario}, live=${liveSource})`,
+      { skip: liveSource && sourceTestOptions.skip }, async () => {
+      await withJournalTempDir(async ({ dir, path }) => {
+        const configPath = join(dir, "telegram.json");
+        const config = createTelegramConfigStore({ agentDir: dir, configPath });
+        const store = createStore(path, { ...(liveSource ? { sourceAccess: { directory: dir, limits: sourceLimits } } : {}),
+          withSourceSerialization: config.withSourceSerialization, onPublicationBoundary() {
+            assert.equal(existsSync(`${path}.transaction`), true);
+            assert.equal(existsSync(`${configPath}.transaction`), true);
+          } });
+        store.appendBatch([{ update_id: 1, message: { text: "first" } }, { update_id: 2, message: { text: "second" } }], 2);
+        const sources = store.read().entries.map(createTelegramUpdateJournalEntryDigest);
+        if (scenario === "content") {
+          const file = JSON.parse(await readFile(path, "utf8"));
+          file.entries[0].update.message.text = "changed original";
+          await writeFile(path, JSON.stringify(file));
+        }
+        if (scenario === "retry" || scenario === "failed") store.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0,
+          failedAtMs: 1000, failureClass: "fixture", summary: "fixture", disposition: scenario === "retry" ? "retry-wait" : "failed",
+          ...(scenario === "retry" ? { nextRetryAtMs: 2000 } : { terminalReason: "fixture" }) });
+        if (scenario === "queued") store.markQueued({ queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [1],
+          owner: queueOwnerIdentity });
+        if (scenario === "queued" || scenario === "failed") sources[0] = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+        if (scenario === "missing") store.removeCompleted([1]);
+        const fingerprint = async () => {
+          const names = existsSync(`${path}.segments`) ? (await readdir(`${path}.segments`)).sort() : [];
+          return [await readFile(path, "utf8"), ...await Promise.all(names.map(async name => [name, await readFile(join(`${path}.segments`, name), "utf8")]))];
+        };
+        const before = await fingerprint();
+        if (scenario === "match") {
+          assert.deepEqual(store.removeCompletedExact([1, 2], [sources[0]!]).removedUpdateIds, [1, 2],
+            "one transaction can settle guarded and ordinary completed sources together");
+          assert.deepEqual(createStore(path).read().entries, []);
+          assert.equal(store.read().acceptedThroughUpdateId, 2);
+          const disposed = await fingerprint();
+          assert.throws(() => store.removeCompletedExact([1], [sources[0]!]), error => isJournalError(error, "conflict"),
+            "absence is not a second exact completion ACK");
+          assert.deepEqual(await fingerprint(), disposed);
+        } else if (scenario === "invalid") {
+          for (const guards of [[], [sources[0]!, sources[0]!], [{ ...sources[0]!, sourceSha256: "invalid" }],
+            [{ ...sources[0]!, updateId: 99 }], [{ ...sources[0]!, unexpected: true }]]) {
+            assert.throws(() => store.removeCompletedExact([1, 2], guards), error => isJournalError(error, "invalid"));
+          }
+        } else if (scenario === "no-guard") {
+          assert.throws(() => store.removeCompletedExact([1, 2], undefined as unknown as typeof sources), error => isJournalError(error, "invalid"));
+        } else {
+          const expected = scenario === "batch-mismatch" ? [sources[0]!, { ...sources[1]!, sourceSha256: "f".repeat(64) }] : sources;
+          assert.throws(() => store.removeCompletedExact([1, 2], expected), error => isJournalError(error, "conflict"));
+        }
+        if (scenario !== "match") assert.deepEqual(await fingerprint(), before, "one mismatch retains the entire batch without publication or repair");
+        assert.equal(existsSync(`${path}.transaction`) || existsSync(`${configPath}.transaction`), false);
+      });
+    });
+  }
+}
+
+for (const scenario of ["match", "missing", "pending", "completed", "subset", "superset", "kind", "owner", "acquisition",
+  "detached", "invalid", "corrupt", "foreign-token", "unprepared", "offered"] as const) {
+  test(`Strict queued receipt inspection observes complete immutable source authority without publication (${scenario})`, sourceTestOptions, async () => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const config = createTelegramConfigStore({ agentDir: dir });
+      const options = { sourceAccess: { directory: dir, limits: sourceLimits }, withSourceSerialization: config.withSourceSerialization };
+      const store = createStore(path, options);
+      store.appendBatch([1, 2, 99].map(update_id => ({ update_id, message: { text: `original-${update_id}` } })), 99);
+      const admitted = store.markQueued({ queueKind: "prompt", receiptId: "fixture-queue", sourceUpdateIds: [1, 2], owner: queueOwnerIdentity });
+      const expected = { queueKind: "prompt" as const, receiptId: "fixture-queue", sourceUpdateIds: [1, 2], queueOwner: admitted.queueOwner! };
+      const entries = store.read().entries.filter(entry => entry.updateId < 99);
+      if (scenario === "missing") expected.receiptId = "unknown";
+      if (scenario === "pending") {
+        await rm(path); await rm(`${path}.segments`, { recursive: true, force: true });
+        store.appendBatch([1, 2].map(update_id => ({ update_id, message: { text: `pending-${update_id}` } })), 2);
+      }
+      if (scenario === "completed") store.completeQueued([expected]);
+      if (scenario === "offered") store.offerQueuedHandoff({ ...expected, expectedOwner: expected.queueOwner,
+        recipientOwner: { ...queueOwnerIdentity, instanceId: "another-instance", processId: queueOwnerIdentity.processId + 1,
+          processBirthId: "another-birth" }, handoffToken: createTelegramUpdateQueueHandoffToken() });
+      if (scenario === "subset") expected.sourceUpdateIds = [1];
+      if (scenario === "superset") expected.sourceUpdateIds = [1, 2, 99];
+      if (scenario === "kind") Object.assign(expected, { queueKind: "control" });
+      if (scenario === "owner") expected.queueOwner = { ...expected.queueOwner, sessionGeneration: expected.queueOwner.sessionGeneration + 1 };
+      if (scenario === "acquisition") expected.queueOwner = { ...expected.queueOwner, acquisitionId: "another-acquisition" };
+      if (scenario === "corrupt") await writeFile(path, "{invalid-native-snapshot");
+      const fingerprint = async () => [await readFile(path, "utf8"), ...await Promise.all(
+        (existsSync(`${path}.segments`) ? (await readdir(`${path}.segments`)).sort() : []).map(async name => [name, await readFile(join(`${path}.segments`, name), "utf8")]))];
+      const before = await fingerprint();
+      const reader = scenario === "unprepared" ? createStore(path) : scenario === "foreign-token" ? createTelegramUpdateJournalStore({ path,
+        ...options, botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "foreign-fixture" }) }) : createStore(path, options);
+      if (scenario === "invalid") {
+        for (const bad of [{ ...expected, sourceUpdateIds: [] }, { ...expected, sourceUpdateIds: [2, 1] },
+          { ...expected, sourceUpdateIds: [1, 1] }, { ...expected, sourceUpdateIds: [-1] },
+          { ...expected, queueOwner: { ...expected.queueOwner, acquisitionId: "" } }, { ...expected, unexpected: true }]) {
+          assert.throws(() => reader.inspectQueuedReceipt(bad), error => isJournalError(error, "invalid"));
+        }
+      } else if (["corrupt", "foreign-token", "unprepared"].includes(scenario)) {
+        assert.throws(() => reader.inspectQueuedReceipt(expected));
+      } else if (scenario === "match" || scenario === "detached") {
+        const proof = reader.inspectQueuedReceipt(expected)!;
+        assert.deepEqual(proof.receipt, expected);
+        assert.deepEqual(proof.sources, entries.map(createTelegramUpdateJournalEntryDigest));
+        assert.match(proof.queueOwnerSha256, /^[a-f0-9]{64}$/u);
+        const cold = createStore(path, options).inspectQueuedReceipt(expected)!;
+        assert.deepEqual(cold, proof);
+        if (scenario === "detached") {
+          proof.receipt.sourceUpdateIds.length = 0; proof.receipt.queueOwner.acquisitionId = "mutated";
+          proof.sources[0]!.sourceSha256 = "f".repeat(64); proof.queueOwnerSha256 = "e".repeat(64);
+          assert.deepEqual(reader.inspectQueuedReceipt(expected), cold);
+        }
+      } else assert.equal(reader.inspectQueuedReceipt(expected), undefined, "a valid mismatch cannot grant receipt authority");
+      assert.deepEqual(await fingerprint(), before, "inspection does not publish, repair or release original authority");
+      assert.equal(existsSync(join(dir, "recovery")), false);
+    });
+  });
+}
+
+for (const scenario of ["normal", "control", "subset-proof", "ordinary", "before-write", "after-write-before-rename", "lost-ack", "detached-input",
+  "partial-receipt", "owner", "runtime", "offered", "pending-digest", "unrelated-source", "malformed", "unprepared", "writer-ended", "capacity", "resolver"] as const) {
+  test(`Queued source completion requires whole receipt ownership and one atomic scoped ACK (${scenario})`, sourceTestOptions, async () => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const configPath = join(dir, "telegram.json"), config = createTelegramConfigStore({ agentDir: dir, configPath });
+      let armed = false;
+      const options = { sourceAccess: { directory: dir, limits: sourceLimits }, withSourceSerialization: config.withSourceSerialization,
+        ...(scenario === "capacity" ? { maxEntries: 2 } : {}), queueRuntimeIdentity: queueOwnerIdentity,
+        onPublicationBoundary(boundary: string) {
+          assert.ok(existsSync(`${path}.transaction`) && existsSync(`${configPath}.transaction`));
+          if (armed && boundary === scenario) throw new Error("Fixture queued completion publication interrupted");
+          if (armed && scenario === "detached-input") completions[0]!.completionSha256 = "f".repeat(64);
+        } };
+      const store = createStore(path, options);
+      store.appendBatch([1, 2].map(update_id => ({ update_id, message: { text: `queued-original-${update_id}` } })), 2);
+      const pending = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+      const queueKind = scenario === "control" ? "control" as const : "prompt" as const;
+      const admitted = store.markQueued({ queueKind, receiptId: "owned", sourceUpdateIds: [1, 2], owner: queueOwnerIdentity });
+      const receipt = { queueKind, receiptId: "owned", sourceUpdateIds: [1, 2], queueOwner: admitted.queueOwner! };
+      const completions = store.read().entries.map(entry => ({ ...createTelegramUpdateJournalEntryDigest(entry),
+        completionSha256: String(entry.updateId === 1 ? "a" : "b").repeat(64) }));
+      const expected = structuredClone(scenario === "subset-proof" ? completions.slice(0, 1) : completions);
+      for (const marker of expected) assert.equal(store.inspectSourceCompletion(marker), undefined, "queue readiness is not terminal proof");
+      if (scenario === "partial-receipt") receipt.sourceUpdateIds = [1];
+      if (scenario === "owner") receipt.queueOwner = { ...receipt.queueOwner, acquisitionId: "foreign" };
+      if (scenario === "pending-digest") completions[0]!.sourceSha256 = pending.sourceSha256;
+      if (scenario === "unrelated-source") completions[0]!.updateId = 99;
+      if (scenario === "malformed") completions[0]!.completionSha256 = "invalid";
+      if (scenario === "offered") store.offerQueuedHandoff({ ...receipt, expectedOwner: receipt.queueOwner,
+        recipientOwner: { ...queueOwnerIdentity, instanceId: "recipient", processId: queueOwnerIdentity.processId + 1,
+          processBirthId: "recipient-birth" }, handoffToken: createTelegramUpdateQueueHandoffToken() });
+      const fingerprint = async () => [await readFile(path, "utf8"), ...await Promise.all(
+        (existsSync(`${path}.segments`) ? (await readdir(`${path}.segments`)).sort() : []).map(async name => [name, await readFile(join(`${path}.segments`, name), "utf8")]))];
+      const before = await fingerprint(); armed = true;
+      const disposer = scenario === "unprepared" ? createStore(path) : scenario === "writer-ended" ? createTelegramUpdateJournalStore({ ...options,
+        path, profileName: "work", botIdentity: identity, withWriterAdmission() { throw new Error("Fixture writer admission ended"); } })
+        : scenario === "runtime" ? createTelegramUpdateJournalStore({ ...options,
+        path, profileName: "work", botIdentity: identity, queueRuntimeIdentity: { ...queueOwnerIdentity, instanceId: "foreign" } }) : scenario === "resolver"
+        ? createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => "work", getBotToken: () => "123:journal-secret",
+            getBotId: () => identity.botId, getJournalPath: () => path, getQueueRuntimeIdentity: () => queueOwnerIdentity,
+            withSourceSerialization: config.withSourceSerialization })()!.journal : store;
+      const rejected = ["before-write", "after-write-before-rename", "partial-receipt", "owner", "runtime", "offered", "pending-digest",
+        "unrelated-source", "malformed", "unprepared", "writer-ended"].includes(scenario);
+      if (rejected) {
+        assert.throws(() => disposer.completeQueuedExact([receipt], completions));
+        armed = false;
+        assert.deepEqual(await fingerprint(), before, "a mismatch retains the entire receipt without a marker");
+        assert.equal(store.read().entries.length, 2);
+      } else {
+        if (scenario === "ordinary") store.completeQueued([receipt]);
+        else if (scenario === "lost-ack") assert.throws(() => {
+          disposer.completeQueuedExact([receipt], completions); throw new Error("Fixture queued completion ACK lost");
+        }, /ACK lost/);
+        else {
+          const result = disposer.completeQueuedExact([receipt], scenario === "subset-proof" ? completions.slice(0, 1) : completions);
+          assert.deepEqual(result.removedUpdateIds, [1, 2]); assert.deepEqual(result.sourceCompletions, expected);
+          result.sourceCompletions![0]!.completionSha256 = "f".repeat(64);
+        }
+        armed = false;
+        const cold = createStore(path, options), disposed = await fingerprint();
+        assert.deepEqual(cold.read().entries, []);
+        for (const marker of expected) assert.deepEqual(cold.inspectSourceCompletion(marker), scenario === "ordinary" ? undefined : marker);
+        if (scenario !== "ordinary") {
+          assert.throws(() => cold.completeQueuedExact([receipt], expected), error => isJournalError(error, "conflict"), "inspect; never replay receipt disposal");
+          assert.deepEqual(await fingerprint(), disposed);
+          assert.deepEqual(cold.appendBatch(expected.map(marker => ({ update_id: marker.updateId })), 2).addedUpdateIds, [],
+            "retained scoped sources cannot be readmitted; unscoped siblings keep ordinary semantics");
+        }
+        if (scenario === "subset-proof") assert.equal(cold.inspectSourceCompletion(completions[1]!), undefined, "unscoped siblings gain no proof");
+        if (scenario === "capacity") {
+          cold.appendBatch([{ update_id: 3 }, { update_id: 4 }], 4);
+          const next = cold.markQueued({ queueKind: "prompt", receiptId: "next", sourceUpdateIds: [3, 4], owner: queueOwnerIdentity });
+          const marker = { ...createTelegramUpdateJournalEntryDigest(cold.read().entries[0]!), completionSha256: "c".repeat(64) };
+          const full = await fingerprint();
+          assert.throws(() => cold.completeQueuedExact([{ queueKind: "prompt", receiptId: "next", sourceUpdateIds: [3, 4], queueOwner: next.queueOwner! }], [marker]),
+            error => isJournalError(error, "capacity"));
+          assert.deepEqual(await fingerprint(), full); assert.equal(cold.read().entries.length, 2);
+          assert.deepEqual(cold.inspectSourceCompletion(expected[0]!), expected[0], "capacity never evicts an older ACK");
+        }
+      }
+      assert.equal(existsSync(`${path}.transaction`) || existsSync(`${configPath}.transaction`), false);
+    });
+  });
+}
+
+for (const scenario of ["partial", "reintroduced", "digest", "erasure"] as const) {
+  test(`Cold queued completion rejects incomplete or contradictory receipt disposal (${scenario})`, sourceTestOptions, async () => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const options = { sourceAccess: { directory: dir, limits: sourceLimits },
+        withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
+      const store = createStore(path, options);
+      store.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
+      const queued = store.markQueued({ queueKind: "prompt", receiptId: "group", sourceUpdateIds: [1, 2], owner: queueOwnerIdentity });
+      const entries = store.read().entries;
+      const marker = { ...createTelegramUpdateJournalEntryDigest(entries[0]!), completionSha256: "a".repeat(64) };
+      store.completeQueuedExact([{ queueKind: "prompt", receiptId: "group", sourceUpdateIds: [1, 2], queueOwner: queued.queueOwner! }], [marker]);
+      let segmentPath = join(`${path}.segments`, "0000000000000002.json");
+      const segment = JSON.parse(await readFile(segmentPath, "utf8"));
+      if (scenario === "partial") segment.removedUpdateIds = [1];
+      if (scenario === "reintroduced") segment.upsertedEntries = [entries[1]];
+      if (scenario === "digest") segment.sourceCompletions[0].sourceSha256 = "f".repeat(64);
+      if (scenario === "erasure") {
+        segmentPath = join(`${path}.segments`, "0000000000000003.json");
+        segment.revision = 3; segment.previousRevision = 2; segment.removedUpdateIds = []; segment.sourceCompletions = [];
+      }
+      await writeFile(segmentPath, JSON.stringify(segment), { mode: 0o600 });
+      const before = await readFile(segmentPath, "utf8");
+      assert.throws(() => createStore(path, options).inspectSourceCompletion(scenario === "digest" ? { ...marker, sourceSha256: "f".repeat(64) } : marker),
+        error => isJournalError(error, "invalid"));
+      assert.equal(await readFile(segmentPath, "utf8"), before); assert.equal(existsSync(join(dir, "recovery")), false);
+    });
+  });
+}
+
+for (const scenario of ["normal", "before-write", "after-write-before-rename", "lost-ack", "changed", "detached-input", "capacity", "work-bound"] as const) {
+  test(`Journal source completion is one atomic, scoped removal ACK (${scenario})`, sourceTestOptions, async () => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const configPath = join(dir, "telegram.json");
+      const config = createTelegramConfigStore({ agentDir: dir, configPath });
+      let armed = false;
+      let completion: ReturnType<typeof createTelegramUpdateJournalEntryDigest> & { completionSha256: string };
+      const options = { sourceAccess: { directory: dir, limits: sourceLimits }, withSourceSerialization: config.withSourceSerialization,
+        ...(scenario === "capacity" ? { maxEntries: 1 } : {}), onPublicationBoundary(boundary: string) {
+          assert.equal(existsSync(`${path}.transaction`) && existsSync(`${configPath}.transaction`), true);
+          if (armed && boundary === scenario) throw new Error("Fixture source completion publication interrupted");
+          if (armed && scenario === "detached-input") completion.completionSha256 = "f".repeat(64);
+        } };
+      const store = createStore(path, options);
+      store.appendBatch((scenario === "capacity" ? [1] : [1, 2]).map(update_id => ({ update_id, message: { text: "original" } })),
+        scenario === "capacity" ? 1 : 2);
+      const source = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+      completion = { ...source, completionSha256: "a".repeat(64) };
+      const expected = { ...completion };
+      assert.equal(store.inspectSourceCompletion(expected), undefined, "pending input is not a completion ACK");
+      if (scenario === "changed") store.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0, failedAtMs: 2000,
+        failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: 3000 });
+      const fingerprint = async () => [await readFile(path, "utf8"), ...await Promise.all(
+        (existsSync(`${path}.segments`) ? (await readdir(`${path}.segments`)).sort() : []).map(async name => [name, await readFile(join(`${path}.segments`, name), "utf8")]))];
+      const before = await fingerprint();
+      armed = true;
+      const ids = scenario === "capacity" ? [1] : [1, 2];
+      if (["before-write", "after-write-before-rename", "changed"].includes(scenario)) {
+        assert.throws(() => store.removeCompletedExact(ids, [source], [completion]), error => isJournalError(error, scenario === "changed" ? "conflict" : "io"));
+        armed = false;
+        assert.deepEqual(await fingerprint(), before);
+        assert.equal(createStore(path, options).inspectSourceCompletion(expected), undefined);
+        assert.equal(store.read().entries.some(entry => entry.updateId === 1), true);
+      } else {
+        if (scenario === "lost-ack") assert.throws(() => {
+          store.removeCompletedExact(ids, [source], [completion]); throw new Error("Fixture source completion ACK lost");
+        }, /ACK lost/);
+        else {
+          const result = store.removeCompletedExact(ids, [source], [completion]);
+          assert.deepEqual(result.removedUpdateIds, ids);
+          assert.deepEqual(result.sourceCompletions, [expected]);
+          result.sourceCompletions![0]!.completionSha256 = "f".repeat(64);
+        }
+        armed = false;
+        const cold = createStore(path, options);
+        assert.deepEqual(cold.read().entries, []);
+        const disposed = await fingerprint();
+        const observed = cold.inspectSourceCompletion(expected);
+        assert.deepEqual(observed, expected, "lost reply and new store observe the retained ACK, not source absence");
+        observed!.completionSha256 = "f".repeat(64);
+        assert.deepEqual(cold.inspectSourceCompletion(expected), expected);
+        assert.throws(() => cold.inspectSourceCompletion({ ...expected, completionSha256: "f".repeat(64) }), error => isJournalError(error, "conflict"));
+        assert.throws(() => cold.inspectSourceCompletion({ ...expected, sourceSha256: "f".repeat(64) }), error => isJournalError(error, "conflict"));
+        assert.equal(cold.inspectSourceCompletion({ ...expected, updateId: 2 }), undefined, "ordinary removal has no scoped completion ACK");
+        assert.throws(() => cold.removeCompletedExact([1], [source], [expected]), error => isJournalError(error, "conflict"), "inspect, never repeat disposal");
+        assert.deepEqual(await fingerprint(), disposed, "all observations and conflicts are read-only");
+        if (scenario === "capacity") {
+          cold.appendBatch([{ update_id: 2 }], 2);
+          const nextSource = createTelegramUpdateJournalEntryDigest(cold.read().entries[0]!);
+          const next = { ...nextSource, completionSha256: "b".repeat(64) };
+          const full = await fingerprint();
+          assert.throws(() => cold.removeCompletedExact([2], [nextSource], [next]), error => isJournalError(error, "capacity"));
+          assert.deepEqual(await fingerprint(), full);
+          assert.equal(cold.read().entries[0]?.updateId, 2);
+          assert.equal(cold.inspectSourceCompletion(next), undefined);
+          assert.deepEqual(cold.inspectSourceCompletion(expected), expected, "capacity never evicts older proof");
+        }
+        if (scenario === "work-bound") {
+          const bounded = createStore(path, { ...options, sourceAccess: { directory: dir, limits: { ...sourceLimits, maxWork: 5 } } });
+          assert.throws(() => bounded.inspectSourceCompletion(expected), error => isJournalError(error, "capacity"), "receipt collections consume real source work");
+        }
+      }
+      assert.equal(existsSync(`${path}.transaction`) || existsSync(`${configPath}.transaction`), false);
+    });
+  });
+}
+
+for (const scenario of ["bad-hash", "duplicate-id", "duplicate-scope", "foreign-source", "missing-removal", "erasure", "rewrite", "unrelated-revision", "active", "missing-proof"] as const) {
+  test(`Cold source completion retains unknown or contradictory evidence (${scenario})`, sourceTestOptions, async () => {
+    await withJournalTempDir(async ({ dir, path }) => {
+      const options = { sourceAccess: { directory: dir, limits: sourceLimits },
+        withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
+      const store = createStore(path, options);
+      store.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
+      const source = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+      const completion = { ...source, completionSha256: "a".repeat(64) };
+      store.removeCompletedExact([1, 2], [source], [completion]);
+      const segmentPath = join(`${path}.segments`, "0000000000000001.json");
+      const other = { ...createTelegramUpdateJournalEntryDigest(JSON.parse(await readFile(path, "utf8")).entries[1]), completionSha256: "b".repeat(64) };
+      const segment = JSON.parse(await readFile(segmentPath, "utf8"));
+      if (scenario === "bad-hash") segment.sourceCompletions[0].completionSha256 = "invalid";
+      if (scenario === "duplicate-id") segment.sourceCompletions.push({ ...completion });
+      if (scenario === "duplicate-scope") segment.sourceCompletions.push({ ...completion, updateId: 2 });
+      if (scenario === "foreign-source") segment.sourceCompletions[0].sourceSha256 = "f".repeat(64);
+      if (scenario === "missing-removal") segment.removedUpdateIds = [];
+      if (scenario === "active") segment.upsertedEntries = [JSON.parse(await readFile(path, "utf8")).entries[0]];
+      if (scenario === "missing-proof") delete segment.sourceCompletions;
+      let target = segmentPath;
+      if (scenario === "erasure" || scenario === "rewrite" || scenario === "unrelated-revision") {
+        target = join(`${path}.segments`, "0000000000000002.json");
+        segment.revision = 2; segment.previousRevision = 1; segment.removedUpdateIds = [];
+        segment.sourceCompletions = scenario === "erasure" ? [] : scenario === "unrelated-revision" ? [completion, other]
+          : [{ ...completion, completionSha256: "f".repeat(64) }];
+      }
+      await writeFile(target, JSON.stringify(segment), { mode: 0o600 });
+      const before = await readFile(target, "utf8");
+      const names = await readdir(dir);
+      const cold = createStore(path, options);
+      const claimed = scenario === "rewrite" ? { ...completion, completionSha256: "f".repeat(64) }
+        : scenario === "foreign-source" ? { ...completion, sourceSha256: "f".repeat(64) } : scenario === "unrelated-revision" ? other : completion;
+      if (scenario === "missing-proof") assert.equal(cold.inspectSourceCompletion(completion), undefined, "absence plus acceptance shape never manufactures a removal ACK");
+      else assert.throws(() => cold.inspectSourceCompletion(claimed), error => isJournalError(error, "invalid"));
+      assert.equal(await readFile(target, "utf8"), before);
+      assert.deepEqual(await readdir(dir), names, "strict receipt inspection never repairs, quarantines or resets the family");
+    });
+  });
+}
+
+test("Source completion survives ordinary publishers and compaction without replay or empty-scope rebinding", sourceTestOptions, async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const options = { sourceAccess: { directory: dir, limits: sourceLimits },
+      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
+    const store = createStore(path, options);
+    store.appendBatch([{ update_id: 1 }], 1);
+    const source = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+    const completion = { ...source, completionSha256: "a".repeat(64) };
+    store.removeCompletedExact([1], [source], [completion]);
+    const replay = store.appendBatch([{ update_id: 1 }, { update_id: 3 }, { update_id: 4 }, { update_id: 5 }], 5);
+    assert.deepEqual(replay.addedUpdateIds, [3, 4, 5]); assert.deepEqual(replay.duplicateUpdateIds, [1]);
+    assert.deepEqual(replay.nonExcludedUpdateIds, [3, 4, 5]);
+    const queued = store.markQueued({ sourceUpdateIds: [3], queueKind: "control", receiptId: "independent", owner: queueOwnerIdentity });
+    store.completeQueued([{ sourceUpdateIds: [3], queueKind: "control", receiptId: "independent", queueOwner: queued.queueOwner! }]);
+    const failed = store.markExecutionFailure({ updateId: 4, expectedAttemptCount: 0, failedAtMs: 2000, failureClass: "fixture", summary: "fixture",
+      disposition: "failed", terminalReason: "fixture" });
+    store.applyOperatorDisposition({ action: "discard", updateId: 4, failureId: failed.entry.terminalFailureId! });
+    store.abandonPending({ journalBindingKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity: identity }),
+      entry: store.read().entries[0]!, operatorAuthorityId: "telegram-owner:7", isCurrent: () => true });
+    for (let revision = 6; revision < TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT + 10; revision++) store.appendBatch([], revision);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")).sourceCompletions, [completion], "snapshot compaction owns the ACK after deleting old segments");
+    assert.deepEqual(createStore(path, options).inspectSourceCompletion(completion), completion);
+    const before = await readFile(path, "utf8");
+    for (const foreign of [
+      { profileName: "foreign", botIdentity: identity },
+      { profileName: "work", botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "changed", botId: identity.botId }) },
+    ]) assert.throws(() => createTelegramUpdateJournalStore({ path, ...foreign }).read(), error => isJournalError(error, "identity-mismatch"));
+    assert.equal(await readFile(path, "utf8"), before, "empty entries do not make retained source proof disposable");
+  });
+});
+
+test("Scoped queued completion is absent from the raw input custody surface", async context => {
+  await withInputCustodyFixture(context, async ({ options }) => {
+    const raw = createTelegramInputJournalStore(options);
+    assert.equal("completeQueuedExact" in raw, false);
+    assert.equal("routingInputs" in raw, false);
+  });
+});
+
+test("Source completion refuses unguarded, malformed, unsupported and foreign-scope publication", sourceTestOptions, async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const store = createStore(path, { sourceAccess: { directory: dir, limits: sourceLimits },
+      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+    store.appendBatch([{ update_id: 1 }], 1);
+    const source = createTelegramUpdateJournalEntryDigest(store.read().entries[0]!);
+    const completion = { ...source, completionSha256: "a".repeat(64) };
+    const before = await readFile(path, "utf8");
+    for (const input of [[], [{ ...completion, completionSha256: "invalid" }], [{ ...completion, updateId: 2 }],
+      [{ ...completion, sourceSha256: "f".repeat(64) }], [{ ...completion, unknown: true }]]) {
+      assert.throws(() => store.removeCompletedExact([1], [source], input), error => isJournalError(error, "invalid"));
+    }
+    assert.throws(() => createStore(path).removeCompletedExact([1], [source], [completion]), /requires an exact source handle/);
+    assert.throws(() => createStore(path).inspectSourceCompletion(completion), /requires an exact source handle/);
+    assert.equal(await readFile(path, "utf8"), before);
+    assert.equal(existsSync(`${path}.segments`), false);
+    for (const version of [2, 3] as const) {
+      const file = JSON.parse(before); file.version = version; file.entries = []; file.sourceCompletions = [completion];
+      await writeFile(path, JSON.stringify(file));
+      assert.throws(() => inspectTelegramUpdateJournalFamily({ path, directory: dir, profile: "work", botIdentity: identity, limits: sourceLimits }),
+        error => isJournalError(error, "invalid"));
+    }
+  });
+});
+
 test("Update journal publishes and retains a monotonic admission cursor with its batch", async () => {
   await withJournalTempDir(async ({ path }) => {
     const store = createStore(path);
@@ -4806,8 +6246,39 @@ test("Update journal reconstructs ordered segments, rejects foreign identity, an
   });
 });
 
+test("Follower, recipient and path journal bindings expose the same exact queue receipt ports as the leader", async context => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-binding-ports-")));
+  try {
+    const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
+    const runtime = { instanceId: "binding-owner", processId: process.pid, processBirthId: `${process.pid}:binding-ports` };
+    const bindings = createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => "work", getBotToken: () => "123:synthetic-binding-ports", getBotId: () => 42,
+        getQueueRuntimeIdentity: () => runtime, withSourceSerialization: config.withSourceSerialization },
+      getLeaderJournalPath: () => join(dir, "inbox.work.json"),
+      getFollowerJournalPath: () => join(dir, "follower-inbox-fixture.work.json"),
+      getActiveFollowerBindingKey: () => "workspace:follower", isFollowerRegistered: () => true });
+    const resolvers = [["leader", bindings.resolveLeader], ["follower", bindings.resolveFollower],
+      ["recipient", bindings.createRecipientResolver("workspace:follower")], ["path", bindings.createPathResolver(join(dir, "other.work.json"))]] as const;
+    if (assertUnsupportedStrictInspection({ directory: dir, path: join(dir, "inbox.work.json"), profile: "work",
+      botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "123:synthetic-binding-ports", botId: 42 }),
+      limits: { maxFiles: 10, maxBytes: 1_000_000, maxEntries: 10, maxWork: 100 } }, context)) return;
+    for (const [name, resolve] of resolvers) {
+      const binding = resolve()!;
+      for (const port of ["isQueueReceiptCurrent", "inspectQueuedReceipt", "completeQueuedExact", "inspectSourceCompletion"] as const) {
+        assert.equal(typeof binding.journal[port], "function", `${name}.${port}`);
+      }
+      binding.journal.appendBatch([{ update_id: 1 }]);
+      const receipt = { queueKind: "prompt" as const, receiptId: `${name}-receipt`, sourceUpdateIds: [1] };
+      const { queueOwner } = binding.journal.markQueued({ ...receipt, owner: { ...runtime, sessionGeneration: 1 } });
+      assert.equal(binding.journal.isQueueReceiptCurrent!({ ...receipt, journalBindingKey: binding.recoveryKey }, queueOwner!), true, `${name} exact receipt`);
+      assert.equal(binding.journal.isQueueReceiptCurrent!({ ...receipt, journalBindingKey: "another-journal" }, queueOwner!), false, `${name} foreign binding`);
+      assert.deepEqual(binding.journal.completeQueued([{ ...receipt, queueOwner: queueOwner! }]).removedUpdateIds, [1]);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("Unsupported journal schemas remain byte-preserved even behind recoverable damage", async () => {
-  for (const scenario of ["snapshot", "segment", "damaged-snapshot", "revisionless-tail", "missing-snapshot"] as const) {
+  for (const unsupportedVersion of [2, 3, 4]) for (const scenario of ["snapshot", "segment", "damaged-snapshot", "revisionless-tail", "missing-snapshot"] as const) {
     await withJournalTempDir(async ({ dir, path }) => {
       const recoveries: unknown[] = [];
       let publications = 0;
@@ -4817,7 +6288,7 @@ test("Unsupported journal schemas remain byte-preserved even behind recoverable 
       const snapshot = JSON.parse(await readFile(path, "utf8"));
       delete snapshot.revision;
       if (scenario === "snapshot") {
-        snapshot.version = 2;
+        snapshot.version = unsupportedVersion;
         snapshot.futureRequiredField = true;
       }
       await writeFile(path, scenario === "damaged-snapshot" ? "{" : JSON.stringify(snapshot));
@@ -4826,10 +6297,10 @@ test("Unsupported journal schemas remain byte-preserved even behind recoverable 
       const segment = { version: 1, revision: 2, previousRevision: 1,
         profile: "work", botIdentity: identity, upsertedEntries: [], removedUpdateIds: [] };
       const firstPath = join(`${path}.segments`, "0000000000000002.json");
-      const first = JSON.stringify(scenario === "segment" ? { ...segment, version: 2, futureRequiredField: true } : segment);
+      const first = JSON.stringify(scenario === "segment" ? { ...segment, version: unsupportedVersion, futureRequiredField: true } : segment);
       await writeFile(firstPath, first);
       const tailPath = join(`${path}.segments`, "0000000000000003.json");
-      const tail = JSON.stringify({ ...segment, revision: 3, previousRevision: 2, version: 2, futureRequiredField: true });
+      const tail = JSON.stringify({ ...segment, revision: 3, previousRevision: 2, version: unsupportedVersion, futureRequiredField: true });
       await writeFile(tailPath, tail);
       const before = existsSync(path) ? await readFile(path, "utf8") : undefined;
       publications = 0;
@@ -4895,11 +6366,11 @@ test("Update journal repairs a revisionless snapshot from a later segment tail",
   });
 });
 
-test("Update journal quarantines and resets an uncertain orphaned segment history", async () => {
-  await withJournalTempDir(async ({ path }) => {
+test("Update journal deletes and resets an uncertain orphaned segment history", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
     const recoveryEvents: Array<{
       kind: "repaired" | "reset";
-      quarantinePath?: string;
+      deletedPaths?: string[];
       reason: string;
     }> = [];
     const store = createStore(path, {
@@ -4923,22 +6394,35 @@ test("Update journal quarantines and resets an uncertain orphaned segment histor
     assert.equal(recoveryEvents.length, 1);
     assert.equal(recoveryEvents[0]?.kind, "reset");
     assert.match(recoveryEvents[0]?.reason ?? "", /missing while .*segments/u);
-    const quarantinePath = recoveryEvents[0]?.quarantinePath;
-    assert.ok(quarantinePath);
-    assert.deepEqual(await readdir(quarantinePath), [
-      "inbox.work.json.segments",
-    ]);
-    assert.deepEqual(
-      await readdir(join(quarantinePath, "inbox.work.json.segments")),
-      ["0000000000000001.json"],
-    );
+    assert.deepEqual(recoveryEvents[0]?.deletedPaths, [`${path}.segments`]);
     await assert.rejects(() => stat(`${path}.segments`), /ENOENT/u);
+    assert.equal(existsSync(join(dir, "recovery")), false, "No recovery quarantine is created");
     assert.deepEqual(store.appendBatch([{ update_id: 2 }]).addedUpdateIds, [2]);
   });
 });
 
-test("Update journal restores orphaned segments when reset publication fails", async () => {
-  await withJournalTempDir(async ({ path }) => {
+test("Update journal replaces a corrupt snapshot and deletes its segments without quarantine", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const recoveryEvents: Array<{ kind: "repaired" | "reset"; deletedPaths?: string[] }> = [];
+    const store = createStore(path, { onRecovery: (event) => recoveryEvents.push(event) });
+    store.appendBatch([{ update_id: 1, message: { text: "lost with the damaged journal" } }]);
+    publishTelegramUpdateJournalSegment(path, {
+      version: 1, revision: 1, previousRevision: 0, profile: "work", botIdentity: identity,
+      upsertedEntries: [], removedUpdateIds: [],
+    });
+    await writeFile(path, "{ damaged", "utf8");
+    const reset = store.read();
+    assert.deepEqual(reset.entries, [], "Approved policy: corrupt input is lost, not retained");
+    assert.deepEqual(recoveryEvents.map(event => [event.kind, event.deletedPaths]), [["reset", [`${path}.segments`, path]]]);
+    assert.equal(existsSync(`${path}.segments`), false);
+    assert.equal(existsSync(join(dir, "recovery")), false);
+    assert.deepEqual(store.read().entries, []);
+    assert.equal(recoveryEvents.length, 1, "The replacement is a valid journal, not repeated recovery");
+  });
+});
+
+test("Update journal reset publication failure leaves no replayable damaged segments", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
     const seed = createStore(path);
     seed.appendBatch([{ update_id: 1 }]);
     publishTelegramUpdateJournalSegment(path, {
@@ -4961,10 +6445,9 @@ test("Update journal restores orphaned segments when reset publication fails", a
 
     assert.throws(() => recovering.read(), /mutation failed/u);
     await assert.rejects(() => stat(path), /ENOENT/u);
-    assert.deepEqual(await readdir(`${path}.segments`), [
-      "0000000000000001.json",
-    ]);
-    assert.deepEqual(seed.read().entries, []);
+    await assert.rejects(() => stat(`${path}.segments`), /ENOENT/u, "Damaged segments were deleted before publication");
+    assert.equal(existsSync(join(dir, "recovery")), false);
+    assert.deepEqual(seed.read().entries, [], "A later read starts from an absent journal, never stale segments");
   });
 });
 
@@ -6995,6 +8478,78 @@ test("Update journal serializes concurrent rebind and old-identity append", asyn
     assert.equal(snapshot.entries[0]?.updateId, source.profile === "rebound" ? 20_000 : 10_000);
   });
 });
+
+for (const scenario of ["expire", "half-hour", "selected", "cancel", "restart", "duplicate", "foreign", "changed", "authority", "before-copy", "after-copy", "batch", "delayed-write"] as const) {
+  test(`Routing input lifetime preserves one hour, exact source custody and no delivery inference (${scenario})`, async () => {
+    await withJournalTempDir(async ({ path }) => {
+      let now = 1000, active = true, fault: string | undefined;
+      const options = { path, botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture:routing-lifetime" }), getNowMs: () => now,
+        onPublicationBoundary(point: string, target: string) {
+          if (point === "before-write" && fault && (fault === "before-copy" ? target.startsWith(`${path}.retained`) : !target.startsWith(`${path}.retained`))) {
+            throw new Error("fixture routing retention interrupted");
+          }
+        } };
+      let journal = createTelegramUpdateJournalStore(options);
+      const binding = createTelegramUpdateJournalBindingKey(options);
+      journal.appendBatch([{ update_id: 1, message: { message_id: 11, text: "never selected", from: { id: 7, is_bot: false }, chat: { id: 7, type: "private" } } }]);
+      const original = journal.read().entries[0]!;
+      const input = { journalBindingKey: binding, entries: [original], operatorUserId: 7, publishedAtMs: now, isCurrent: () => active };
+      if (scenario === "delayed-write") now += 10_000;
+      const armed = journal.routingInputs!.arm(input)[0]!;
+      assert.deepEqual(armed.routingInput, { operatorUserId: 7, publishedAtMs: 1000, expiresAtMs: 3_601_000, phase: "waiting" });
+      assert.deepEqual(armed.update, original.update);
+      const expiry = { journalBindingKey: binding, entry: armed, operatorUserId: 7, isCurrent: () => active };
+      now += 30 * 60_000;
+      if (scenario === "half-hour" || scenario === "selected") {
+        const choice = journal.routingInputs!.select({ ...input, entries: [armed] });
+        assert.equal(choice.issued, true);
+        assert.equal(choice.entries[0]!.routingInput?.phase, "selected");
+        now += 60 * 60_000;
+        assert.throws(() => journal.routingInputs!.expire(expiry), /changed before abandonment/);
+        assert.equal(journal.read().entries.length, 1);
+        assert.equal(journal.routingInputs!.select({ ...input, entries: choice.entries }).issued, false, "A retained selection is not another issuance");
+        assert.throws(() => journal.routingInputs!.arm({ ...input, entries: choice.entries }), /cannot renew/);
+        return;
+      }
+      if (scenario === "cancel") {
+        journal.abandonPending({ journalBindingKey: binding, entry: armed, operatorAuthorityId: "telegram-owner:7", isCurrent: () => active });
+        assert.equal(journal.read().entries.length, 0); return;
+      }
+      if (scenario === "foreign" || scenario === "authority" || scenario === "changed") {
+        if (scenario === "foreign") input.operatorUserId = 8;
+        if (scenario === "authority") active = false;
+        if (scenario === "changed") input.entries = [{ ...armed, update: { ...armed.update, message: { text: "forged" } } }];
+        assert.throws(() => journal.routingInputs!.arm(input));
+        assert.deepEqual(journal.read().entries, [armed]); return;
+      }
+      if (scenario === "batch") {
+        journal.appendBatch([{ update_id: 2, message: { text: "sibling" } }]);
+        const before = journal.read();
+        assert.throws(() => journal.routingInputs!.select({ ...input, entries: before.entries }), /not armed/);
+        assert.deepEqual(journal.read(), before, "A later source failure cannot partially freeze a batch"); return;
+      }
+      if (scenario === "restart") journal = createTelegramUpdateJournalStore(options);
+      const duplicate = journal.routingInputs!.arm({ ...input, entries: [armed] })[0]!;
+      assert.deepEqual(duplicate, armed, "Neither refresh nor reconstruction renews the clock");
+      assert.throws(() => journal.routingInputs!.expire(expiry), /not expired/);
+      now = armed.routingInput!.expiresAtMs;
+      assert.throws(() => journal.routingInputs!.select({ ...input, entries: [armed] }), /expired/);
+      if (scenario === "before-copy" || scenario === "after-copy") {
+        fault = scenario;
+        assert.throws(() => journal.routingInputs!.expire(expiry));
+        assert.deepEqual(journal.read().entries, [armed]);
+        fault = undefined;
+        if (scenario === "after-copy") assert.throws(() => journal.routingInputs!.select({ ...input, entries: [armed] }), /protected retention/);
+      }
+      const ack = journal.routingInputs!.expire(expiry);
+      assert.equal(journal.read().entries.length, 0);
+      assert.deepEqual(JSON.parse(await readFile(ack.retainedPath, "utf8")).entry, armed);
+      assert.equal(journal.inspectAbandonedPending(1)?.operatorAuthorityId, "telegram-owner:7");
+      assert.deepEqual(journal.appendBatch([original.update]).duplicateUpdateIds, [1]);
+      if (scenario === "duplicate") assert.equal(journal.routingInputs!.expire(expiry).duplicate, true);
+    });
+  });
+}
 
 test("Update journal transaction serializes concurrent process appenders", async () => {
   await withJournalTempDir(async ({ path }) => {

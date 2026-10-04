@@ -7,9 +7,10 @@ import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from
 import { getTelegramTargetKey } from "./target.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
-import { createTelegramCleanupTargetProtection, commitTelegramWorkspaceProvisionBinding, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, normalizeTelegramWorkspacePath, provisionOwnBusTopic, } from "./threads.js";
-export function markTelegramConfigSyncChange(state, action, options) {
+import { createTelegramCleanupTargetProtection, commitTelegramWorkspaceProvisionBinding, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, } from "./threads.js";
+function markTelegramConfigSyncChange(state, action, options) {
     const nowMs = options?.nowMs ?? Date.now();
     let nextState = markTelegramSyncSliceFresh(state, "pairing", {
         nowMs,
@@ -61,7 +62,7 @@ export function createTelegramPreservedLeaderQuitHandler(deps) {
         };
     };
 }
-export function createTelegramSessionRestartThreadCleanupHandler(deps) {
+function createTelegramSessionRestartThreadCleanupHandler(deps) {
     return createTelegramManualThreadDisconnectHandler({
         ...deps,
         workspaceOperationKind: "workspace.cleanup-session-restart",
@@ -655,7 +656,7 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
         deps.topicTargetStore.releaseWorkspaceClaim(deps.instanceId);
     }
 }
-export const TELEGRAM_SYNC_SLICE_TARGET_BINDINGS = "target-bindings";
+const TELEGRAM_SYNC_SLICE_TARGET_BINDINGS = "target-bindings";
 export const TELEGRAM_SYNC_SLICES = [
     "bot-identity",
     "bot-capabilities",

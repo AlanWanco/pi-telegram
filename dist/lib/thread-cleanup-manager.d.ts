@@ -173,6 +173,7 @@ export interface TelegramThreadCleanupWorkStore {
 }
 export declare function createTelegramThreadCleanupWorkStore(options: {
     path: string;
+    runtimeDir?: string;
     profileName: string;
     tokenSha256: string;
     maxWorkSets?: number;

@@ -8,12 +8,13 @@
 import { isDeepStrictEqual } from "node:util";
 
 import type {
+  TelegramJournalNamespaceInspection,
   TelegramUpdateJournalDeadQueueOwnerRecoveryInput,
   TelegramUpdateJournalDeadQueueOwnerRecoveryResult,
   TelegramUpdateJournalEntry,
   TelegramUpdateJournalQueueOwnerIdentity,
 } from "./journal.ts";
-import type { TelegramTarget } from "./target.ts";
+import { areTelegramTargetsEqual as sameTarget, type TelegramTarget } from "./target.ts";
 import {
   getTelegramApiErrorRequestTarget,
   isTelegramApiRequestRejected,
@@ -21,6 +22,7 @@ import {
 } from "./telegram-api.ts";
 import type {
   TelegramTopicTargetStore,
+  TelegramWorkspaceJournalSource,
   TelegramWorkspaceExternalProtectionEvidence,
   TelegramWorkspaceRetirementIntent,
   TelegramWorkspaceProtectionState,
@@ -104,8 +106,8 @@ export interface TelegramWorkspaceJournalProtectionCapture {
 
 interface TelegramWorkspaceJournalReader {
   recoveryKey?: string;
-  journal: { read: () => { entries: readonly { update: unknown }[] } };
-  readForProtection?: () => { entries: readonly { update: unknown }[] };
+  journal: { read: () => { entries: readonly { update: unknown }[]; exists?: boolean } };
+  readForProtection?: () => { entries: readonly { update: unknown }[]; exists?: boolean };
 }
 
 export function captureTelegramWorkspaceJournalProtectionSources(input: {
@@ -113,6 +115,10 @@ export function captureTelegramWorkspaceJournalProtectionSources(input: {
   resolveLeader: () => TelegramWorkspaceJournalReader | undefined;
   createFollowerResolver: (
     journalBindingKey: string,
+  ) => () => TelegramWorkspaceJournalReader | undefined;
+  createSessionResolver?: (
+    recipientBindingKey: string,
+    sessionId: string,
   ) => () => TelegramWorkspaceJournalReader | undefined;
   withJournalReference?: <T>(binding: TelegramWorkspaceJournalReader,
     operation: () => T) => T;
@@ -140,7 +146,8 @@ export function captureTelegramWorkspaceJournalProtectionSources(input: {
       const snapshot = input.withJournalReference
         ? input.withJournalReference(binding, read)
         : read();
-      sources.push({ kind: "available", scope, entries: snapshot.entries });
+      sources.push({ kind: "available", scope, entries: snapshot.entries,
+        ...(snapshot.exists === undefined ? {} : { exists: snapshot.exists }) });
     } catch {
       complete = false;
       sources.push({ kind: "unknown", scope });
@@ -157,6 +164,11 @@ export function captureTelegramWorkspaceJournalProtectionSources(input: {
       input.createFollowerResolver(journalBindingKey),
     );
   }
+  for (const source of input.binding.journalSources ?? []) {
+    capture({ kind: "binding", bindingKey: input.binding.bindingKey,
+      journalBindingKey: source.recipientBindingKey, sessionId: source.sessionId },
+      input.createSessionResolver?.(source.recipientBindingKey, source.sessionId) ?? (() => undefined));
+  }
   for (const path of input.discovery?.paths ?? []) {
     capture({ kind: "discovered", path }, input.discovery!.createResolver(path));
   }
@@ -168,15 +180,17 @@ export type TelegramWorkspaceJournalProtectionSource =
       kind: "available";
       scope:
         | { kind: "shared" }
-        | { kind: "binding"; bindingKey: string; journalBindingKey: string }
+        | { kind: "binding"; bindingKey: string; journalBindingKey: string; sessionId?: string }
         | { kind: "discovered"; path: string };
       entries: readonly { update: unknown }[];
+      /** Positive filesystem presence is distinct from a complete namespace with a missing historical family. */
+      exists?: boolean;
     }
   | {
       kind: "unknown";
       scope:
         | { kind: "shared" }
-        | { kind: "binding"; bindingKey: string; journalBindingKey: string }
+        | { kind: "binding"; bindingKey: string; journalBindingKey: string; sessionId?: string }
         | { kind: "discovered"; path: string };
     };
 
@@ -206,18 +220,13 @@ function getJournalUpdateTarget(update: unknown):
   };
 }
 
-function sameTarget(
-  left: { chatId: number; threadId?: number },
-  right: { chatId: number; threadId?: number },
-): boolean {
-  return left.chatId === right.chatId && left.threadId === right.threadId;
-}
-
 export function resolveTelegramWorkspaceAcceptedWorkProtection(input: {
   binding: TelegramWorkspaceThreadBinding;
   localAcceptedTargets: readonly { chatId: number; threadId?: number }[];
   journalSources: readonly TelegramWorkspaceJournalProtectionSource[];
   sourcesComplete: boolean;
+  /** Relocation cannot infer execution ownership from the original Telegram message target. */
+  requireBindingProvenance?: boolean;
 }): TelegramWorkspaceProtectionState {
   if (input.localAcceptedTargets.some((target) => sameTarget(target, input.binding.target))) {
     return "protected";
@@ -231,8 +240,16 @@ export function resolveTelegramWorkspaceAcceptedWorkProtection(input: {
       unknown = true;
       continue;
     }
+    if (input.requireBindingProvenance && source.scope.kind === "binding" && source.exists === false) {
+      unknown = true;
+      continue;
+    }
     if (source.scope.kind === "binding" && source.entries.length > 0) {
       return "protected";
+    }
+    if (input.requireBindingProvenance && source.entries.length > 0) {
+      unknown = true;
+      continue;
     }
     for (const entry of source.entries) {
       const target = getJournalUpdateTarget(entry.update);
@@ -251,19 +268,22 @@ export type TelegramWorkspaceJournalPruneResult =
       kind: "committed";
       binding: TelegramWorkspaceThreadBinding;
       removedKeys: string[];
+      removedSources?: TelegramWorkspaceJournalSource[];
     }
   | {
       kind: "blocked";
-      reason: "incomplete-evidence" | "writer-not-quiescent" | "state-changed";
+      reason: "incomplete-evidence" | "writer-not-quiescent" | "state-changed" | "publication-refused";
     };
 
 export async function pruneTelegramWorkspaceJournalEvidence(input: {
   store: Pick<
     TelegramTopicTargetStore,
-    "commitWorkspaceJournalEvidence" | "persist"
+    "commitWorkspaceJournalEvidence" | "persistWorkspaceJournalEvidence"
   >;
   binding: TelegramWorkspaceThreadBinding;
-  capture: TelegramWorkspaceJournalProtectionCapture;
+  /** Capture fresh source evidence after admission, not a snapshot taken before the lease. */
+  capture: () => TelegramWorkspaceJournalProtectionCapture;
+  runExclusive: TelegramWorkspaceOperationGate["runExclusive"];
   getJournalWriterProtection: (
     journalBindingKey: string,
   ) => TelegramWorkspaceProtectionState;
@@ -289,72 +309,68 @@ export async function pruneTelegramWorkspaceJournalEvidence(input: {
         "Telegram Workspace journal pruning requires current leader authority.",
       );
     }
-    const shared = input.capture.sources.filter(
-      (source) => source.scope.kind === "shared",
-    );
-    const bindingSources = input.capture.sources.filter(
-      (source) =>
-        source.scope.kind === "binding" &&
-        source.scope.bindingKey === input.binding.bindingKey,
-    );
-    const sourceByKey = new Map(
-      bindingSources.flatMap((source) =>
-        source.scope.kind === "binding"
-          ? [[source.scope.journalBindingKey, source] as const]
-          : [],
-      ),
-    );
-    if (
-      !input.capture.complete ||
-      shared.length !== 1 ||
-      shared[0]?.kind !== "available" ||
-      bindingSources.length !==
-        (input.binding.journalBindingKeys ?? []).length ||
-      sourceByKey.size !== (input.binding.journalBindingKeys ?? []).length ||
-      Array.from(sourceByKey.values()).some(
-        (source) => source.kind !== "available",
-      )
-    ) {
+    let capture: TelegramWorkspaceJournalProtectionCapture;
+    try { capture = input.capture(); }
+    catch { return { kind: "blocked", reason: "incomplete-evidence" }; }
+    const address = (key: string, sessionId?: string) => JSON.stringify([sessionId ?? null, key]);
+    const keys = input.binding.journalBindingKeys ?? [];
+    const sessions = input.binding.journalSources ?? [];
+    const expected = [
+      ...keys.map(key => address(key)),
+      ...sessions.map(source => address(source.recipientBindingKey, source.sessionId)),
+    ];
+    const shared = capture.sources.filter(source => source.scope.kind === "shared");
+    const bindingSources = capture.sources.filter(source => source.scope.kind === "binding" &&
+      source.scope.bindingKey === input.binding.bindingKey);
+    const sourceByAddress = new Map(bindingSources.flatMap(source => source.scope.kind === "binding"
+      ? [[address(source.scope.journalBindingKey, source.scope.sessionId), source] as const] : []));
+    if (!capture.complete || shared.length !== 1 || shared[0]?.kind !== "available" ||
+        bindingSources.length !== expected.length || sourceByAddress.size !== expected.length ||
+        expected.some(key => sourceByAddress.get(key)?.kind !== "available")) {
       return { kind: "blocked", reason: "incomplete-evidence" };
     }
-    const emptyKeys = (input.binding.journalBindingKeys ?? []).filter((key) => {
-      const source = sourceByKey.get(key);
+    const empty = new Set(expected.filter(key => {
+      const source = sourceByAddress.get(key);
       return source?.kind === "available" && source.entries.length === 0;
-    });
-    if (
-      emptyKeys.some(
-        (key) => input.getJournalWriterProtection(key) !== "clear",
-      )
-    ) {
+    }));
+    const emptyWriterKeys = new Set([
+      ...keys.filter(key => empty.has(address(key))),
+      ...sessions.filter(source => empty.has(address(source.recipientBindingKey, source.sessionId)))
+        .map(source => source.recipientBindingKey),
+    ]);
+    const quiescent = new Set([...emptyWriterKeys].filter(key => input.getJournalWriterProtection(key) === "clear"));
+    const removedKeys = keys.filter(key => empty.has(address(key)) && quiescent.has(key));
+    const removedSources = sessions.filter(source => empty.has(address(source.recipientBindingKey, source.sessionId)) &&
+      quiescent.has(source.recipientBindingKey));
+    if (empty.size > 0 && removedKeys.length === 0 && removedSources.length === 0) {
       return { kind: "blocked", reason: "writer-not-quiescent" };
     }
-    const retainedKeys = (input.binding.journalBindingKeys ?? []).filter(
-      (key) => !emptyKeys.includes(key),
-    );
+    const retainedKeys = keys.filter(key => !removedKeys.includes(key));
+    const retainedSources = sessions.filter(source => !removedSources.includes(source));
     if (!isCurrent()) {
       throw new Error("Telegram Workspace journal pruning lost leader authority.");
     }
     const binding = input.store.commitWorkspaceJournalEvidence(
-      input.binding,
-      retainedKeys,
-      input.binding.journalBindingsComplete === true,
+      input.binding, retainedKeys, input.binding.journalBindingsComplete === true, retainedSources,
     );
     if (!binding) return { kind: "blocked", reason: "state-changed" };
-    const removedKeys = (input.binding.journalBindingKeys ?? []).filter(
-      (key) => !retainedKeys.includes(key),
-    );
-    if (removedKeys.length > 0) await input.store.persist();
+    if (removedKeys.length > 0 || removedSources.length > 0) {
+      const published = await input.store.persistWorkspaceJournalEvidence(binding, isCurrent);
+      if (!isCurrent()) throw new Error("Telegram Workspace journal pruning lost leader authority.");
+      if (!published) return { kind: "blocked", reason: "publication-refused" };
+    }
     if (!isCurrent()) {
       throw new Error("Telegram Workspace journal pruning lost leader authority.");
     }
-    return { kind: "committed", binding, removedKeys };
+    return { kind: "committed", binding, removedKeys,
+      ...(removedSources.length ? { removedSources: removedSources.map(source => ({ ...source })) } : {}) };
   };
   return runWithTelegramWorkspaceAdmissionsAsync({
     ledger: input.admission,
     operationId: createTelegramWorkspaceAdmissionOperationId(),
     operationKind: "workspace.prune-journal-evidence",
     scopes: [{ kind: "target", target: input.binding.target }],
-    operation,
+    operation: () => input.runExclusive(operation),
     onReleaseError(error) {
       input.onAdmissionReleaseError?.(error);
     },
@@ -363,6 +379,7 @@ export async function pruneTelegramWorkspaceJournalEvidence(input: {
 
 export function captureTelegramWorkspaceExternalProtection(input: {
   binding: TelegramWorkspaceThreadBinding;
+  requireBindingProvenance?: boolean;
   getLiveOwnerProtection: (
     binding: TelegramWorkspaceThreadBinding,
   ) => TelegramWorkspaceProtectionState;
@@ -392,6 +409,7 @@ export function captureTelegramWorkspaceExternalProtection(input: {
       localAcceptedTargets: local.targets,
       journalSources: journals.sources,
       sourcesComplete: journals.complete && local.complete,
+      requireBindingProvenance: input.requireBindingProvenance,
     });
   } catch {
     // Unavailable queue or journal evidence must not clear accepted work.
@@ -404,7 +422,7 @@ export function captureTelegramWorkspaceExternalProtection(input: {
   return { liveOwner, acceptedWork, deliveryAuthority };
 }
 
-export function createTelegramWorkspaceExternalProtectionCapture(deps: {
+interface TelegramWorkspaceProtectionObserverDeps {
   listFollowers: () => readonly { target?: TelegramTarget }[];
   getActiveTurnTarget: () => TelegramTarget | undefined;
   getQueuedItems: () => readonly { chatId: number; target?: TelegramTarget }[];
@@ -412,7 +430,13 @@ export function createTelegramWorkspaceExternalProtectionCapture(deps: {
   createFollowerJournalResolver: (
     journalBindingKey: string,
   ) => () => TelegramWorkspaceJournalReader | undefined;
+  createSessionJournalResolver?: (
+    recipientBindingKey: string,
+    sessionId: string,
+  ) => () => TelegramWorkspaceJournalReader | undefined;
   discoverFollowerJournals?: () => { paths: readonly string[]; complete: boolean };
+  /** Strict read-only namespace evidence; it never substitutes for writer closure. */
+  inspectJournalNamespace?: () => TelegramJournalNamespaceInspection;
   createJournalPathResolver?: (
     path: string,
   ) => () => TelegramWorkspaceJournalReader | undefined;
@@ -424,19 +448,56 @@ export function createTelegramWorkspaceExternalProtectionCapture(deps: {
   getDeliveryAuthorityProtection?: (
     binding: TelegramWorkspaceThreadBinding,
   ) => TelegramWorkspaceProtectionState;
-}): (
-  binding: TelegramWorkspaceThreadBinding,
-) => TelegramWorkspaceExternalProtectionEvidence {
-  return function (binding) {
+}
+
+export interface TelegramWorkspaceProtectionObserver {
+  capture: (binding: TelegramWorkspaceThreadBinding,
+    options?: { requireBindingProvenance?: boolean }) => TelegramWorkspaceExternalProtectionEvidence;
+  captureJournalSources: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceJournalProtectionCapture;
+  getJournalWriterProtection: (journalBindingKey: string) => TelegramWorkspaceProtectionState;
+}
+
+/** Shared read-only observer: protection and metadata pruning use the same scoped evidence path. */
+export function createTelegramWorkspaceProtectionObserver(deps: TelegramWorkspaceProtectionObserverDeps): TelegramWorkspaceProtectionObserver {
+  const captureJournalSources: TelegramWorkspaceProtectionObserver["captureJournalSources"] = (candidate) => {
+    const namespace = deps.inspectJournalNamespace?.();
+    if (deps.inspectJournalNamespace && (!namespace || namespace.sources.filter(source => source.role === "polling").length !== 1))
+      throw new Error("Telegram strict namespace evidence is unavailable or incomplete.");
+    if (namespace?.retainedInputs?.some(original => original.state !== "committed")) throw new Error(
+      "Telegram namespace contains uncommitted private retention evidence.",
+    );
+    const discovery = namespace
+      ? { paths: namespace.sources.filter(source => source.role !== "polling" && source.evidence.kind === "present")
+          .map(source => source.path), complete: true }
+      : candidate.journalBindingsComplete === true ? undefined : deps.discoverFollowerJournals?.();
+    if (namespace && !deps.createJournalPathResolver) throw new Error(
+      "Telegram strict namespace protection requires discovered source resolution.",
+    );
+    return captureTelegramWorkspaceJournalProtectionSources({
+      binding: candidate,
+      resolveLeader: deps.resolveLeaderJournal,
+      createFollowerResolver: deps.createFollowerJournalResolver,
+      ...(deps.createSessionJournalResolver ? { createSessionResolver: deps.createSessionJournalResolver } : {}),
+      ...(deps.withJournalReference ? { withJournalReference: deps.withJournalReference } : {}),
+      ...(discovery && deps.createJournalPathResolver
+        ? { discovery: { ...discovery, createResolver: deps.createJournalPathResolver } } : {}),
+    });
+  };
+  const capture: TelegramWorkspaceProtectionObserver["capture"] = function (binding, options) {
     return captureTelegramWorkspaceExternalProtection({
       binding,
+      requireBindingProvenance: options?.requireBindingProvenance,
       getLiveOwnerProtection(candidate) {
         if (deps.listFollowers().some((follower) =>
           !!follower.target && sameTarget(follower.target, candidate.target),
         )) return "protected";
         if (!deps.getJournalWriterProtection) return "unknown";
         let unknown = candidate.journalBindingsComplete !== true;
-        for (const journalBindingKey of candidate.journalBindingKeys ?? []) {
+        const writerKeys = new Set([
+          ...(candidate.journalBindingKeys ?? []),
+          ...(candidate.journalSources ?? []).map(source => source.recipientBindingKey),
+        ]);
+        for (const journalBindingKey of writerKeys) {
           const protection = deps.getJournalWriterProtection(journalBindingKey);
           if (protection === "protected") return "protected";
           if (protection === "unknown") unknown = true;
@@ -455,27 +516,38 @@ export function createTelegramWorkspaceExternalProtectionCapture(deps: {
         }
         return { targets, complete };
       },
-      captureJournalSources(candidate) {
-        const discovery = candidate.journalBindingsComplete === true
-          ? undefined
-          : deps.discoverFollowerJournals?.();
-        return captureTelegramWorkspaceJournalProtectionSources({
-          binding: candidate,
-          resolveLeader: deps.resolveLeaderJournal,
-          createFollowerResolver: deps.createFollowerJournalResolver,
-          ...(deps.withJournalReference
-            ? { withJournalReference: deps.withJournalReference } : {}),
-          ...(discovery && deps.createJournalPathResolver
-            ? { discovery: {
-                ...discovery,
-                createResolver: deps.createJournalPathResolver,
-              } }
-            : {}),
-        });
-      },
+      captureJournalSources,
       ...(deps.getDeliveryAuthorityProtection
         ? { getDeliveryAuthorityProtection: deps.getDeliveryAuthorityProtection }
         : {}),
+    });
+  };
+  return { capture, captureJournalSources,
+    getJournalWriterProtection: deps.getJournalWriterProtection ?? (() => "unknown") };
+}
+
+/** Callable protection view retained for callers that need no metadata observation ports. */
+export function createTelegramWorkspaceExternalProtectionCapture(deps: TelegramWorkspaceProtectionObserverDeps): TelegramWorkspaceProtectionObserver["capture"] {
+  return createTelegramWorkspaceProtectionObserver(deps).capture;
+}
+
+export function createTelegramWorkspaceJournalEvidencePruner(deps: TelegramWorkspaceOperationGate & {
+  store: TelegramTopicTargetStore;
+  getAdmission: () => TelegramWorkspaceAdmissionLedger | undefined;
+  getLeaderEpoch: () => number | string | undefined;
+  protection: Pick<TelegramWorkspaceProtectionObserver, "captureJournalSources" | "getJournalWriterProtection">;
+}): (binding: TelegramWorkspaceThreadBinding, isCurrent: () => boolean) => Promise<TelegramWorkspaceJournalPruneResult> {
+  return async (binding, isCurrent) => {
+    const admission = deps.getAdmission();
+    if (!admission) return { kind: "blocked", reason: "state-changed" };
+    const profileKey = admission.getProfileKey();
+    return pruneTelegramWorkspaceJournalEvidence({
+      store: deps.store, binding, admission, runExclusive: deps.runExclusive,
+      capture: () => deps.protection.captureJournalSources(binding),
+      getJournalWriterProtection: deps.protection.getJournalWriterProtection,
+      getLeaderEpoch: deps.getLeaderEpoch,
+      getProfileKey: () => deps.getAdmission()?.getProfileKey() ?? "",
+      isCurrent: () => isCurrent() && deps.getAdmission()?.getProfileKey() === profileKey,
     });
   };
 }
@@ -530,6 +602,10 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps: {
   createFollowerJournalResolver: (
     journalBindingKey: string,
   ) => () => TelegramWorkspaceDeadQueueJournalBinding | undefined;
+  createSessionJournalResolver?: (
+    recipientBindingKey: string,
+    sessionId: string,
+  ) => () => TelegramWorkspaceDeadQueueJournalBinding | undefined;
   discoverFollowerJournals?: () => { paths: readonly string[]; complete: boolean };
   createJournalPathResolver?: (
     path: string,
@@ -564,6 +640,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps: {
     if (!isCurrent() || !deps.isBindingCurrent(binding)) {
       return { kind: "blocked", reason: "authority-changed" };
     }
+    // Session addresses require exact resolution; never substitute a flat same-hash journal.
+    if (binding.journalSources?.length && !deps.createSessionJournalResolver)
+      return { kind: "blocked", reason: "incomplete-source" };
     const initial = deps.getExternalProtection(binding);
     if (initial.liveOwner !== "clear" || initial.deliveryAuthority !== "clear") {
       return { kind: "blocked", reason: "live-owner" };
@@ -606,6 +685,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps: {
     capture("shared", deps.resolveLeaderJournal);
     for (const key of binding.journalBindingKeys ?? []) {
       capture("binding", deps.createFollowerJournalResolver(key));
+    }
+    for (const source of binding.journalSources ?? []) {
+      capture("binding", deps.createSessionJournalResolver!(source.recipientBindingKey, source.sessionId));
     }
     for (const path of discovery?.paths ?? []) {
       if (!deps.createJournalPathResolver) {
@@ -1339,6 +1421,8 @@ export type TelegramWorkspaceCapacityRunner = <T>(operation: () => Promise<T>) =
 export interface TelegramWorkspaceSlotRotationPorts extends TelegramWorkspaceOperationGate {
   getAdmission: () => TelegramWorkspaceAdmissionLedger | undefined;
   deleteThread: TelegramWorkspaceThreadDeletionTransport;
+  pruneJournalEvidence?: (binding: TelegramWorkspaceThreadBinding,
+    isCurrent: () => boolean) => Promise<TelegramWorkspaceJournalPruneResult>;
   reclaimDeadOwnerQueuedWork?: (
     binding: TelegramWorkspaceThreadBinding,
     isCurrent: () => boolean,
@@ -1417,14 +1501,16 @@ export function createTelegramWorkspaceSlotRotation(input: TelegramWorkspaceSlot
       try { return await operation(); }
       catch (error) {
         if (!(error instanceof TelegramWorkspaceSlotUnavailableError)) throw error;
-        if (input.reclaimDeadOwnerQueuedWork) {
+        if (input.pruneJournalEvidence || input.reclaimDeadOwnerQueuedWork) {
           const candidates = await input.runExclusive(async () => {
             await input.store.load();
             if (!isCurrent()) throw new Error("Telegram Workspace reclamation lost leader authority.");
             const snapshot = input.store.captureWorkspaceSlotOccupancy(input.getExternalProtection);
             const allocation = planTelegramWorkspaceSlotAllocation({ ...snapshot, nowMs: Date.now() });
-            if (allocation.kind !== "blocked" || allocation.reason !== "protected-capacity") return [];
+            if (allocation.kind === "free" || (allocation.kind === "blocked" && allocation.reason !== "protected-capacity")) return [];
+            if (allocation.kind === "reclaim" && !input.pruneJournalEvidence) return [];
             return input.store.listWorkspaceBindings().filter((binding) =>
+              (allocation.kind !== "reclaim" || binding.bindingKey === allocation.candidate.bindingKey) &&
               typeof binding.inactiveSinceMs === "number" &&
               Number.isFinite(binding.inactiveSinceMs) &&
               binding.inactiveSinceMs >= 0,
@@ -1433,7 +1519,20 @@ export function createTelegramWorkspaceSlotRotation(input: TelegramWorkspaceSlot
               (left.slot ?? "").localeCompare(right.slot ?? ""),
             );
           });
-          for (const binding of candidates) {
+          for (const original of candidates) {
+            let binding = original;
+            if (input.pruneJournalEvidence && ((binding.journalBindingKeys?.length ?? 0) + (binding.journalSources?.length ?? 0) > 0)) {
+              const pruned = await input.pruneJournalEvidence(binding, isCurrent);
+              if (!isCurrent()) throw new Error("Telegram Workspace pruning lost leader authority.");
+              if (pruned.kind !== "committed") continue;
+              binding = pruned.binding;
+              const removed = pruned.removedKeys.length + (pruned.removedSources?.length ?? 0);
+              if (removed > 0) {
+                try { input.recordEvent("Telegram Workspace journal evidence pruned.", { slot: binding.slot, removed }); }
+                catch { /* Diagnostics cannot revoke a published metadata subset. */ }
+              }
+            }
+            if (!input.reclaimDeadOwnerQueuedWork) continue;
             const evidence = input.getExternalProtection(binding);
             if (evidence.liveOwner !== "clear" ||
                 evidence.acceptedWork !== "protected" ||

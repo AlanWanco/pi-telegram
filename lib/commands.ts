@@ -91,11 +91,11 @@ function getOrCreateTelegramCommandRegistry(): TelegramExtensionCommandRegistry 
   return registry;
 }
 
-export function normalizeTelegramExtensionCommandName(name: string): string {
+function normalizeTelegramExtensionCommandName(name: string): string {
   return name.trim().replace(/^\/+/, "").toLowerCase();
 }
 
-export function isTelegramExtensionCommandName(name: string): boolean {
+function isTelegramExtensionCommandName(name: string): boolean {
   return TELEGRAM_BOT_COMMAND_NAME_PATTERN.test(name);
 }
 
@@ -144,7 +144,7 @@ export function registerTelegramCommand(
   };
 }
 
-export function getTelegramExtensionCommands(): RegisteredTelegramExtensionCommand[] {
+function getTelegramExtensionCommands(): RegisteredTelegramExtensionCommand[] {
   return Array.from(
     getOrCreateTelegramCommandRegistry().commands.values(),
   ).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
@@ -181,7 +181,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
 
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
 
-export function getTelegramCommandEmoji(
+function getTelegramCommandEmoji(
   command: TelegramCommandEmojiName,
 ): string {
   return TELEGRAM_COMMAND_EMOJI[command];
@@ -235,12 +235,12 @@ export function formatTelegramAutomaticThreadDisplayNameRestoredHeading(
   return `<b>✅ Automatic Thread display name restored as <i>${escapeHtml(name)}</i>.</b>`;
 }
 
-export const TELEGRAM_COMPACTION_STARTED_TEXT =
+const TELEGRAM_COMPACTION_STARTED_TEXT =
   formatTelegramInformationHeading(
     getTelegramCommandEmoji("compact"),
     "Compaction started.",
   );
-export const TELEGRAM_COMPACTION_COMPLETED_TEXT =
+const TELEGRAM_COMPACTION_COMPLETED_TEXT =
   formatTelegramInformationHeading("✅", "Compaction completed.");
 export const TELEGRAM_COMPACTION_STARTED_MARKDOWN =
   `**${formatTelegramCommandEmojiPrefix("compact")}Compaction started.**`;
@@ -254,7 +254,7 @@ function formatTelegramBotCommandDescription(
   return `${formatTelegramCommandEmojiPrefix(command)}${description}`;
 }
 
-export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinition[] =
+const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinition[] =
   [
     {
       command: "start",
@@ -1504,7 +1504,7 @@ export async function handleTelegramNextCommand(deps: {
   deps.updateStatus();
 }
 
-export async function handleTelegramContinueCommand<TMessage, TContext>(
+async function handleTelegramContinueCommand<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: {
@@ -1530,7 +1530,7 @@ function dispatchNextQueuedTelegramTurnAfterCompact(
   deps.dispatchNextQueuedTelegramTurn();
 }
 
-export function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
+function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
   return {
     inline_keyboard: [
       [
@@ -1541,7 +1541,7 @@ export function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfir
   };
 }
 
-export function getTelegramNewConfirmationHtml(): string {
+function getTelegramNewConfirmationHtml(): string {
   return "<b>Start a new session?</b>";
 }
 
@@ -1588,7 +1588,7 @@ export async function handleTelegramNewConfirmationCallback<TContext>(
   return true;
 }
 
-export function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
+function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
   return {
     inline_keyboard: [
       [
@@ -1599,11 +1599,11 @@ export function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactCo
   };
 }
 
-export function getTelegramCompactConfirmationHtml(): string {
+function getTelegramCompactConfirmationHtml(): string {
   return "<b>Compact session?</b>";
 }
 
-export async function openTelegramCompactConfirmation(
+async function openTelegramCompactConfirmation(
   target: TelegramCommandMessageTarget,
   deps: TelegramCompactConfirmationDeps,
 ): Promise<void> {
@@ -2373,7 +2373,7 @@ export const TELEGRAM_INTERNAL_COMMAND_DESCRIPTION =
 export const TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE =
   "This internal Telegram command cannot be run manually.";
 
-export function delayTelegramSessionAction(delayMs: number): Promise<void> {
+function delayTelegramSessionAction(delayMs: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }
 
@@ -2433,7 +2433,7 @@ export async function settleTelegramSessionReplacement(
   return "stale";
 }
 
-export function createTelegramSessionReplacementSettlementRuntime<TContext>(deps: {
+function createTelegramSessionReplacementSettlementRuntime<TContext>(deps: {
   resolve: (ctx: TContext) => TelegramSessionReplacementSettlementDeps | undefined;
   onResult?: (result: "none" | "settled" | "expired" | "failed" | "stale") => void;
   onError?: (error: unknown) => void;

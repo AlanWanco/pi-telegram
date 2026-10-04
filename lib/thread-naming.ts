@@ -1,11 +1,11 @@
 /**
- * Telegram Thread manual-name dialog state
- * Zones: telegram, thread identity, runtime controls
- * Owns one expiring exact-target interaction per session scope.
- * Excludes Telegram transport, durable Workspace mutation, and name validation.
+ * Telegram Thread naming rules and manual-name interaction
+ * Zones: thread identity names, palettes, title formatting, runtime controls
+ * Owns name/title value policy and one expiring exact-target dialog per session scope.
+ * Excludes occupancy/slot allocation, display-mode projection, transport and API/store effects.
  */
 
-import type { TelegramTarget } from "./target.ts";
+import { areTelegramTargetsEqual as sameTarget, type TelegramTarget } from "./target.ts";
 
 export const TELEGRAM_THREAD_NAME_DIALOG_TTL_MS = 5 * 60_000;
 
@@ -21,10 +21,6 @@ export interface TelegramThreadNameDialogCandidate {
 
 function targetKey(target: TelegramTarget): string {
   return `${target.chatId}:${target.threadId ?? "chat"}`;
-}
-
-function sameTarget(left: TelegramTarget, right: TelegramTarget): boolean {
-  return left.chatId === right.chatId && left.threadId === right.threadId;
 }
 
 function cloneCandidate(
@@ -115,4 +111,266 @@ export function createTelegramThreadNameDialogRuntime(options?: {
       return cloneCandidate(candidate);
     },
   };
+}
+
+export interface TelegramThreadTitleInput {
+  instanceId: string;
+  profileKey: string;
+  threadName?: string;
+}
+
+export interface TelegramThreadNameInput {
+  seed: string;
+  cwd?: string;
+  role?: "leader" | "follower";
+  peers?: readonly string[];
+  slot?: string;
+}
+
+function hashString(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function getWorkspaceHint(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  const parts = cwd.split("/").filter(Boolean);
+  const last = parts.at(-1)?.trim();
+  if (!last) return undefined;
+  return (
+    last
+      .replace(/[^\p{L}\p{N}._-]+/gu, " ")
+      .trim()
+      .slice(0, 32) || undefined
+  );
+}
+
+export function createTelegramThreadName(
+  input: TelegramThreadNameInput,
+): string {
+  const workspace = getWorkspaceHint(input.cwd);
+  const roleMark =
+    input.role === "leader"
+      ? "Leader"
+      : input.role === "follower"
+        ? "Follower"
+        : undefined;
+  const slot = input.slot ? `Thread ${input.slot}` : undefined;
+  const peerSalt = input.peers?.slice().sort().join("|") ?? "";
+  const fallback = `Instance ${hashString(
+    `${input.seed}|${input.cwd ?? ""}|${input.role ?? ""}|${peerSalt}|${input.slot ?? ""}`,
+  )
+    .toString(36)
+    .slice(0, 4)}`;
+  return (
+    [slot, workspace, roleMark].filter(Boolean).join(" ").slice(0, 96) ||
+    fallback
+  );
+}
+
+export function normalizeTelegramTopicTargetThreadName(
+  threadName: string,
+): string {
+  return threadName.replace(/\s+/g, " ").trim().slice(0, 96);
+}
+
+function getGraphemeSegments(value: string): string[] {
+  const segmenter = (
+    Intl as unknown as {
+      Segmenter?: new (
+        locale?: string,
+        options?: { granularity: "grapheme" },
+      ) => { segment(input: string): Iterable<{ segment: string }> };
+    }
+  ).Segmenter;
+  if (!segmenter) return Array.from(value);
+  return Array.from(
+    new segmenter(undefined, { granularity: "grapheme" }).segment(value),
+    (part) => part.segment,
+  );
+}
+
+export function getTelegramTopicIdentityName(threadName: string): string {
+  return getGraphemeSegments(normalizeTelegramTopicTargetThreadName(threadName))
+    .join("")
+    .trim();
+}
+
+const TELEGRAM_THREAD_NAME_PALETTE: Record<string, readonly string[]> = {
+  A: ["Atlas", "Aster", "Aurora", "Anchor", "Ashen"],
+  B: ["Beacon", "Briar", "Boreal", "Birch", "Bison"],
+  C: ["Cedar", "Comet", "Cipher", "Coral", "Cinder"],
+  D: ["Delta", "Dawn", "Drift", "Dune", "Dagger"],
+  E: ["Ember", "Echo", "Eagle", "Eden", "Elder"],
+  F: ["Falcon", "Fjord", "Flint", "Forest", "Fable"],
+  G: ["Grove", "Glade", "Glyph", "Garnet", "Gale"],
+  H: ["Harbor", "Hawk", "Hazel", "Helix", "Haven"],
+  I: ["Iris", "Ivory", "Iron", "Isle", "Idea"],
+  J: ["Jade", "Juno", "Jolt", "Jewel", "Jasper"],
+  K: ["Kite", "Karma", "Kernel", "Kodiak", "Kelp"],
+  L: ["Lumen", "Laurel", "Lynx", "Lotus", "Lagoon"],
+  M: ["Maple", "Meteor", "Meadow", "Marble", "Moss"],
+  N: ["Nimbus", "Nova", "Nectar", "North", "Noble"],
+  O: ["Orion", "Onyx", "Opal", "Orbit", "Olive"],
+  P: ["Pine", "Pulse", "Praxis", "Pebble", "Prism"],
+  Q: ["Quartz", "Quill", "Quasar", "Quest", "Quiver"],
+  R: ["River", "Raven", "Rune", "Reef", "Ridge"],
+  S: ["Spruce", "Solar", "Signal", "Stone", "Sable"],
+  T: ["Timber", "Talon", "Terra", "Torch", "Tide"],
+  U: ["Umber", "Unity", "Ursa", "Uplink", "Ulmus"],
+  V: ["Violet", "Vector", "Vista", "Vale", "Vortex"],
+  W: ["Willow", "Warden", "Wave", "Winter", "Wisp"],
+  X: ["Xenon", "Xylem", "Xavier", "Xylo", "Xerus"],
+  Y: ["Yarrow", "Yonder", "Yukon", "Yale", "Yogi"],
+  Z: ["Zenith", "Zephyr", "Zircon", "Zebra", "Zion"],
+};
+
+export function chooseTelegramThreadName(input: {
+  slot: string | undefined;
+  entropy?: number | string;
+  getRandom?: () => number;
+  occupied?: readonly string[];
+}): string | undefined {
+  if (!input.slot || !/^[A-Z]$/.test(input.slot)) return undefined;
+  const names = TELEGRAM_THREAD_NAME_PALETTE[input.slot];
+  if (!names || names.length === 0) return undefined;
+  const occupied = new Set(
+    (input.occupied ?? []).map((name) => getTelegramTopicIdentityName(name)),
+  );
+  const start = input.getRandom
+    ? Math.max(
+        0,
+        Math.min(
+          names.length - 1,
+          Math.floor(input.getRandom() * names.length),
+        ),
+      )
+    : getTelegramThreadNameEntropyIndex(input.entropy, names.length);
+  for (let offset = 0; offset < names.length; offset += 1) {
+    const name = names[(start + offset) % names.length];
+    if (!occupied.has(getTelegramTopicIdentityName(name))) return name;
+  }
+  for (const paletteSlot of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+    for (const name of TELEGRAM_THREAD_NAME_PALETTE[paletteSlot] ?? []) {
+      if (!occupied.has(getTelegramTopicIdentityName(name))) return name;
+    }
+  }
+  return undefined;
+}
+
+export function getTelegramThreadNameLeadingSlot(
+  threadName: string | undefined,
+): string | undefined {
+  if (!threadName) return undefined;
+  const first = getTelegramTopicIdentityName(threadName)[0];
+  return first && /^[A-Z]$/.test(first) ? first : undefined;
+}
+
+function getTelegramThreadNameEntropyIndex(
+  entropy: number | string | undefined,
+  length: number,
+): number {
+  if (length <= 1) return 0;
+  if (typeof entropy === "number" && entropy < 1_000_000_000_000) return 0;
+  const value = entropy === undefined ? "0" : String(entropy);
+  let hash = 2166136261;
+  for (const char of value) {
+    hash ^= char.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash % length;
+}
+
+export function getTelegramTopicThreadNameValidationError(
+  threadName: string,
+  _slot: string | undefined,
+): string | undefined {
+  const identity = getTelegramTopicIdentityName(threadName);
+  const reasons: string[] = [];
+  if (!identity) reasons.push("it is empty after trimming");
+  if (/\s/.test(identity)) reasons.push("it contains spaces");
+  if (/[^A-Za-z]/.test(identity)) {
+    reasons.push("it contains characters outside Latin A-Z letters");
+  }
+  if (!/^[A-Z]/.test(identity)) {
+    reasons.push("it does not start with an uppercase Latin letter");
+  }
+  const genericLabels = new Set(["telegram", "leader", "follower"]);
+  if (genericLabels.has(identity.toLowerCase())) {
+    reasons.push("it is a generic role label");
+  }
+  if (/^[A-Z]$/.test(identity)) reasons.push("it is only a bare slot letter");
+  if (reasons.length === 0) return undefined;
+  return `Invalid Telegram instance name: ${reasons.join("; ")}. Use exactly one capitalized Latin word with no spaces, punctuation, emoji, non-Latin letters, or digits; it must not be a generic role label or only a bare slot letter.`;
+}
+
+export function getTelegramManualThreadDisplayNameValidationError(
+  threadName: string,
+): string | undefined {
+  const trimmed = threadName.trim();
+  const normalized = trimmed.replace(/\s+/g, " ");
+  const reasons: string[] = [];
+  if (!trimmed) reasons.push("it is empty after trimming");
+  if (trimmed && /[^\x20-\x7E]/.test(trimmed)) {
+    reasons.push("it contains characters outside printable ASCII");
+  }
+  if (normalized.length > 96) reasons.push("it is longer than 96 characters");
+  if (/^[A-Z]$/.test(normalized)) {
+    reasons.push("a bare slot letter is reserved for reset to automatic");
+  }
+  if (reasons.length === 0) return undefined;
+  return `Invalid Telegram Thread display name: ${reasons.join("; ")}. Use 1–96 printable ASCII characters.`;
+}
+
+export function isTelegramTopicThreadNameValidForSlot(
+  threadName: string,
+  slot: string | undefined,
+): boolean {
+  return !getTelegramTopicThreadNameValidationError(threadName, slot);
+}
+
+function applyTopicNameTemplate(
+  template: string,
+  request: TelegramThreadTitleInput,
+  slot?: string,
+): string {
+  const threadName =
+    request.threadName?.replace(/\s+/g, " ").trim() || request.profileKey;
+  let result = template
+    .replaceAll("{threadName}", threadName)
+    .replaceAll("{profileKey}", request.profileKey)
+    .replaceAll("{instanceId}", request.instanceId);
+  if (slot) result = result.replaceAll("{slot}", slot);
+  return result;
+}
+
+export function getTelegramTopicName(
+  request: TelegramThreadTitleInput,
+  template = "{slot}",
+  slot?: string,
+): string {
+  const name = applyTopicNameTemplate(template, request, slot)
+    .replace(/\s+/g, " ")
+    .trim();
+  return (name || slot || "Pi").slice(0, 128);
+}
+
+export function getTelegramTopicTitleForThreadName(
+  threadName: string,
+  slot: string,
+  template = "{threadName}",
+): string {
+  return getTelegramTopicName(
+    {
+      instanceId: "",
+      profileKey: normalizeTelegramTopicTargetThreadName(threadName) || "Pi",
+      threadName,
+    },
+    template,
+    slot,
+  );
 }

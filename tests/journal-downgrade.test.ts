@@ -4,7 +4,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, symlink, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createTelegramUpdateJournalStore } from "../lib/journal.ts";
+import { resolveTelegramSessionJournalPath } from "../lib/paths.ts";
 
 const execFileAsync = promisify(execFile);
 const scriptUrl = new URL("../scripts/check-downgrade.mjs", import.meta.url);
@@ -76,7 +77,7 @@ async function withAgentDir(
   run: (input: { agentDir: string; runtimeDir: string }) => Promise<void>,
 ) {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-downgrade-"));
-  const runtimeDir = join(agentDir, "tmp", "telegram");
+  const runtimeDir = join(agentDir, "tmp", "pi-telegram");
   await mkdir(runtimeDir, { recursive: true });
   try {
     await run({ agentDir, runtimeDir });
@@ -112,6 +113,103 @@ test("Downgrade check blocks unresolved leader and follower authority", async ()
       () => runCheck(agentDir),
       /follower-inbox-0123456789abcdef\.work\.json retains 1 unresolved[\s\S]*inbox\.json retains 1 unresolved/u,
     );
+  });
+});
+
+test("Downgrade check sees each session journal and its unapplied segment authority", async () => {
+  await withAgentDir(async ({ agentDir, runtimeDir }) => {
+    const oldPath = resolveTelegramSessionJournalPath("session-old", "manual:same-recipient", agentDir);
+    const newPath = resolveTelegramSessionJournalPath("session-new", "manual:same-recipient", agentDir, "work");
+    await mkdir(join(runtimeDir, "sessions", "session-old"), { recursive: true });
+    await mkdir(join(runtimeDir, "sessions", "session-new"));
+    await writeFile(join(runtimeDir, "inbox.json"), JSON.stringify(snapshot([])));
+    await writeFile(oldPath, JSON.stringify(snapshot([entry(1)])));
+    await writeFile(newPath, JSON.stringify(snapshot([], { profile: "work" })));
+    await mkdir(`${newPath}.segments`);
+    await writeFile(join(`${newPath}.segments`, "0000000000000001.json"), JSON.stringify(segment(1, 0, {
+      profile: "work", upsertedEntries: [entry(2)],
+    })));
+    await expectBlocked(() => runCheck(agentDir), /sessions[\s\S]*retains 1 unresolved/u);
+    assert.deepEqual(JSON.parse(await readFile(oldPath, "utf8")).entries, [entry(1)]);
+    await mkdir(`${oldPath}.segments`);
+    await writeFile(join(`${oldPath}.segments`, "0000000000000001.json"), JSON.stringify(segment(1, 0, { removedUpdateIds: [1] })));
+    await expectBlocked(() => runCheck(agentDir), /session-new[\s\S]*retains 1 unresolved/u);
+    await writeFile(join(`${newPath}.segments`, "0000000000000002.json"), JSON.stringify(segment(2, 1, {
+      profile: "work", removedUpdateIds: [2],
+    })));
+    const drained = await runCheck(agentDir);
+    assert.match(drained.stdout, /SAFE: 3 Telegram journal/u);
+    assert.deepEqual(JSON.parse(await readFile(oldPath, "utf8")).entries, [entry(1)], "Inspection never compacts the source");
+  });
+});
+
+for (const artifact of ["alias", "unknown", "orphan-segments", "retained", "snapshot-directory", "root-alias"] as const) {
+  test(`Downgrade check refuses unclassified session storage (${artifact})`, async () => {
+    await withAgentDir(async ({ agentDir, runtimeDir }) => {
+      const root = join(runtimeDir, artifact === "root-alias" ? "Sessions" : "sessions");
+      const directory = join(root, artifact === "alias" ? "%61" : "session");
+      await mkdir(directory, { recursive: true });
+      if (artifact === "unknown") await writeFile(join(directory, "journal.bad.json"), "unchanged");
+      if (artifact === "orphan-segments") await mkdir(join(directory, "journal.0123456789abcdef.json.segments"));
+      if (artifact === "retained") await mkdir(join(directory, "journal.0123456789abcdef.json.retained"));
+      if (artifact === "snapshot-directory") await mkdir(join(directory, "journal.0123456789abcdef.json"));
+      await expectBlocked(() => runCheck(agentDir), /BLOCKED: cannot verify/u);
+    });
+  });
+}
+
+test("Downgrade check ignores legacy recovery folders", async () => {
+  await withAgentDir(async ({ agentDir, runtimeDir }) => {
+    await mkdir(join(runtimeDir, "recovery", "old"), { recursive: true });
+    await writeFile(join(runtimeDir, "recovery", "old", "inbox.json"), "{damaged");
+    await mkdir(join(runtimeDir, "sessions", "session", "recovery"), { recursive: true });
+    const result = await runCheck(agentDir);
+    assert.match(result.stdout, /SAFE/u);
+  });
+});
+
+for (const artifact of ["runtime", "session-root", "session-folder", "snapshot", "segments"] as const) {
+  test(`Downgrade check refuses linked session storage (${artifact})`, { skip: process.platform === "win32" }, async () => {
+    await withAgentDir(async ({ agentDir, runtimeDir }) => {
+      const outside = join(agentDir, "outside");
+      await mkdir(outside);
+      await writeFile(join(outside, "source.json"), JSON.stringify(snapshot([entry(1)])));
+      if (artifact === "runtime") {
+        await rm(runtimeDir, { recursive: true });
+        await symlink(outside, runtimeDir);
+      } else if (artifact === "session-root") await symlink(outside, join(runtimeDir, "sessions"));
+      else {
+        await mkdir(join(runtimeDir, "sessions"));
+        const directory = join(runtimeDir, "sessions", "session");
+        if (artifact === "session-folder") await symlink(outside, directory);
+        else {
+          await mkdir(directory);
+          const path = join(directory, "journal.0123456789abcdef.json");
+          if (artifact === "snapshot") await symlink(join(outside, "source.json"), path);
+          else {
+            await writeFile(path, JSON.stringify(snapshot([])));
+            await symlink(join(outside, "missing"), `${path}.segments`);
+          }
+        }
+      }
+      await expectBlocked(() => runCheck(agentDir), /BLOCKED: cannot verify/u);
+      assert.deepEqual(JSON.parse(await readFile(join(outside, "source.json"), "utf8")).entries, [entry(1)]);
+    });
+  });
+}
+
+test("Downgrade check shares directory and file-byte budgets across inspection", async () => {
+  await withAgentDir(async ({ agentDir, runtimeDir }) => {
+    const path = join(runtimeDir, "inbox.json");
+    await writeFile(path, "{}");
+    await truncate(path, 64 * 1024 * 1024 + 1);
+    await expectBlocked(() => runCheck(agentDir), /file\/byte inspection limit exhausted/u);
+    await rm(path);
+    for (let index = 0; index < 10_001; index += 100) {
+      await Promise.all(Array.from({ length: Math.min(100, 10_001 - index) }, (_, offset) =>
+        mkdir(join(runtimeDir, `unrelated-${index + offset}`))));
+    }
+    await expectBlocked(() => runCheck(agentDir), /directory listing limit exhausted/u);
   });
 });
 
@@ -182,7 +280,7 @@ test("Downgrade check uses PI_CODING_AGENT_DIR when no argument is provided", as
 
 test("Downgrade check auto-detects an OMP invocation", async () => {
   const home = await mkdtemp(join(tmpdir(), "pi-telegram-downgrade-home-"));
-  const runtimeDir = join(home, ".omp", "agent", "tmp", "telegram");
+  const runtimeDir = join(home, ".omp", "agent", "tmp", "pi-telegram");
   const ompScriptPath = join(home, "omp");
   await mkdir(runtimeDir, { recursive: true });
   await writeFile(
@@ -204,7 +302,7 @@ test("Downgrade check auto-detects an OMP invocation", async () => {
             PI_CODING_AGENT_DIR: "",
           },
         }),
-      /\.omp[\\/]agent[\\/]tmp[\\/]telegram[\\/]inbox\.json retains 1 unresolved/u,
+      /\.omp[\\/]agent[\\/]tmp[\\/]pi-telegram[\\/]inbox\.json retains 1 unresolved/u,
     );
   } finally {
     await rm(home, { recursive: true, force: true });

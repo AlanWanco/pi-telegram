@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+import { createTelegramBusLeaderApiProxy } from "../lib/bus-leader.ts";
 import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } from "../lib/sync.ts";
 import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
@@ -413,6 +414,29 @@ test("Bus-aware API runtime routes follower outbound calls through the leader", 
       args: ["file1", "photo.png"],
     },
   ]);
+});
+
+test("Attachment source survives the bus-aware wrapper and the leader proxy into the scoped file name", async () => {
+  const names: string[] = [];
+  const direct = createTelegramBridgeApiRuntime({
+    client: { ...createTelegramApiClient(() => "test-token"),
+      async downloadFile(_fileId, fileName) { names.push(fileName); return `/tmp/${fileName}`; } },
+    tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1, getBotScope: () => "@pi_bot", recordRuntimeEvent: () => {},
+  });
+  const source = { kind: "voice", messageId: 175683, chat: { id: 7, type: "private" } };
+  const leader = createTelegramBusAwareApiRuntime({ directRuntime: direct, ownsDirect: () => true,
+    callFollowerApi: async () => assert.fail("leader downloads directly") });
+  assert.equal(await leader.downloadFile("file", "voice-175683.ogg", source), "/tmp/voice-pi_bot-175683.ogg");
+  const proxy = createTelegramBusLeaderApiProxy({ call: async () => true, callMultipart: async () => true,
+    downloadFile: direct.downloadFile });
+  const follower = createTelegramBusAwareApiRuntime({ directRuntime: direct, ownsDirect: () => false,
+    callFollowerApi: (method, args) => proxy(method, structuredClone(args)) });
+  assert.equal(await follower.downloadFile("file", "voice-9.ogg", { ...source, messageId: 9 }), "/tmp/voice-pi_bot-9.ogg");
+  // A malformed follower source is ignored rather than trusted; the plain generated name remains.
+  assert.equal(await proxy("downloadFile", ["file", "voice-10.ogg", { kind: "voice", messageId: "10/../x" }]), "/tmp/voice-10.ogg");
+  assert.equal(await follower.downloadFile("file", "photo-11.jpg", { kind: "photo", messageId: 11, chat: source.chat, scope: "@peer" }), "/tmp/photo-peer-11.jpg",
+    "an explicit guest scope replaces the bot scope across the proxy");
+  assert.deepEqual(names, ["voice-pi_bot-175683.ogg", "voice-pi_bot-9.ogg", "voice-10.ogg", "photo-peer-11.jpg"]);
 });
 
 test("Bus-aware API runtime applies follower default thread to scoped actions", async () => {

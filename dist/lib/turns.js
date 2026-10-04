@@ -30,7 +30,7 @@ export function createTelegramTurnPrefix(attributes = {}) {
     }
     return `[${parts.join("|")}]`;
 }
-export function formatTelegramTurnPrefix(_message, basePrefix = TELEGRAM_PREFIX) {
+function formatTelegramTurnPrefix(_message, basePrefix = TELEGRAM_PREFIX) {
     return basePrefix;
 }
 export { truncateTelegramQueueSummary };

@@ -21,9 +21,9 @@ export interface TelegramInlineKeyboardMarkup {
   inline_keyboard: TelegramInlineKeyboardButton[][];
 }
 
-export const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
+const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
-export function getTelegramCallbackDataByteLength(value: string): number {
+function getTelegramCallbackDataByteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 

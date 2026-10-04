@@ -18,14 +18,25 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
-
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import { createTelegramConfigStore } from "../lib/config.ts";
+import { createTelegramUpdateJournalBindingRuntime } from "../lib/journal.ts";
+import {
+  resolveTelegramOwnersPath,
+  resolveTelegramSessionsDir,
+  resolveTelegramTempDir,
+} from "../lib/paths.ts";
+import { createTelegramSessionFolderSweeper } from "../lib/recovery.ts";
 import {
   createTelegramLockedPollingRuntime,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
   isProcessAlive,
   readLocks,
+  readTelegramRuntimeState,
+  resetDamagedTelegramRuntimeState,
+  mutateTelegramRuntimeStateSection,
+  type TelegramRuntimeStateSection,
   resolveTelegramLockKey,
   TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
   TELEGRAM_LOCK_KEY,
@@ -34,7 +45,38 @@ import {
   withTelegramFileTransaction,
   writeLocks,
   type TelegramLockEntry,
+  createTelegramLeaderJournalPathResolver,
+  createTelegramOwnedStateAuthorityCapture,
 } from "../lib/locks.ts";
+import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
+
+for (const change of ["replace-session", "same-context-restart", "clear", "release", "re-elect"] as const) {
+  test(`Shared-state grant binds exact session generation and leader epoch (${change})`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "pt-state-grant-")), path = join(dir, "state.json");
+    try {
+      const lock = createTelegramLockRuntime<{ cwd: string }>({ statePath: path, instanceId: "grant-fixture", isProcessAlive: () => true });
+      const sessions = createTelegramSessionContextStore<{ cwd: string }>(), capture = createTelegramOwnedStateAuthorityCapture(lock, sessions);
+      assert.equal(capture(), undefined, "No session context means no shared-state grant");
+      const ctx = { cwd: "/fixture" };
+      sessions.set(ctx);
+      assert.equal(capture(), undefined, "A session without exact ownership receives no grant");
+      assert.equal(lock.acquire(ctx).ok, true);
+      const epoch = lock.getOwnedLeaderEpoch(), grant = capture();
+      assert.ok(grant);
+      assert.equal(grant(), true);
+      if (change === "replace-session") sessions.set({ cwd: "/fixture" });
+      else if (change === "same-context-restart") { sessions.clear(ctx); sessions.set(ctx); }
+      else if (change === "clear") sessions.clear(ctx);
+      else if (change === "release") lock.release();
+      else { lock.release(); assert.equal(lock.acquire(ctx).ok, true); }
+      if (change !== "release" && change !== "re-elect") assert.equal(lock.getOwnedLeaderEpoch(), epoch, "Counterexample keeps the same leader epoch");
+      assert.equal(grant(), false, "A captured grant never survives session, ownership or epoch replacement");
+      const successor = capture();
+      if (change === "clear" || change === "release") assert.equal(successor, undefined);
+      else { assert.ok(successor); assert.equal(successor(), true, "The current session receives its own fresh grant"); assert.equal(grant(), false); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Process absence requires ESRCH rather than an unknown liveness error", (t) => {
   let code: string | undefined;
@@ -51,6 +93,358 @@ function createTempLockPath(): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-owners-"));
   return { dir, path: join(dir, "owners.json") };
 }
+
+test("Consolidated runtime state publishes only the selected section and profile", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  const publish = (profile: string, section: TelegramRuntimeStateSection, value: unknown) =>
+    mutateTelegramRuntimeStateSection(path, profile, section, () => ({ value, result: "published" }), { isCurrent: () => true });
+  try {
+    assert.deepEqual(readTelegramRuntimeState(path), { version: 2, profiles: {} });
+    assert.equal(existsSync(path), false, "An observational read never creates state");
+    publish("default", "transport", { leaderEpoch: "a", journalPath: "/sessions/owner/inbox.json" });
+    publish("default", "workspace", { binding: { sessionId: "s", threadId: 55 }, restoreIssued: true });
+    publish("other", "admission", { leases: [{ operationId: "busy" }], fence: "deletion-issued" });
+    const before = readTelegramRuntimeState(path);
+    mutateTelegramRuntimeStateSection(path, "default", "runtime", (_, observed) => {
+      (observed.transport as { leaderEpoch: string }).leaderEpoch = "forged";
+      return { value: { polling: true }, result: 42 };
+    }, { isCurrent: () => true });
+    const after = readTelegramRuntimeState(path);
+    assert.deepEqual(after.profiles.default?.transport, before.profiles.default?.transport, "Sibling mutation of an observed copy is not authority");
+    assert.deepEqual(after.profiles.default?.workspace, before.profiles.default?.workspace);
+    assert.deepEqual(after.profiles.other, before.profiles.other);
+    if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o077, 0);
+    const stableBytes = readFileSync(path, "utf8"), stableIdentity = statSync(path);
+    assert.equal(publish("default", "runtime", { polling: true }), "published");
+    assert.equal(readFileSync(path, "utf8"), stableBytes);
+    assert.equal(statSync(path).ino, stableIdentity.ino, "No-op does not replace the shared file");
+    publish("default", "runtime", undefined);
+    assert.deepEqual(readTelegramRuntimeState(path), before, "Removing diagnostics leaves every durable fact untouched");
+    publish("__proto__", "runtime", { polling: false });
+    assert.equal(Object.hasOwn(readTelegramRuntimeState(path).profiles, "__proto__"), true, "Profile names cannot mutate object prototypes");
+    assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "state.json"], "Staging and guards stay below runtime");
+    assert.deepEqual(readdirSync(join(temp.dir, "runtime")), []);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ["before-mutation", "after-mutation", "before-write", "after-write-before-rename", "after-rename"] as const) {
+  test(`Consolidated runtime state fences lost authority without undoing published facts (${boundary})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    try {
+      mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true });
+      const before = readFileSync(path, "utf8");
+      let current = boundary !== "before-mutation", ran = false;
+      assert.throws(() => mutateTelegramRuntimeStateSection(path, "default", "workspace", () => {
+        ran = true;
+        if (boundary === "after-mutation") current = false;
+        return { value: { binding: 66, forwardIssued: true }, result: true };
+      }, { isCurrent: () => current, onPublicationBoundary(at) { if (at === boundary) current = false; } }), /authority changed|outcome is unknown/);
+      assert.equal(ran, boundary !== "before-mutation");
+      if (boundary === "after-rename") assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { binding: 66, forwardIssued: true });
+      else assert.equal(readFileSync(path, "utf8"), before);
+      assert.deepEqual(readdirSync(join(temp.dir, "runtime")), [], "Fault cleanup never leaves an authoritative guard or temporary snapshot");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const malformed of ["{", "null", "[]", '{"version":1,"threads":[]}', '{"version":3,"profiles":{}}',
+  '{"version":2,"profiles":[]}', '{"version":2,"profiles":{"default":[]}}', '{"version":2,"profiles":{"default":{"unknown":1}}}']) {
+  test(`Consolidated runtime state never repairs or silently adopts a rejected envelope (${malformed})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    try {
+      writeFileSync(path, malformed, { mode: 0o600 });
+      assert.throws(() => readTelegramRuntimeState(path));
+      assert.throws(() => mutateTelegramRuntimeStateSection(path, "default", "runtime", () => ({ value: {}, result: true }), { isCurrent: () => true }));
+      assert.equal(readFileSync(path, "utf8"), malformed);
+      assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "state.json"]);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const damaged of ["{", "null", '{"version":3,"profiles":{}}', '{"version":2,"profiles":{"default":{"unknown":1}}}',
+  '{"version":2,"profiles":{"default":{"transport":{"pid":"wrong"}}}}', "invalid-workspace"]) {
+  test(`Damaged runtime state is reset to an empty envelope before leadership (${damaged})`, async () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    const events: string[] = [];
+    try {
+      const validator = (_profile: string, sections: { workspace?: unknown }) => {
+        if (sections.workspace === "broken") throw new Error("fixture invalid workspace");
+      };
+      writeFileSync(path, damaged === "invalid-workspace"
+        ? JSON.stringify({ version: 2, profiles: { work: { workspace: "broken" } } }) : damaged, { mode: 0o600 });
+      const runtime = createTelegramLockedPollingRuntime({
+        lock: createTelegramLockRuntime({ statePath: path, pid: process.pid, instanceId: "reset" }),
+        resetDamagedState: () => resetDamagedTelegramRuntimeState(path, validator),
+        hasBotToken: () => true, startPolling: async () => undefined, stopPolling: async () => undefined, updateStatus: () => undefined,
+        recordRuntimeEvent: (_category, _error, details) => { events.push(String(details?.phase)); },
+      });
+      assert.equal((await runtime.start({ cwd: "/repo" })).ok, true, "connect proceeds after an optimistic reset");
+      assert.deepEqual(events, ["state-reset"]);
+      const state = readTelegramRuntimeState(path);
+      assert.deepEqual(Object.keys(state.profiles), [TELEGRAM_LOCK_KEY], "only the new owner is published");
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "state.json"]);
+      await runtime.stop();
+      assert.equal(resetDamagedTelegramRuntimeState(path, validator), false, "healthy state is never reset");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Healthy runtime state is never reset and elections never reset", async () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  try {
+    mutateTelegramRuntimeStateSection(path, "work", "runtime", () => ({ value: { kept: true }, result: true }), { isCurrent: () => true });
+    const before = readFileSync(path, "utf8");
+    assert.equal(resetDamagedTelegramRuntimeState(path), false);
+    assert.equal(readFileSync(path, "utf8"), before);
+    writeFileSync(path, "{", { mode: 0o600 });
+    let resets = 0;
+    const runtime = createTelegramLockedPollingRuntime({
+      lock: createTelegramLockRuntime({ statePath: path, pid: process.pid, instanceId: "election" }),
+      resetDamagedState: () => { resets++; return resetDamagedTelegramRuntimeState(path); },
+      hasBotToken: () => true, startPolling: async () => undefined, stopPolling: async () => undefined, updateStatus: () => undefined,
+    });
+    await assert.rejects(runtime.start({ cwd: "/repo" }, { election: {} }));
+    assert.equal(resets, 0, "a follower election never resets shared state");
+    assert.equal(readFileSync(path, "utf8"), "{");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime state refuses nested publication and retains a rename with a lost acknowledgement", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  const mutate = () => ({ value: { issued: true }, result: true });
+  try {
+    assert.throws(() => mutateTelegramRuntimeStateSection(path, "default", "workspace", () => {
+      mutateTelegramRuntimeStateSection(path, "default", "admission", mutate, { isCurrent: () => true });
+      return mutate();
+    }, { isCurrent: () => true }), /Nested/);
+    assert.equal(existsSync(path), false);
+    assert.throws(() => mutateTelegramRuntimeStateSection(path, "default", "workspace", mutate, {
+      isCurrent: () => true, publishRename(from, to) { renameSync(from, to); throw new Error("Lost publication ACK"); },
+    }), /outcome is unknown/);
+    assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { issued: true }, "Uncertain publication is not rollback or replay authority");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime state serializes competing processes without losing sibling facts", async () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  try {
+    mutateTelegramRuntimeStateSection(path, "other", "admission", () => ({ value: { leases: ["keep"] }, result: true }), { isCurrent: () => true });
+    const moduleUrl = new URL("../lib/locks.ts", import.meta.url).href;
+    const source = `
+      import { mutateTelegramRuntimeStateSection } from ${JSON.stringify(moduleUrl)};
+      for (let n = 0; n < 40; n++) mutateTelegramRuntimeStateSection(process.env.STATE_PATH, "default", process.env.SECTION,
+        current => ({ value: { count: (current?.count ?? 0) + 1 }, result: true }), { isCurrent: () => true });
+    `;
+    const children = await Promise.all(["workspace", "runtime"].map(section => runNodeEval(source, { env: { STATE_PATH: path, SECTION: section } })));
+    for (const child of children) assert.equal(child.code, 0, child.stderr);
+    const file = readTelegramRuntimeState(path);
+    assert.deepEqual(file.profiles.default, { workspace: { count: 40 }, runtime: { count: 40 } });
+    assert.deepEqual(file.profiles.other?.admission, { leases: ["keep"] });
+    assert.deepEqual(readdirSync(join(temp.dir, "runtime")), []);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated transport lifecycle preserves custody, other sections and other profiles", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  let now = 1000, journalCreations = 0;
+  const owner = createTelegramLockRuntime({ statePath: path, instanceId: "one", pid: 10, runtimeGeneration: 1,
+    getNowMs: () => now, mintLeaderEpoch: () => "epoch-one", isProcessAlive: () => true,
+    createJournalPath: () => `/sessions/owner/inbox.json#${++journalCreations}` });
+  try {
+    mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 55, restoreIssued: true }, result: true }), { isCurrent: () => true });
+    mutateTelegramRuntimeStateSection(path, "other", "admission", () => ({ value: { leases: ["keep"], deletionIssued: true }, result: true }), { isCurrent: () => true });
+    const before = readTelegramRuntimeState(path);
+    assert.equal(owner.acquire({ cwd: "/repo" }).ok, true);
+    assert.equal(owner.owns({ cwd: "/repo" }), true);
+    assert.equal(owner.getOwnedLeaderEpoch(), "epoch-one");
+    now += 2000;
+    assert.equal(owner.refresh({ cwd: "/repo" }), true);
+    let committed = 0;
+    assert.equal(owner.commitIfOwned(() => { committed++; }), true);
+    assert.equal(committed, 1);
+    assert.equal(owner.publishStateSectionIfOwned!("runtime", () => ({ value: { polling: true }, result: "saved" }), { isCurrent: () => true }).committed, true);
+    owner.release();
+    assert.equal(owner.owns(), false);
+    assert.equal(owner.getState().kind, "inactive");
+    assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.transport, { journalPath: "/sessions/owner/inbox.json#1" });
+    assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, before.profiles.default?.workspace);
+    assert.deepEqual(readTelegramRuntimeState(path).profiles.other, before.profiles.other);
+    const successor = createTelegramLockRuntime({ statePath: path, instanceId: "two", pid: 20, runtimeGeneration: 2,
+      isProcessAlive: () => true, createJournalPath: () => { journalCreations++; return "/sessions/new/inbox.json"; } });
+    assert.equal(successor.acquire({ cwd: "/new" }).ok, true);
+    assert.equal(successor.getJournalPath(), "/sessions/owner/inbox.json#1");
+    assert.equal(journalCreations, 1, "Ownership transfer never creates a second polling journal");
+    assert.deepEqual(readdirSync(temp.dir).sort(), ["runtime", "state.json"]);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated transport profile drift refuses publication and never redirects the selected section", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  let profile = "default";
+  const owner = createTelegramLockRuntime({ statePath: path, key: () => profile, instanceId: "owner", pid: 10,
+    statePublication: { onPublicationBoundary(at) { if (at === "after-write-before-rename") profile = "other"; } } });
+  try {
+    mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true });
+    mutateTelegramRuntimeStateSection(path, "other", "transport", () => ({ value: { pid: 20, instanceId: "other" }, result: true }), { isCurrent: () => true });
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => owner.acquire({ cwd: "/repo" }), /authority changed/);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.equal(owner.owns(), false);
+    profile = "default";
+    assert.equal(owner.owns(), false, "Restoring the profile cannot invent a missing published owner");
+    assert.equal(owner.getState().kind, "inactive");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated transport same-PID replacement fences old refresh, commit and section publication", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  const first = createTelegramLockRuntime({ statePath: path, instanceId: "old", pid: 10, runtimeGeneration: 1 });
+  const next = createTelegramLockRuntime({ statePath: path, instanceId: "new", pid: 10, runtimeGeneration: 2 });
+  try {
+    const acquired = first.acquire({ cwd: "/repo" });
+    assert.equal(acquired.ok, true);
+    assert.equal(next.acquire({ cwd: "/repo" }).ok, false, "Same PID does not grant force takeover");
+    assert.equal(next.acquire({ cwd: "/repo" }, { force: true, expectedOwner: acquired.ok ? acquired.lock : undefined }).ok, true);
+    const before = readFileSync(path, "utf8");
+    let callbacks = 0;
+    assert.equal(first.commitIfOwned(() => { callbacks++; }), false);
+    assert.deepEqual(first.publishStateSectionIfOwned!("workspace", () => { callbacks++; return { value: {}, result: true }; }, { isCurrent: () => true }), { committed: false });
+    assert.equal(first.refresh(), false);
+    first.release();
+    assert.equal(callbacks, 0);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.equal(next.owns(), true);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const boundary of ["after-write-before-rename", "after-rename"] as const) {
+  test(`Consolidated transport refuses stale section ACK after source-generation loss (${boundary})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    const owner = createTelegramLockRuntime({ statePath: path, instanceId: "owner", pid: 10 });
+    try {
+      owner.acquire({ cwd: "/repo" });
+      let current = true;
+      const before = readFileSync(path, "utf8");
+      assert.throws(() => owner.publishStateSectionIfOwned!("workspace", () => ({ value: { forwardIssued: true }, result: true }), {
+        isCurrent: () => current, onPublicationBoundary(at) { if (at === boundary) current = false; },
+      }), /authority changed|outcome is unknown/);
+      if (boundary === "after-rename") assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { forwardIssued: true });
+      else assert.equal(readFileSync(path, "utf8"), before);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const boundary of ["after-write-before-rename", "after-rename"] as const) {
+  test(`Consolidated transport preserves replacement-owner facts at the section publication boundary (${boundary})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    const owner = createTelegramLockRuntime({ statePath: path, instanceId: "owner", pid: 10 });
+    try {
+      owner.acquire({ cwd: "/repo" });
+      assert.throws(() => owner.publishStateSectionIfOwned!("workspace", () => ({ value: { forwardIssued: true }, result: true }), {
+        isCurrent: () => true, onPublicationBoundary(at) {
+          if (at !== boundary) return;
+          const file = readTelegramRuntimeState(path);
+          file.profiles.default!.transport = { pid: 20, instanceId: "replacement", leaderEpoch: "new", runtimeGeneration: 2 };
+          writeFileSync(path, JSON.stringify(file), { mode: 0o600 });
+        },
+      }), /authority changed|outcome is unknown/);
+      const file = readTelegramRuntimeState(path);
+      assert.equal((file.profiles.default?.transport as { pid: number }).pid, 20);
+      assert.equal(owner.owns(), false);
+      assert.deepEqual(file.profiles.default?.workspace, boundary === "after-rename" ? { forwardIssued: true } : undefined);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Consolidated transport external-file commit retains its effect without a stale positive ACK", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  const owner = createTelegramLockRuntime({ statePath: path, instanceId: "owner", pid: 10 });
+  try {
+    owner.acquire({ cwd: "/repo" });
+    let effect = 0;
+    assert.equal(owner.commitIfOwned(() => {
+      effect++;
+      const file = readTelegramRuntimeState(path);
+      file.profiles.default!.transport = { pid: 20, instanceId: "replacement" };
+      writeFileSync(path, JSON.stringify(file), { mode: 0o600 });
+    }), false);
+    assert.equal(effect, 1, "Committed external effect is not rolled back or replayed");
+    assert.equal((readTelegramRuntimeState(path).profiles.default?.transport as { pid: number }).pid, 20);
+    assert.equal(owner.commitIfOwned(() => { effect++; }), false);
+    assert.equal(effect, 1);
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated transport rejects nested root publication rather than borrowing owner authority", () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  const owner = createTelegramLockRuntime({ statePath: path, instanceId: "owner", pid: 10 });
+  try {
+    owner.acquire({ cwd: "/repo" });
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => owner.publishStateSectionIfOwned!("transport" as "workspace", () => ({ value: { pid: 99 }, result: true }),
+      { isCurrent: () => true }), /restricted/);
+    assert.throws(() => owner.commitIfOwned(() => owner.publishStateSectionIfOwned!("workspace",
+      () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true })), /Nested/);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.equal(owner.publishStateSectionIfOwned!("workspace", () => ({ value: { binding: 55 }, result: true }),
+      { isCurrent: () => true }).committed, true, "The direct owner-gated section publisher needs only one transaction");
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
+for (const malformed of [null, [], {}, { pid: "wrong" }, { pid: 10, unexpected: true }, { pid: 10, heartbeatMs: -1 },
+  { pid: 10, journalPath: "" }, { pid: 10, leaderEpoch: "" }]) {
+  test(`Consolidated transport never replaces malformed ownership (${JSON.stringify(malformed)})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    try {
+      mutateTelegramRuntimeStateSection(path, "default", "transport", () => ({ value: malformed, result: true }), { isCurrent: () => true });
+      const before = readFileSync(path, "utf8");
+      const owner = createTelegramLockRuntime({ statePath: path, instanceId: "owner", pid: 10 });
+      assert.equal(owner.owns(), false, "Read-only queries fail closed instead of throwing into Pi hooks");
+      assert.equal(owner.getState().kind, "inactive");
+      assert.throws(() => owner.acquire({ cwd: "/repo" }), /transport is malformed/);
+      assert.equal(readFileSync(path, "utf8"), before);
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const predecessor of ["live", "malformed", "foreign-envelope", "malformed-record"] as const) {
+  test(`Consolidated transport reads legacy ownership protectively without adopting it (${predecessor})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    try {
+      const source = predecessor === "live" ? JSON.stringify({ default: { pid: 77, instanceId: "old", heartbeatMs: 1000, busSecret: "never-adopt" } }) :
+        predecessor === "foreign-envelope" ? JSON.stringify({ version: 2, profiles: {} }) :
+        predecessor === "malformed-record" ? JSON.stringify({ unrelated: { pid: "unknown" } }) : "{";
+      writeFileSync(temp.path, source, { mode: 0o600 });
+      const before = readFileSync(temp.path, "utf8");
+      const owner = createTelegramLockRuntime({ statePath: path, legacyLocksPath: temp.path, instanceId: "owner", pid: 10,
+        getNowMs: () => 1000, staleHeartbeatMs: 8000, isProcessAlive: () => true });
+      if (predecessor === "live") {
+        const result = owner.acquire({ cwd: "/repo" });
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.equal(result.lock.busSecret, undefined);
+      } else assert.throws(() => owner.acquire({ cwd: "/repo" }));
+      assert.equal(existsSync(path), false);
+      assert.equal(readFileSync(temp.path, "utf8"), before, "The older release file is never modified or adopted");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Consolidated transport acquisition has one cross-process winner in the shared state", async () => {
+  const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+  try {
+    mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true });
+    const startPath = join(temp.dir, "start"), children = [0, 1].map(index => {
+      const readyPath = join(temp.dir, `ready-${index}`);
+      return { readyPath, child: spawnLockRaceChild({ locksPath: temp.path, statePath: path, key: "default", readyPath, startPath }) };
+    });
+    await waitForCondition(() => children.every(child => existsSync(child.readyPath)), 2000);
+    writeFileSync(startPath, "start");
+    const results = await Promise.all(children.map(child => child.child.result));
+    assert.equal(results.filter(result => result.ok).length, 1);
+    assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { binding: 55 });
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
 
 async function waitForCondition(
   predicate: () => boolean,
@@ -71,6 +465,7 @@ interface LockRaceChild {
 
 function spawnLockRaceChild(input: {
   locksPath: string;
+  statePath?: string;
   key: string;
   readyPath: string;
   startPath: string;
@@ -83,7 +478,7 @@ function spawnLockRaceChild(input: {
     writeFileSync(process.env.READY_PATH, "ready");
     while (!existsSync(process.env.START_PATH)) sleep(2);
     const lock = createTelegramLockRuntime({
-      locksPath: process.env.LOCKS_PATH,
+      ...(process.env.STATE_PATH ? { statePath: process.env.STATE_PATH } : { locksPath: process.env.LOCKS_PATH }),
       key: process.env.LOCK_KEY,
     });
     const acquired = lock.acquire({ cwd: "/race" });
@@ -93,6 +488,7 @@ function spawnLockRaceChild(input: {
   const result = runNodeEval(source, {
     env: {
       LOCKS_PATH: input.locksPath,
+      STATE_PATH: input.statePath ?? "",
       LOCK_KEY: input.key,
       READY_PATH: input.readyPath,
       START_PATH: input.startPath,
@@ -103,6 +499,105 @@ function spawnLockRaceChild(input: {
   });
   return { result };
 }
+
+test("Polling journal pointer survives release and is inherited by every successor", () => {
+  const temp = createTempLockPath();
+  try {
+    let created = 0;
+    const create = (name: string) => createTelegramLockRuntime({ locksPath: temp.path, instanceId: name,
+      pid: name === "first" ? 101 : 202, isProcessAlive: () => true,
+      createJournalPath: () => `/runtime/sessions/${name}/inbox.json#${++created}` });
+    const first = create("first");
+    assert.equal(first.getJournalPath(), undefined);
+    const acquired = first.acquire({ cwd: "/a" });
+    assert.equal(acquired.ok && acquired.lock.journalPath, "/runtime/sessions/first/inbox.json#1");
+    assert.equal(first.refresh({ cwd: "/a" }), true);
+    assert.equal(first.getJournalPath(), "/runtime/sessions/first/inbox.json#1", "Refresh keeps custody");
+    first.release();
+    const released = JSON.parse(readFileSync(temp.path, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(Object.values(released), [{ journalPath: "/runtime/sessions/first/inbox.json#1" }],
+      "Release keeps only the pointer");
+    const successor = create("successor");
+    assert.equal(successor.getState().kind, "inactive", "A pointer is not an owner");
+    const next = successor.acquire({ cwd: "/b" });
+    assert.equal(next.ok && next.lock.journalPath, "/runtime/sessions/first/inbox.json#1", "Successor continues the named journal");
+    assert.equal(created, 1, "No new journal is created while one is named");
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
+test("Leader journal resolver prefers the owners pointer, then an existing root, then the hosting session", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-leader-path-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    let named: string | undefined, sessionId: string | undefined = "host";
+    const resolver = createTelegramLeaderJournalPathResolver({ getNamedJournalPath: () => named,
+      getSessionId: () => sessionId, getProfileName: () => "work" });
+    const runtime = join(agentDir, "tmp", "pi-telegram");
+    const own = join(runtime, "sessions", "host", "inbox.work.json");
+    assert.equal(resolver.createJournalPath(), own);
+    assert.equal(resolver.resolve("work"), own);
+    named = join(runtime, "sessions", "former", "inbox.work.json");
+    assert.equal(resolver.resolve("work"), named, "The owners pointer wins");
+    named = join(agentDir, "elsewhere", "inbox.work.json");
+    assert.equal(resolver.resolve("work"), own, "A pointer outside this runtime is ignored");
+    named = undefined;
+    mkdirSync(runtime, { recursive: true });
+    writeFileSync(join(runtime, "inbox.work.json"), "{}");
+    assert.equal(resolver.createJournalPath(), join(runtime, "inbox.work.json"), "Existing root custody is kept");
+    rmSync(join(runtime, "inbox.work.json"));
+    sessionId = undefined;
+    assert.equal(resolver.resolve("work"), join(runtime, "inbox.work.json"), "Without a session, the flat fallback");
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Leader succession continues the owners-named polling journal, cursor and pending custody", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-leader-succession-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const config = createTelegramConfigStore({ agentDir });
+    const createLeader = (sessionId: string, pid: number) => {
+      let lock!: ReturnType<typeof createTelegramLockRuntime>;
+      const path = createTelegramLeaderJournalPathResolver({ getNamedJournalPath: () => lock.getJournalPath(),
+        getSessionId: () => sessionId, getProfileName: () => undefined });
+      lock = createTelegramLockRuntime({ locksPath: resolveTelegramOwnersPath(), instanceId: `leader-${sessionId}`,
+        pid, isProcessAlive: () => true, createJournalPath: path.createJournalPath });
+      const journals = createTelegramUpdateJournalBindingRuntime({
+        base: { getProfileName: () => undefined, getBotToken: () => "123:succession", getBotId: () => 123,
+          withSourceSerialization: config.withSourceSerialization },
+        getLeaderJournalPath: path.resolve, getRuntimeDir: () => resolveTelegramTempDir(agentDir),
+        getFollowerJournalPath: () => { throw new Error("leader-only fixture"); },
+        getActiveFollowerBindingKey: () => "unused", isFollowerRegistered: () => false,
+      });
+      return { lock, journals };
+    };
+    const a = createLeader("session-a", 101);
+    assert.equal(a.lock.acquire({ cwd: "/a" }).ok, true);
+    const hosted = a.journals.resolveLeader()!;
+    hosted.journal.appendBatch([{ update_id: 41, message: { text: "unprocessed" } }], 41);
+    assert.match(JSON.parse(hosted.runtimeKey).path, /sessions[\\/]session-a[\\/]inbox\.json$/u);
+    a.lock.release();
+    const swept = createTelegramSessionFolderSweeper({ getSessionsDir: () => resolveTelegramSessionsDir(agentDir),
+      getProfileName: () => undefined, getKeptSessionIds: () => [] }).sweep();
+    assert.deepEqual(swept, [], "The sweeper never deletes the polling journal or its hosting folder");
+    const b = createLeader("session-b", 202);
+    assert.equal(b.lock.acquire({ cwd: "/b" }).ok, true);
+    const continued = b.journals.resolveLeader()!;
+    assert.equal(continued.recoveryKey, hosted.recoveryKey, "Successor continues the same polling journal");
+    const snapshot = continued.journal.read();
+    assert.equal(snapshot.acceptedThroughUpdateId, 41, "Bot cursor continues");
+    assert.deepEqual(snapshot.entries.map(entry => entry.updateId), [41], "Unprocessed custody continues");
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
 
 test("Lock runtime commits side effects only under its exact transaction owner", () => {
   const temp = createTempLockPath();
@@ -173,6 +668,34 @@ test("Lock runtime acquires, refreshes, and releases its own key", () => {
     rmSync(temp.dir, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ["live", "dead", "stale-heartbeat", "other-key", "missing", "malformed", "same-path"] as const) {
+  test(`A live fresh older-release owner blocks acquisition without exposing its bus (${scenario})`, () => {
+    const current = createTempLockPath(), legacy = createTempLockPath();
+    try {
+      const entry = { pid: 77, cwd: "/older", instanceId: "77:1", heartbeatMs: scenario === "stale-heartbeat" ? 1_000 : 99_000,
+        leaderEpoch: "epoch", busSocketPath: "/older/bus.sock", busSecret: "secret" };
+      if (scenario === "malformed") writeFileSync(legacy.path, "{ not json");
+      else if (scenario !== "missing") writeFileSync(legacy.path, JSON.stringify({ [scenario === "other-key" ? "work" : TELEGRAM_LOCK_KEY]: entry }));
+      const legacyBytes = existsSync(legacy.path) ? readFileSync(legacy.path, "utf8") : undefined;
+      const lock = createTelegramLockRuntime({ locksPath: current.path, legacyLocksPath: scenario === "same-path" ? current.path : legacy.path,
+        pid: 10, getNowMs: () => 100_000, staleHeartbeatMs: 8_000, isProcessAlive: pid => scenario !== "dead" && pid === 77 });
+      const acquired = lock.acquire({ cwd: "/repo" });
+      if (scenario === "live") {
+        assert.deepEqual(acquired, { ok: false, lock: { pid: 77, cwd: "/older", instanceId: "77:1", heartbeatMs: 99_000 } },
+          "only identity is exposed: no socket, secret or epoch of another protocol");
+        assert.deepEqual(readLocks(current.path), {}, "refusal publishes nothing in the new directory");
+        assert.equal(lock.owns(), false);
+        return;
+      }
+      assert.equal(acquired.ok, true);
+      if (scenario !== "same-path") assert.equal(existsSync(legacy.path) ? readFileSync(legacy.path, "utf8") : undefined, legacyBytes,
+        "the older file is only read, never modified");
+    } finally {
+      rmSync(current.dir, { recursive: true, force: true }); rmSync(legacy.dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("Owner slot resolver uses local default and named profile keys", () => {
   let activeProfileName: string | undefined;
@@ -2707,6 +3230,7 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     }),
     getStatusLabel: () => "active here",
     getOwnedLeaderEpoch: () => undefined,
+    getJournalPath: () => undefined,
     owns: () => true,
     commitIfOwned: (commit: () => void) => {
       commit();

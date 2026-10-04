@@ -160,6 +160,7 @@ export function buildStatusReplyMarkup(
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
+  pendingCancellationCount = 0,
 ): TelegramReplyMarkup {
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   rows.push([
@@ -188,6 +189,10 @@ export function buildStatusReplyMarkup(
       callback_data: "menu:queue",
     },
   ]);
+  if (pendingCancellationCount > 0) rows.push([{
+    text: `❌ Pending cancellations: ${pendingCancellationCount}`,
+    callback_data: "reroutecancel:review:open",
+  }]);
   if (sectionRegistry) {
     const sectionRows = getTelegramSectionMainMenuRows(sectionRegistry);
     for (const row of sectionRows) {
@@ -210,6 +215,7 @@ export function buildTelegramStatusMenuRenderPayload(
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
+  pendingCancellationCount = 0,
 ): TelegramMenuRenderPayload {
   return {
     nextMode: "status",
@@ -221,6 +227,7 @@ export function buildTelegramStatusMenuRenderPayload(
       queueItemCount,
       sectionRegistry,
       isVoiceReplyActive,
+      pendingCancellationCount,
     ),
   };
 }
@@ -234,6 +241,7 @@ export async function updateTelegramStatusMessage(
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
+  pendingCancellationCount = 0,
 ): Promise<void> {
   await editTelegramMenuMessage(
     state,
@@ -244,6 +252,7 @@ export async function updateTelegramStatusMessage(
       queueItemCount,
       sectionRegistry,
       isVoiceReplyActive,
+      pendingCancellationCount,
     ),
     deps,
   );
@@ -258,6 +267,7 @@ export function sendTelegramStatusMessage(
   queueItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
+  pendingCancellationCount = 0,
 ): Promise<number | undefined> {
   return sendTelegramMenuMessage(
     state,
@@ -268,6 +278,7 @@ export function sendTelegramStatusMessage(
       queueItemCount,
       sectionRegistry,
       isVoiceReplyActive,
+      pendingCancellationCount,
     ),
     deps,
   );

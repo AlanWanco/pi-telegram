@@ -284,7 +284,7 @@ function buildTelegramSectionCallbackContext(
 // --- GlobalThis Bridge ---
 
 /** @internal */
-export function setGlobalTelegramSectionRegistry(
+function setGlobalTelegramSectionRegistry(
   registry: TelegramSectionRegistry,
 ): void {
   (globalThis as Record<string, unknown>)[SECTION_REGISTRY_KEY] = registry;

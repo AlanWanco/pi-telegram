@@ -4,12 +4,12 @@
  * Owns serializable bus envelopes, socket/auth helpers, local IPC client/server primitives,
  * cross-instance forwarding helpers, and the live follower registry model.
  */
-import { type TelegramBusTransportEventRecorder, type TelegramBusTransportRetryPolicy } from "./bus-transport.ts";
+import { type TelegramBusEndpointLayout, type TelegramBusTransportEventRecorder, type TelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import { type TelegramQueueHandoffPayload } from "./queue.ts";
 import type { TelegramTarget } from "./target.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramSessionReplacementIntent } from "./threads.ts";
-export interface TelegramBusProcessRuntime {
+interface TelegramBusProcessRuntime {
     instanceId: string;
     processId: number;
     processBirthId: string;
@@ -17,22 +17,15 @@ export interface TelegramBusProcessRuntime {
     getLeaderSocketPath: () => string;
     getFollowerSocketPath: () => string;
 }
-export interface TelegramProcessBirthIdentityOptions {
+interface TelegramProcessBirthIdentityOptions {
     platform?: NodeJS.Platform;
     readProcStat?: (pid: number) => string;
     readDarwinProcessStart?: (pid: number) => string;
 }
-export type TelegramProcessBirthProof = {
-    status: "proven";
-    identity: string;
-} | {
-    status: "unverifiable";
-};
 export type TelegramProcessLiveness = "alive" | "dead" | "unverifiable";
-export interface TelegramProcessLivenessOptions extends TelegramProcessBirthIdentityOptions {
+interface TelegramProcessLivenessOptions extends TelegramProcessBirthIdentityOptions {
     isProcessAlive?: (pid: number) => boolean;
 }
-export declare function getTelegramProcessBirthProof(pid: number, options?: TelegramProcessBirthIdentityOptions): TelegramProcessBirthProof;
 export declare function getTelegramProcessBirthIdentity(pid: number, fallbackGeneration: number | string, options?: TelegramProcessBirthIdentityOptions): string;
 export declare function getTelegramProcessLiveness(owner: {
     processId: number;
@@ -41,19 +34,20 @@ export declare function getTelegramProcessLiveness(owner: {
 export declare function getTelegramProcessBirthIdentityLiveness(processBirthId: string, options?: TelegramProcessLivenessOptions): TelegramProcessLiveness;
 export declare function createCurrentTelegramBusProcessRuntime(input: {
     getActiveProfileName: () => string | undefined;
+    endpointLayout?: TelegramBusEndpointLayout;
     pid?: number;
     parentPid?: number;
     createdAtMs?: number;
 }): TelegramBusProcessRuntime;
 export declare function createTelegramBusProcessRuntime(input: {
     getActiveProfileName: () => string | undefined;
+    endpointLayout?: TelegramBusEndpointLayout;
     pid: number;
     parentPid: number;
     parentProcessIdentity?: string;
     createdAtMs: number;
 }): TelegramBusProcessRuntime;
 export declare function createTelegramBusAuthSecret(): string;
-export declare const TELEGRAM_BUS_PROTOCOL_VERSION: 2;
 export declare const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION: "durable-follower-admission-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF: "queue-handoff-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE: "input-custody-reference-v1";
@@ -62,12 +56,27 @@ export declare const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE: "thread-displa
 export declare const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT: "directory-display-format-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT: "workspace-follower-auto-connect-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "session-replacement-intent-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";
+export interface TelegramBusWorkspaceRestoreObservation {
+    operationId: string;
+    recipient: {
+        kind: "follower";
+        instanceId: string;
+        sessionId: string;
+        generation: string;
+    };
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    slot: string;
+    ready: boolean;
+}
 export interface TelegramBusProtocolIdentity {
     protocolVersion: number;
     runtimeBuild: string;
     capabilities: string[];
 }
-export interface TelegramBusProtocolCompatibility {
+interface TelegramBusProtocolCompatibility {
     compatible: boolean;
     reason?: "missing-identity" | "version-mismatch" | "missing-capability";
     missingCapabilities: string[];
@@ -83,8 +92,8 @@ export declare function getTelegramBusProtocolCompatibility(input: {
     local: TelegramBusProtocolIdentity;
     remote?: TelegramBusProtocolIdentity;
 }): TelegramBusProtocolCompatibility;
-export declare function getTelegramBusSocketPath(agentDir?: string, platform?: NodeJS.Platform, profileName?: string): string;
-export declare function getTelegramBusFollowerSocketPath(instanceId: string, agentDir?: string, platform?: NodeJS.Platform, profileName?: string): string;
+export declare function getTelegramBusSocketPath(agentDir?: string, platform?: NodeJS.Platform, profileName?: string, layout?: TelegramBusEndpointLayout): string;
+export declare function getTelegramBusFollowerSocketPath(instanceId: string, agentDir?: string, platform?: NodeJS.Platform, profileName?: string, layout?: TelegramBusEndpointLayout): string;
 export interface TelegramBusInstanceRegistration {
     instanceId: string;
     previousInstanceId?: string;
@@ -125,9 +134,7 @@ export declare function getTelegramFollowerTargetOwnership(input: {
     protocolIdentity: TelegramBusProtocolIdentity;
 } | undefined;
 export declare function markTelegramBusAggregateDelivery<T extends Record<string, unknown>>(body: T): T;
-export declare function isTelegramBusAggregateDelivery(body: unknown): boolean;
 export declare function markTelegramBusCrossTargetDelivery<T extends Record<string, unknown>>(body: T): T;
-export declare function isTelegramBusCrossTargetDelivery(body: unknown): boolean;
 export declare function stripTelegramBusApiMetadata<T extends Record<string, unknown>>(body: T): T;
 export declare function isTelegramFollowerApiCallAllowed(input: {
     follower: TelegramBusFollowerView;
@@ -135,7 +142,7 @@ export declare function isTelegramFollowerApiCallAllowed(input: {
     args: unknown[];
     isMessageOwned?: (chatId: number, messageId: number) => boolean;
 }): boolean;
-export interface TelegramFollowerApiCallAuthorizationInput {
+interface TelegramFollowerApiCallAuthorizationInput {
     follower: TelegramBusFollowerView;
     method: string;
     args: unknown[];
@@ -169,7 +176,7 @@ export interface TelegramBusFollowerDeliveryIdentity {
         handoffId: string;
     };
 }
-export type TelegramBusForeignUpdateFailureClass = "source-update-identity-missing" | "recipient-binding-missing" | "recipient-generation-missing" | "source-reference-missing" | "recipient-ownership-stale" | "transport-failed" | "acknowledgement-missing" | "acknowledgement-rejected" | "acknowledgement-mismatched" | "durable-receipt-missing" | "durable-receipt-mismatched";
+type TelegramBusForeignUpdateFailureClass = "source-update-identity-missing" | "recipient-binding-missing" | "recipient-generation-missing" | "source-reference-missing" | "recipient-ownership-stale" | "transport-failed" | "acknowledgement-missing" | "acknowledgement-rejected" | "acknowledgement-mismatched" | "durable-receipt-missing" | "durable-receipt-mismatched";
 export type TelegramBusForeignUpdateSettlement = {
     status: "accepted";
     delivery: TelegramBusFollowerDeliveryIdentity;
@@ -313,17 +320,12 @@ export type TelegramBusEnvelope = ({
     delivery: TelegramBusFollowerDeliveryIdentity;
     sentAtMs: number;
 } | {
-    kind: "leader.replaceFollowerTarget";
+    kind: "leader.workspaceRestore";
     requestId: string;
     recipientInstanceId: string;
-    recipientRegistrationGeneration?: string;
-    target: TelegramTarget & {
-        threadId: number;
-    };
-    oldTarget?: TelegramTarget & {
-        threadId: number;
-    };
-    reason: "thread-restore";
+    recipientRegistrationGeneration: string;
+    operationId: string;
+    mode: "apply" | "inspect";
     sentAtMs: number;
 } | {
     kind: "leader.offerQueueHandoff";
@@ -392,7 +394,7 @@ export type TelegramBusEnvelope = ({
 }) & {
     auth?: string;
 };
-export type TelegramBusEnvelopeTrafficClass = "bootstrap" | "generation-fenced" | "response";
+type TelegramBusEnvelopeTrafficClass = "bootstrap" | "generation-fenced" | "response";
 export declare function getTelegramBusEnvelopeTrafficClass(envelope: TelegramBusEnvelope): TelegramBusEnvelopeTrafficClass;
 export declare function createTelegramBusRequestId(input: {
     instanceId: string;
@@ -401,14 +403,14 @@ export declare function createTelegramBusRequestId(input: {
 export declare function createTelegramBusRequestIdFactory(instanceId: string): () => string;
 export declare function encodeTelegramBusEnvelope(envelope: TelegramBusEnvelope): string;
 export declare function parseTelegramBusEnvelope(line: string): TelegramBusEnvelope | undefined;
-export interface TelegramBusLocalServer {
+interface TelegramBusLocalServer {
     start: () => Promise<void>;
     stop: () => Promise<void>;
     ensureEndpoint: () => Promise<boolean>;
 }
 export type TelegramBusSocketPathSource = string | (() => string);
 export declare function resolveTelegramBusSocketPath(source: TelegramBusSocketPathSource, platform?: NodeJS.Platform | string): string;
-export interface TelegramBusLocalServerDeps {
+interface TelegramBusLocalServerDeps {
     socketPath: TelegramBusSocketPathSource;
     handleEnvelope: (envelope: TelegramBusEnvelope) => Promise<TelegramBusEnvelope | undefined> | TelegramBusEnvelope | undefined;
     recordTransportEvent?: TelegramBusTransportEventRecorder;
@@ -417,14 +419,14 @@ export interface TelegramBusLocalServerDeps {
     requestLedgerMaxEntries?: number;
     shouldDropResponse?: (request: TelegramBusEnvelope, response: TelegramBusEnvelope) => boolean;
 }
-export interface TelegramBusLocalClientOptions {
+interface TelegramBusLocalClientOptions {
     socketPath: string;
     envelope: TelegramBusEnvelope;
     timeoutMs?: number;
     retry?: TelegramBusTransportRetryPolicy;
     recordTransportEvent?: TelegramBusTransportEventRecorder;
 }
-export interface TelegramBusForeignOwnedForwarderDeps<TMessage = unknown> {
+interface TelegramBusForeignOwnedForwarderDeps<TMessage = unknown> {
     socketPath: TelegramBusSocketPathSource;
     createRequestId: () => string;
     getNowMs?: () => number;
@@ -477,38 +479,31 @@ export declare function createTelegramBusForeignOwnedUpdateForwarder<TContext, T
         ctx: TContext;
     }) => Promise<TelegramBusForeignUpdateSettlement>;
 };
-export interface TelegramBusFollowerThreadRestoreHandlerDeps {
-    followerRegistry: Pick<TelegramBusFollowerRegistry, "get" | "register">;
-    followerTargetController: ReturnType<typeof createTelegramBusFollowerTargetController>;
-    onRestored?: () => void;
-}
 export declare function listTelegramBusLiveThreadTargets(input: {
     leaderTarget?: TelegramTarget;
     followers: readonly TelegramBusFollowerView[];
 }): TelegramTarget[];
-export declare function createTelegramBusFollowerTargetController(deps: TelegramBusForeignOwnedForwarderDeps): {
-    replaceTarget: (input: {
-        follower: TelegramBusFollowerView;
-        target: TelegramTarget & {
-            threadId: number;
-        };
-        oldTarget?: TelegramTarget & {
-            threadId: number;
-        };
-        reason: "thread-restore";
-    }) => Promise<boolean>;
-};
-export declare function createTelegramBusFollowerThreadRestoreHandler(deps: TelegramBusFollowerThreadRestoreHandlerDeps): (input: {
-    record: {
-        instanceId?: string;
-    };
+/** Caller owns the durable one-shot apply grant. Inspections never grant another apply. */
+export declare function createTelegramBusWorkspaceRestoreController(deps: {
+    getFollower: (instanceId: string) => TelegramBusFollowerView | undefined;
+    localProtocolIdentity: TelegramBusProtocolIdentity;
+    createRequestId: () => string;
+    getAuthSecret: () => string | undefined;
+    timeoutMs?: number;
+}): (input: {
+    operationId: string;
+    instanceId: string;
+    sessionId: string;
+    slot: string;
     target: TelegramTarget & {
         threadId: number;
     };
-    oldTarget?: TelegramTarget & {
+    oldTarget: TelegramTarget & {
         threadId: number;
     };
-}) => Promise<boolean>;
+    mode: "apply" | "inspect";
+    isCurrent: () => boolean;
+}) => Promise<TelegramBusWorkspaceRestoreObservation | undefined>;
 export declare function isTelegramBusEnvelopeAuthorized(envelope: TelegramBusEnvelope, secret: string | undefined): boolean;
 export declare function createUnauthorizedBusAck(requestId: string): TelegramBusEnvelope;
 export declare function createTelegramBusLocalServer(deps: TelegramBusLocalServerDeps): TelegramBusLocalServer;
@@ -529,3 +524,4 @@ export interface TelegramBusFollowerRegistry {
 }
 export declare function createTelegramBusForwardOwnershipValidator(registry: Pick<TelegramBusFollowerRegistry, "get">): (ownership: TelegramBusForwardOwnership) => boolean;
 export declare function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry;
+export {};

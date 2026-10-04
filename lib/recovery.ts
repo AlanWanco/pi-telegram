@@ -4,21 +4,21 @@
  * Owns fail-safe classification of temporary ownership and routing artifacts
  */
 
-import { randomUUID } from "node:crypto";
 import {
   existsSync,
   lstatSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
+  rmdirSync,
+  rmSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+
+import { decodeTelegramSessionDirectoryName, getTelegramProfilePathSuffix } from "./paths.ts";
 
 import {
   isProcessAlive as defaultIsProcessAlive,
   parseTelegramLockEntry,
-  renameTelegramPathWithRetry,
   TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
   withTelegramFileTransaction,
   type TelegramFileTransactionOptions,
@@ -59,22 +59,22 @@ export type TelegramRuntimeRecoveryResult =
   | {
       kind: "blocked-live-owner";
       livePids: number[];
-      quarantineDir?: string;
+      deletedPaths?: string[];
     }
   | {
       kind: "recovered";
       artifacts: TelegramRuntimeCorruptArtifact[];
-      quarantineDir: string;
+      /** Damaged disposable artifacts deleted per the approved corruption policy; nothing is quarantined. */
+      deletedPaths: string[];
     };
 
 export interface TelegramRuntimeRecoveryOptions
   extends TelegramRuntimeRecoveryClassificationOptions {
   recoveryTransactionPath?: string;
-  quarantineRoot?: string;
   pid?: number;
   getNowMs?: () => number;
-  quarantineRename?: typeof renameSync;
-  quarantineRenameRetryDelayMs?: number;
+  /** Fault-injection seam; production uses bounded-retry recursive removal. */
+  removePath?: (path: string) => void;
   transactionOptions?: TelegramFileTransactionOptions;
 }
 
@@ -145,6 +145,9 @@ function inspectOwners(
 function inspectState(path: string): ArtifactInspection {
   if (!existsSync(path)) return { source: "state", ownerPids: [] };
   try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 8 * 1024 * 1024)
+      return corruption("state", path, `${basename(path)} cannot be safely inspected`);
     JSON.parse(readFileSync(path, "utf8"));
     return { source: "state", ownerPids: [] };
   } catch {
@@ -293,24 +296,24 @@ export function classifyTelegramRuntimeRecovery(
 }
 
 /**
- * Quarantine classifier-approved disposable corruption under two guards.
+ * Delete classifier-approved disposable corruption under two guards.
  *
  * A dedicated recovery transaction serializes recoverers. The ownership
  * transaction then prevents a new Telegram owner from appearing between the
- * final classification and mutation. Every artifact is renamed within its
- * filesystem; durable config and diagnostics never enter the candidate set.
+ * final classification and mutation. Damaged ownership debris and canonical
+ * state are deleted (operator policy: unfinished Restores in unreadable state
+ * are acceptable loss). Durable config and diagnostics never enter the set.
  */
 export function recoverTelegramRuntimeState(
   options: TelegramRuntimeRecoveryOptions,
 ): TelegramRuntimeRecoveryResult {
-  const pid = options.pid ?? process.pid;
   const transactionPath =
     options.transactionPath ?? `${options.ownersPath}.transaction`;
   const recoveryTransactionPath =
     options.recoveryTransactionPath ??
     join(dirname(options.ownersPath), "runtime-recovery.transaction");
-  const quarantineRoot =
-    options.quarantineRoot ?? join(dirname(options.ownersPath), "recovery");
+  const removePath = options.removePath ?? ((path: string) =>
+    rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }));
   const classificationOptions = {
     ownersPath: options.ownersPath,
     statePaths: options.statePaths,
@@ -332,34 +335,19 @@ export function recoverTelegramRuntimeState(
         };
       }
 
-      let quarantineDir: string | undefined;
+      const deletedPaths: string[] = [];
       const recoveredArtifacts: TelegramRuntimeCorruptArtifact[] = [];
-      const ensureQuarantineDir = (): string => {
-        if (quarantineDir) return quarantineDir;
-        quarantineDir = join(
-          quarantineRoot,
-          `${options.getNowMs?.() ?? Date.now()}-${pid}-${randomUUID()}`,
-        );
-        mkdirSync(quarantineDir, { recursive: true, mode: 0o700 });
-        return quarantineDir;
-      };
-      const quarantineArtifact = (
+      const deleteArtifact = (
         artifact: TelegramRuntimeCorruptArtifact,
       ): void => {
         if (!existsSync(artifact.path)) return;
-        const destination = join(ensureQuarantineDir(), basename(artifact.path));
-        if (
-          renameTelegramPathWithRetry(artifact.path, destination, {
-            rename: options.quarantineRename,
-            retryDelayMs: options.quarantineRenameRetryDelayMs,
-          })
-        ) {
-          recoveredArtifacts.push(artifact);
-        }
+        removePath(artifact.path);
+        deletedPaths.push(artifact.path);
+        recoveredArtifacts.push(artifact);
       };
 
       for (const artifact of initial.artifacts) {
-        if (artifact.kind === "transaction") quarantineArtifact(artifact);
+        if (artifact.kind === "transaction") deleteArtifact(artifact);
       }
 
       return withTelegramFileTransaction(
@@ -373,19 +361,19 @@ export function recoverTelegramRuntimeState(
             return {
               kind: "blocked-live-owner",
               livePids: current.livePids,
-              quarantineDir,
+              ...(deletedPaths.length > 0 ? { deletedPaths } : {}),
             };
           }
           if (current.kind === "recoverable-corruption") {
             for (const artifact of current.artifacts) {
-              if (artifact.kind !== "transaction") quarantineArtifact(artifact);
+              if (artifact.kind !== "transaction") deleteArtifact(artifact);
             }
           }
-          return recoveredArtifacts.length > 0 && quarantineDir
+          return recoveredArtifacts.length > 0
             ? {
                 kind: "recovered",
                 artifacts: recoveredArtifacts,
-                quarantineDir,
+                deletedPaths,
               }
             : { kind: "not-needed" };
         },
@@ -394,6 +382,81 @@ export function recoverTelegramRuntimeState(
     },
     options.transactionOptions,
   );
+}
+
+/**
+ * Remove recovery folders written by earlier releases (runtime root and session folders).
+ * Current releases delete damaged files instead of quarantining them; nothing reads these copies.
+ */
+export function removeTelegramLegacyRecoveryStorage(runtimeDir: string): string[] {
+  const removed: string[] = [];
+  const remove = (path: string): void => {
+    try {
+      if (!lstatSync(path).isDirectory()) return;
+      rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      removed.push(path);
+    } catch {
+      // Best-effort housekeeping; a later startup retries.
+    }
+  };
+  remove(join(runtimeDir, "recovery"));
+  let sessions: string[] = [];
+  try { sessions = readdirSync(join(runtimeDir, "sessions")); } catch { /* no sessions yet */ }
+  for (const session of sessions) remove(join(runtimeDir, "sessions", session, "recovery"));
+  return removed;
+}
+
+const TELEGRAM_SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+
+export interface TelegramSessionFolderSweeperDeps {
+  getSessionsDir: () => string;
+  getProfileName: () => string | undefined;
+  /** Sessions holding a Workspace slot binding, live registrations and this process's own session. */
+  getKeptSessionIds: () => Iterable<string | undefined>;
+  getNowMs?: () => number;
+  intervalMs?: number;
+}
+
+/**
+ * Leader housekeeping (operator policy): a session without a Workspace slot loses its
+ * current-profile journal family; the folder disappears once no profile uses it.
+ */
+export function createTelegramSessionFolderSweeper(deps: TelegramSessionFolderSweeperDeps): { sweep: () => string[] } {
+  const getNowMs = deps.getNowMs ?? Date.now;
+  const intervalMs = deps.intervalMs ?? TELEGRAM_SESSION_SWEEP_INTERVAL_MS;
+  let lastSweepAtMs: number | undefined;
+  return {
+    sweep() {
+      const now = getNowMs();
+      if (lastSweepAtMs !== undefined && now - lastSweepAtMs < intervalMs) return [];
+      lastSweepAtMs = now;
+      const sessionsDir = deps.getSessionsDir();
+      const kept = new Set(deps.getKeptSessionIds());
+      const suffix = getTelegramProfilePathSuffix(deps.getProfileName()).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const family = new RegExp(`^journal\\.[a-f0-9]{16}${suffix}\\.json(?:\\.segments|\\.retained)?$`, "u");
+      const removed: string[] = [];
+      let names: string[];
+      try { names = readdirSync(sessionsDir); } catch { return removed; }
+      for (const name of names) {
+        const sessionId = decodeTelegramSessionDirectoryName(name);
+        if (sessionId === undefined || kept.has(sessionId)) continue;
+        const folder = join(sessionsDir, name);
+        try {
+          if (!lstatSync(folder).isDirectory()) continue;
+          for (const entry of readdirSync(folder)) {
+            if (!family.test(entry)) continue;
+            const path = join(folder, entry);
+            rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+            removed.push(path);
+          }
+          if (readdirSync(folder).length === 0) { rmdirSync(folder); removed.push(folder); }
+        } catch {
+          // Best-effort housekeeping; the next sweep retries.
+        }
+      }
+      return removed;
+    },
+  };
 }
 
 /** Build the `/telegram-connect` recovery boundary around runtime artifacts. */
@@ -435,10 +498,7 @@ export function createTelegramPollingStartRecoveryHandler(
       });
     }
     try {
-      const recovery = recoverTelegramRuntimeState({
-        ownersPath,
-        statePaths,
-      });
+      const recovery = recoverTelegramRuntimeState({ ownersPath, statePaths });
       if (recovery.kind === "blocked-live-owner") {
         return {
           kind: "blocked",

@@ -42,7 +42,7 @@ test("Thinking menu text and reply markup expose all levels with current marker"
   ]);
 });
 
-test("Thinking callback sets valid levels and reports current level", async () => {
+test("Thinking callback sets valid levels, refreshes its chooser and reports current level", async () => {
   const calls: string[] = [];
   let current = "low" as const;
 
@@ -56,8 +56,8 @@ test("Thinking callback sets valid levels and reports current level", async () =
         calls.push(`set:${level}`);
       },
       getCurrentThinkingLevel: () => current,
-      updateStatusMessage: async () => {
-        calls.push("update-status");
+      updateThinkingMenuMessage: async () => {
+        calls.push("update-thinking");
       },
       answerCallbackQuery: async (_id, text) => {
         calls.push(text ?? "answered");
@@ -66,7 +66,7 @@ test("Thinking callback sets valid levels and reports current level", async () =
   );
 
   assert.equal(handled, true);
-  assert.deepEqual(calls, ["set:high", "update-status", "Thinking: high"]);
+  assert.deepEqual(calls, ["set:high", "update-thinking", "Thinking: high"]);
 });
 
 test("Thinking callback handles invalid, voice-active, non-reasoning, and unrelated actions", async () => {
@@ -76,8 +76,8 @@ test("Thinking callback handles invalid, voice-active, non-reasoning, and unrela
       throw new Error("must not set level");
     },
     getCurrentThinkingLevel: () => "off" as const,
-    updateStatusMessage: async () => {
-      throw new Error("must not update status");
+    updateThinkingMenuMessage: async () => {
+      throw new Error("must not update thinking");
     },
     answerCallbackQuery: async (_id: string, text?: string) => {
       answered.push(text ?? "answered");

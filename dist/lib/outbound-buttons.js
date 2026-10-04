@@ -4,7 +4,7 @@
  * Owns assistant-authored telegram_button extraction, button action storage, callback handling, and prompt-turn construction
  */
 import { randomUUID } from "node:crypto";
-import { parseTelegramActionPayloadRows, parseTelegramButtonPayloadRows, replaceTelegramButtonFences, replaceTopLevelHtmlComments, } from "./outbound-markup.js";
+import { getTelegramActionString as getTelegramButtonString, parseTelegramActionPayloadRows, parseTelegramButtonPayloadRows, replaceTelegramButtonFences, replaceTopLevelHtmlComments, } from "./outbound-markup.js";
 import { truncateTelegramQueueSummary, } from "./queue.js";
 const TELEGRAM_BUTTON_CALLBACK_PREFIX = "tgbtn";
 const TELEGRAM_BUTTON_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -13,13 +13,6 @@ function nowMs() {
 }
 function normalizeMarkdownAfterButtonExtraction(markdown) {
     return markdown.replace(/\n{3,}/g, "\n\n").trim();
-}
-function getTelegramButtonString(payload, key) {
-    const value = payload[key];
-    if (typeof value !== "string")
-        return undefined;
-    const trimmed = value.trim();
-    return trimmed || undefined;
 }
 function parseTelegramButtonAction(payload) {
     const value = getTelegramButtonString(payload, "value");

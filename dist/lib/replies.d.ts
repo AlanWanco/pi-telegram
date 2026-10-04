@@ -117,10 +117,6 @@ export declare function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
 }, options?: TelegramReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
 }): Promise<number | undefined>;
-export declare function sendTelegramNativeRichMessage(chatId: number, richMessage: TelegramInputRichMessage, deps: {
-    recordOwnership?: TelegramReplyOwnershipRecorder["record"];
-    sendRichMessage: (body: TelegramSendRichMessageBody) => Promise<TelegramSentMessage>;
-}, options?: TelegramReplyTargetOptions): Promise<number>;
 export type TelegramAssistantRenderingMode = "rich" | "html";
 export interface TelegramRenderedMessageRuntimeDeps<TReplyMarkup> {
     renderTelegramMessage: (text: string, options?: {

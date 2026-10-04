@@ -4,6 +4,8 @@
  * Owns top-level assistant action comment extraction, attribute parsing, and markup stripping shared by voice and outbound delivery
  */
 
+import { isWireRecord as isTelegramActionPayload } from "./wire.ts";
+
 export interface TelegramTopLevelHtmlComment {
   raw: string;
   content: string;
@@ -150,7 +152,7 @@ export function replaceTopLevelHtmlComments(
   return result + markdown.slice(offset);
 }
 
-export function findTopLevelOpenOrPartialHtmlCommentIndex(
+function findTopLevelOpenOrPartialHtmlCommentIndex(
   markdown: string,
 ): number {
   const { openCommentStart } = collectTopLevelHtmlComments(markdown);
@@ -180,23 +182,6 @@ export function findTopLevelOpenOrPartialHtmlCommentIndex(
   return -1;
 }
 
-export function parseTopLevelTelegramComment(
-  comment: TelegramTopLevelHtmlComment,
-  command: string,
-): { head: string; body?: string } | undefined {
-  let normalizedContent = comment.content.replace(/^\s+/, "");
-  normalizedContent = normalizedContent.replace(/^!/, "");
-  const [rawHead = "", ...bodyLines] = normalizedContent.split(/\r?\n/);
-  let head = rawHead.trimStart();
-  if (!head.startsWith(command)) return undefined;
-  const nextChar = head[command.length];
-  if (nextChar !== undefined && !/\s|:/.test(nextChar)) return undefined;
-  return {
-    head: head.slice(command.length),
-    ...(bodyLines.length > 0 ? { body: bodyLines.join("\n") } : {}),
-  };
-}
-
 function parseTolerantTelegramAttributes(
   source: string,
   names: readonly string[],
@@ -212,10 +197,6 @@ function parseTolerantTelegramAttributes(
     if (value) attributes[match[1]!] = value;
   }
   return Object.keys(attributes).length > 0 ? attributes : undefined;
-}
-
-function isTelegramActionPayload(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function removeTelegramJsonTrailingCommas(source: string): string {
@@ -268,7 +249,7 @@ function looksLikeTelegramNamedJsonObject(
   return /^\{\s*"(?:[^"\\]|\\.)*"\s*:/u.test(source.slice(offset));
 }
 
-export function parseTelegramActionPayload(
+function parseTelegramActionPayload(
   comment: TelegramTopLevelHtmlComment,
   command: string,
 ): Record<string, unknown> | undefined {
@@ -711,7 +692,7 @@ export interface TelegramVoiceReplyPlan {
   rate?: string;
 }
 
-function getTelegramActionString(
+export function getTelegramActionString(
   payload: Record<string, unknown>,
   key: string,
 ): string | undefined {

@@ -14,6 +14,7 @@ import {
   renderTelegramMessage,
 } from "./replies.ts";
 import {
+  areTelegramTargetsEqual as areDeliveryTargetsEqual,
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
@@ -262,7 +263,7 @@ function failure<T>(
     : { ok: false, reason, message, partial, ...retry };
 }
 
-export function classifyTelegramDeliveryTransportError(error: unknown): {
+function classifyTelegramDeliveryTransportError(error: unknown): {
   reason: Extract<TelegramDeliveryFailureReason,
     "commit-unknown" | "message-unavailable" | "rate-limited" |
     "transport-retryable" | "transport-failed">;
@@ -372,13 +373,6 @@ export function isTelegramDeliveryExplicitTargetAuthorized(
   return (view.liveTargets ?? []).some(function (target) {
     return areDeliveryTargetsEqual(candidate, target);
   });
-}
-
-function areDeliveryTargetsEqual(
-  left: TelegramDeliveryTarget,
-  right: TelegramDeliveryTarget,
-): boolean {
-  return left.chatId === right.chatId && left.threadId === right.threadId;
 }
 
 function cloneTarget(target: TelegramDeliveryTarget): TelegramDeliveryTarget {

@@ -5597,6 +5597,7 @@ test("Queue dispatch controller plans prompts and reports dispatch failures", ()
 
 test("Queue dispatch announces the exact selected prompt before one dispatch", async () => {
   const events: string[] = [];
+  let noticeOptions: unknown;
   let queuedItems: TelegramQueueItem<string>[] = [createQueueTestPromptTurn({
     chatId: 42,
     target: { chatId: 42, threadId: 7 },
@@ -5612,6 +5613,7 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
     canDispatch: () => true,
     updateStatus: () => events.push("status"),
     sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      noticeOptions = options;
       events.push(`notice:${chatId}:${replyToMessageId}:${options?.target?.threadId}:${text}`);
       return 100;
     },
@@ -5624,6 +5626,7 @@ test("Queue dispatch announces the exact selected prompt before one dispatch", a
   });
   controller.requestNextDispatchAnnouncement();
   controller.dispatchNext("ctx");
+  assert.deepEqual(noticeOptions, { target: { chatId: 42, threadId: 7 }, parseMode: "HTML" });
   assert.deepEqual(events, [
     "status",
     "notice:42:99:7:<b>⏩ Dispatching next queued turn.</b>",

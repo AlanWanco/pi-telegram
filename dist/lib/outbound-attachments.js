@@ -23,7 +23,7 @@ export function getTelegramOutboundAttachmentByteLimitFromEnv(env, names, defaul
     }
     return defaultValue;
 }
-export const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES = getTelegramOutboundAttachmentByteLimitFromEnv(process.env, [
+const TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES = getTelegramOutboundAttachmentByteLimitFromEnv(process.env, [
     "PI_TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES",
     "TELEGRAM_MAX_ATTACHMENT_SIZE_BYTES",
 ]);

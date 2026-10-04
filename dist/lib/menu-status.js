@@ -60,7 +60,7 @@ export async function handleTelegramStatusMenuCallbackAction(callbackQueryId, da
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
 }
-export function buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueItemCount = 0, sectionRegistry, isVoiceReplyActive) {
+export function buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueItemCount = 0, sectionRegistry, isVoiceReplyActive, pendingCancellationCount = 0) {
     const rows = [];
     rows.push([
         {
@@ -82,6 +82,11 @@ export function buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueI
             callback_data: "menu:queue",
         },
     ]);
+    if (pendingCancellationCount > 0)
+        rows.push([{
+                text: `❌ Pending cancellations: ${pendingCancellationCount}`,
+                callback_data: "reroutecancel:review:open",
+            }]);
     if (sectionRegistry) {
         const sectionRows = getTelegramSectionMainMenuRows(sectionRegistry);
         for (const row of sectionRows) {
@@ -96,17 +101,17 @@ export function buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueI
     ]);
     return { inline_keyboard: rows };
 }
-export function buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount = 0, sectionRegistry, isVoiceReplyActive) {
+export function buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount = 0, sectionRegistry, isVoiceReplyActive, pendingCancellationCount = 0) {
     return {
         nextMode: "status",
         text: statusText,
         mode: "html",
-        replyMarkup: buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive),
+        replyMarkup: buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive, pendingCancellationCount),
     };
 }
-export async function updateTelegramStatusMessage(state, statusText, activeModel, currentThinkingLevel, deps, queueItemCount = 0, sectionRegistry, isVoiceReplyActive) {
-    await editTelegramMenuMessage(state, buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive), deps);
+export async function updateTelegramStatusMessage(state, statusText, activeModel, currentThinkingLevel, deps, queueItemCount = 0, sectionRegistry, isVoiceReplyActive, pendingCancellationCount = 0) {
+    await editTelegramMenuMessage(state, buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive, pendingCancellationCount), deps);
 }
-export function sendTelegramStatusMessage(state, statusText, activeModel, currentThinkingLevel, deps, queueItemCount = 0, sectionRegistry, isVoiceReplyActive) {
-    return sendTelegramMenuMessage(state, buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive), deps);
+export function sendTelegramStatusMessage(state, statusText, activeModel, currentThinkingLevel, deps, queueItemCount = 0, sectionRegistry, isVoiceReplyActive, pendingCancellationCount = 0) {
+    return sendTelegramMenuMessage(state, buildTelegramStatusMenuRenderPayload(statusText, activeModel, currentThinkingLevel, queueItemCount, sectionRegistry, isVoiceReplyActive, pendingCancellationCount), deps);
 }

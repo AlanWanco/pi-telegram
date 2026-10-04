@@ -343,7 +343,7 @@ export function createTelegramCompactionObserverRuntime(deps) {
                 typingStartedByObserver = false;
                 deps.updateStatus(ctx);
                 deps.recordRuntimeEvent?.("compact", new Error("Compaction observer timed out"));
-                deps.onCompactionAbandoned?.();
+                // Observer expiry releases local presence, not Pi's eventual terminal result.
                 requestDispatch();
             }, timeoutMs);
             unrefTelegramLifecycleTimer(fallbackTimer);

@@ -43,10 +43,7 @@ interface RegisteredTelegramExtensionCommand {
     emoji?: string;
     handler: TelegramExtensionCommandRegistration["handler"];
 }
-export declare function normalizeTelegramExtensionCommandName(name: string): string;
-export declare function isTelegramExtensionCommandName(name: string): boolean;
 export declare function registerTelegramCommand(registration: TelegramExtensionCommandRegistration): () => void;
-export declare function getTelegramExtensionCommands(): RegisteredTelegramExtensionCommand[];
 export declare function findTelegramExtensionCommand(name: string | undefined): RegisteredTelegramExtensionCommand | undefined;
 export declare function clearTelegramExtensionCommands(): void;
 export declare const TELEGRAM_COMMAND_EMOJI: {
@@ -65,18 +62,14 @@ export declare const TELEGRAM_COMMAND_EMOJI: {
     readonly new: "🆕";
 };
 export type TelegramCommandEmojiName = keyof typeof TELEGRAM_COMMAND_EMOJI;
-export declare function getTelegramCommandEmoji(command: TelegramCommandEmojiName): string;
 export declare function formatTelegramCommandEmojiPrefix(command: TelegramCommandEmojiName): string;
 export declare function formatTelegramPiCommandHtml(command: string): string;
 export declare function formatTelegramInformationHeading(emoji: string, text: string): string;
 export declare function formatTelegramInvalidInstanceName(validationError: string): string;
 export declare function formatTelegramThreadDisplayNameSavedHeading(name: string): string;
 export declare function formatTelegramAutomaticThreadDisplayNameRestoredHeading(name: string): string;
-export declare const TELEGRAM_COMPACTION_STARTED_TEXT: string;
-export declare const TELEGRAM_COMPACTION_COMPLETED_TEXT: string;
 export declare const TELEGRAM_COMPACTION_STARTED_MARKDOWN: string;
 export declare const TELEGRAM_COMPACTION_COMPLETED_MARKDOWN = "**\u2705 Compaction completed.**";
-export declare const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinition[];
 export declare const TELEGRAM_BOT_COMMANDS: readonly TelegramBotCommandDefinition[];
 export declare function getTelegramReservedCommandNames(): string[];
 export interface TelegramBotCommandRegistrationDeps {
@@ -542,16 +535,8 @@ export declare function handleTelegramNextCommand(deps: {
         parseMode?: "HTML";
     }) => Promise<void>) | undefined;
 }): Promise<void>;
-export declare function handleTelegramContinueCommand<TMessage, TContext>(message: TMessage, ctx: TContext, deps: {
-    enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
-}): Promise<void>;
-export declare function buildTelegramNewConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup;
-export declare function getTelegramNewConfirmationHtml(): string;
 export declare function openTelegramNewConfirmation(target: TelegramCommandMessageTarget, deps: TelegramCompactConfirmationDeps): Promise<void>;
 export declare function handleTelegramNewConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramNewConfirmationCallbackDeps<TContext>): Promise<boolean>;
-export declare function buildTelegramCompactConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup;
-export declare function getTelegramCompactConfirmationHtml(): string;
-export declare function openTelegramCompactConfirmation(target: TelegramCommandMessageTarget, deps: TelegramCompactConfirmationDeps): Promise<void>;
 export declare function handleTelegramCompactConfirmationCallback<TContext>(query: TelegramCompactConfirmationCallbackQuery, deps: TelegramCompactConfirmationCallbackDeps<TContext>): Promise<boolean>;
 export interface TelegramNewCommandDeps extends TelegramRuntimeEventRecorderPort {
     isIdle: () => boolean;
@@ -588,7 +573,6 @@ export declare function createTelegramCommandOrPromptRuntime<TMessage, TContext>
 export declare const TELEGRAM_INTERNAL_COMMAND_NAME = "telegram-internal";
 export declare const TELEGRAM_INTERNAL_COMMAND_DESCRIPTION = "Internal Telegram command cannot be run manually";
 export declare const TELEGRAM_INTERNAL_MANUAL_USE_MESSAGE = "This internal Telegram command cannot be run manually.";
-export declare function delayTelegramSessionAction(delayMs: number): Promise<void>;
 export interface TelegramSessionActionRuntimeDeps {
     registerCommand: Pi.ExtensionAPI["registerCommand"];
     sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];
@@ -621,13 +605,6 @@ export interface TelegramSessionReplacementSettlementDeps {
     isCurrent?: () => boolean;
 }
 export declare function settleTelegramSessionReplacement(deps: TelegramSessionReplacementSettlementDeps): Promise<"none" | "settled" | "expired" | "failed" | "stale">;
-export declare function createTelegramSessionReplacementSettlementRuntime<TContext>(deps: {
-    resolve: (ctx: TContext) => TelegramSessionReplacementSettlementDeps | undefined;
-    onResult?: (result: "none" | "settled" | "expired" | "failed" | "stale") => void;
-    onError?: (error: unknown) => void;
-}): {
-    onSessionStart: (ctx: TContext) => void;
-};
 export interface TelegramSessionActionAssemblyDeps {
     registerCommand: Pi.ExtensionAPI["registerCommand"];
     sendUserMessage: Pi.ExtensionAPI["sendUserMessage"];

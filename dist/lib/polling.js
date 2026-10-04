@@ -15,7 +15,7 @@ const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT = 3;
 const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS = 1_000;
 const TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS = 3_000;
 const TELEGRAM_POLLING_RETRY_MS = 3_000;
-export const TELEGRAM_GET_UPDATES_GRACE_MS = 10_000;
+const TELEGRAM_GET_UPDATES_GRACE_MS = 10_000;
 // Standard Telegram DM polling does not expose ordinary message-deletion events.
 // Business deletions belong to a separate namespace and default routing ignores them.
 export const TELEGRAM_ALLOWED_UPDATES = [
@@ -80,7 +80,7 @@ export function createTelegramPollingControllerState() {
         stopReason: "not-started",
     };
 }
-export function getTelegramPollingStateSnapshot(state) {
+function getTelegramPollingStateSnapshot(state) {
     return {
         phase: state.phase,
         phaseStartedAtMs: state.phaseStartedAtMs,
@@ -481,7 +481,7 @@ export function createTelegramThreadCapabilityOrchestration(deps) {
         }),
     };
 }
-export async function readTelegramThreadCapability(deps) {
+async function readTelegramThreadCapability(deps) {
     const bot = await deps.callApi("getMe", {});
     if (bot.has_topics_enabled === true)
         return true;
@@ -489,7 +489,7 @@ export async function readTelegramThreadCapability(deps) {
         return false;
     return undefined;
 }
-export async function probeTelegramStartupThreadCapability(deps, isCurrent = () => true) {
+async function probeTelegramStartupThreadCapability(deps, isCurrent = () => true) {
     if (!isCurrent())
         return;
     const threadModeEnabled = await readTelegramThreadCapability(deps);
@@ -770,7 +770,7 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         stopFollowerRegistration: deps.stopFollowerRegistration,
     };
 }
-export function createTelegramThreadTargetObservationHandler(deps) {
+function createTelegramThreadTargetObservationHandler(deps) {
     let transitionPending = false;
     return async (ctx) => {
         if (transitionPending)

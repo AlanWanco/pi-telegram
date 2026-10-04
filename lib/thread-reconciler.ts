@@ -202,6 +202,8 @@ export interface ThreadReconciliationApplyResult {
 }
 
 export interface ThreadReconciliationApplyPorts {
+  /** Private-chat temporary tabs support deletion, not forum closing. */
+  skipCloseBeforeDelete?: boolean;
   isCleanupTargetProtected?: (target: ThreadTarget, action: ThreadReconciliationAction) => boolean;
   callApi?: <TResponse>(
     method: string,
@@ -636,7 +638,7 @@ export async function applyThreadReconciliationPlan(
       }
       let deleteConfirmed = false;
       let superseded = false;
-      for (const method of ["closeForumTopic", "deleteForumTopic"]) {
+      for (const method of ports.skipCloseBeforeDelete ? ["deleteForumTopic"] : ["closeForumTopic", "deleteForumTopic"]) {
         if (ports.isCleanupTargetProtected?.(action.target, action)) {
           superseded = true;
           break;

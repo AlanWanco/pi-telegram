@@ -4,7 +4,11 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { createTelegramLockRuntime, mutateTelegramRuntimeStateSection, readTelegramRuntimeState } from "../lib/locks.ts";
 
 import {
   buildTelegramBridgeStatusLines,
@@ -13,6 +17,10 @@ import {
   clearTelegramStatusLineProviders,
   createTelegramBridgeStatusRuntime,
   createTelegramRuntimeDiagnosticsSnapshotScheduler,
+  createTelegramRuntimeProjectionStore,
+  type TelegramRuntimeProjectionStoreOptions,
+  type TelegramRuntimeProjectionStorage,
+  type TelegramStatusSnapshot,
   createTelegramRuntimeEventRecorder,
   createTelegramRuntimeLogScope,
   createTelegramStatusHtmlBuilder,
@@ -24,6 +32,183 @@ import {
   registerTelegramStatusLineProvider,
   type TelegramRuntimeEvent,
 } from "../lib/status.ts";
+
+function createProjectionFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-runtime-projection-")), path = join(dir, "state.json");
+  const scope = { path, profile: "default", generation: 1, now: 1000, onNow: undefined as (() => void) | undefined,
+    onPublish: undefined as ((boundary: "before-write" | "after-write-before-rename" | "after-rename") => void) | undefined };
+  const owner = createTelegramLockRuntime({ statePath: path, key: () => scope.profile, pid: 10,
+    instanceId: "owner", runtimeGeneration: 1, isProcessAlive: () => true });
+  const snapshot: TelegramStatusSnapshot = { runtime: { pollingActive: true }, liveRoster: { busFollowers: [] },
+    diagnostics: { pendingDispatch: false, recentRuntimeEvents: [{ at: 1, category: "bus", message: "already logged" }] } };
+  const publishIfOwned = owner.publishStateSectionIfOwned!;
+  const storage: TelegramRuntimeProjectionStorage = {
+    read({ path, profile }) {
+      const file = readTelegramRuntimeState(path);
+      return Object.hasOwn(file.profiles, profile) ? file.profiles[profile]?.runtime : undefined;
+    },
+    publish(expectedScope, mutate, isCurrent) {
+      const outcome = publishIfOwned("runtime", current => {
+        const projection = mutate(current);
+        return { value: projection.value, result: projection.changed };
+      }, { isCurrent, expectedScope, onPublicationBoundary(at) { scope.onPublish?.(at); } });
+      return outcome.committed && outcome.result;
+    },
+  };
+  const createStore = (overrides: Partial<TelegramRuntimeProjectionStoreOptions> = {}) => createTelegramRuntimeProjectionStore({
+    getPath: () => scope.path, getProfile: () => scope.profile,
+    captureAuthority() {
+      const epoch = owner.getOwnedLeaderEpoch(), generation = scope.generation;
+      if (epoch === undefined) return undefined;
+      return () => scope.generation === generation && owner.owns() && owner.getOwnedLeaderEpoch() === epoch;
+    },
+    storage,
+    getNowMs() { scope.onNow?.(); return scope.now; },
+    ...overrides,
+  });
+  return { dir, path, scope, owner, snapshot, createStore, storage };
+}
+
+test("Consolidated runtime projection reads and missing authority never create state", async () => {
+  const f = createProjectionFixture();
+  try {
+    const store = f.createStore();
+    assert.equal(store.read(), undefined);
+    assert.equal(await store.persist(f.snapshot), false);
+    assert.deepEqual(readdirSync(f.dir), []);
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime projection compares fresh content, excludes event history and preserves every sibling", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    mutateTelegramRuntimeStateSection(f.path, "default", "workspace", () => ({ value: { binding: 55, forwardIssued: true }, result: true }), { isCurrent: () => true });
+    mutateTelegramRuntimeStateSection(f.path, "default", "admission", () => ({ value: { leases: ["busy"], deletionIssued: true }, result: true }), { isCurrent: () => true });
+    mutateTelegramRuntimeStateSection(f.path, "other", "workspace", () => ({ value: { binding: 66 }, result: true }), { isCurrent: () => true });
+    const before = readTelegramRuntimeState(f.path), store = f.createStore();
+    assert.equal(await store.persist(f.snapshot), true);
+    assert.equal(store.read()?.runtime.pollingActive, true);
+    assert.equal(store.read()?.diagnostics.recentRuntimeEvents, undefined);
+    assert.equal(f.snapshot.diagnostics.recentRuntimeEvents instanceof Array, true, "Live debug/ring-buffer input is not mutated");
+    const stable = readFileSync(f.path, "utf8"), inode = statSync(f.path).ino;
+    f.scope.now = 9000;
+    assert.equal(await store.persist(f.snapshot), false);
+    assert.equal(readFileSync(f.path, "utf8"), stable);
+    assert.equal(statSync(f.path).ino, inode);
+    const after = readTelegramRuntimeState(f.path);
+    for (const section of ["transport", "workspace", "admission"] as const) assert.deepEqual(after.profiles.default?.[section], before.profiles.default?.[section]);
+    assert.deepEqual(after.profiles.other, before.profiles.other);
+    mutateTelegramRuntimeStateSection(f.path, "default", "runtime", current => {
+      const changed = structuredClone(current) as { diagnostics: { pendingDispatch: boolean } };
+      changed.diagnostics.pendingDispatch = true;
+      return { value: changed, result: true };
+    }, { isCurrent: () => true });
+    assert.equal(await store.persist(f.snapshot), true, "A remembered no-op cannot skip changed current disk content");
+    assert.equal(store.read()?.diagnostics.pendingDispatch, false);
+    assert.deepEqual(readdirSync(f.dir).sort(), ["runtime", "state.json"], "No status sidecar is created");
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+for (const drift of ["generation", "profile", "path", "owner"] as const) {
+  test(`Consolidated runtime projection refuses queued source drift (${drift})`, async () => {
+    const f = createProjectionFixture();
+    try {
+      const acquired = f.owner.acquire({ cwd: "/repo" }), store = f.createStore();
+      const pending = store.persist(f.snapshot);
+      if (drift === "generation") f.scope.generation++;
+      if (drift === "profile") f.scope.profile = "other";
+      if (drift === "path") f.scope.path = join(f.dir, "other-state.json");
+      if (drift === "owner") createTelegramLockRuntime({ statePath: f.path, pid: 20, instanceId: "replacement", runtimeGeneration: 2,
+        isProcessAlive: () => true }).acquire({ cwd: "/other" }, { force: true, expectedOwner: acquired.ok ? acquired.lock : undefined });
+      const stable = readFileSync(f.path, "utf8");
+      assert.equal(await pending, false);
+      assert.equal(readFileSync(f.path, "utf8"), stable);
+      assert.equal(readTelegramRuntimeState(f.path).profiles.default?.runtime, undefined);
+      assert.equal(existsSync(join(f.dir, "other-state.json")), false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const mismatch of ["profile", "path"] as const) {
+  test(`Consolidated runtime projection cannot borrow a publisher for a mismatched identity (${mismatch})`, async () => {
+    const f = createProjectionFixture();
+    try {
+      f.owner.acquire({ cwd: "/repo" });
+      const store = f.createStore({ ...(mismatch === "profile" ? { getProfile: () => "other" } : { getPath: () => join(f.dir, "other-state.json") }) });
+      const before = readFileSync(f.path, "utf8");
+      assert.equal(await store.persist(f.snapshot), false);
+      assert.equal(readFileSync(f.path, "utf8"), before);
+      assert.equal(existsSync(join(f.dir, "other-state.json")), false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Consolidated runtime projection freezes queued content and callable capabilities at submission/construction", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    const options = { getPath: () => f.path, getProfile: () => "default", captureAuthority: () => () => true,
+      storage: f.storage };
+    const store = createTelegramRuntimeProjectionStore(options);
+    const pending = store.persist(f.snapshot);
+    f.snapshot.runtime.pollingActive = false;
+    options.storage.publish = () => { throw new Error("Replacement capability must not be borrowed"); };
+    assert.equal(await pending, true);
+    assert.equal(store.read()?.runtime.pollingActive, true);
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime projection rejects lost authority during reduction and keeps the queue usable", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    const store = f.createStore(), before = readFileSync(f.path, "utf8");
+    f.scope.onNow = () => { f.scope.generation++; };
+    await assert.rejects(store.persist(f.snapshot), /authority changed/);
+    assert.equal(readFileSync(f.path, "utf8"), before);
+    f.scope.onNow = undefined;
+    assert.equal(await store.persist(f.snapshot), true, "A failed observation cannot poison later freshly authorized diagnostics");
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime projection retains a published observation after lost ACK without replaying publication", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    let writes = 0;
+    f.scope.onPublish = at => {
+      if (at === "after-rename") { writes++; throw new Error("Lost observational publication ACK"); }
+    };
+    const store = f.createStore();
+    await assert.rejects(store.persist(f.snapshot), /outcome is unknown/);
+    assert.equal(store.read()?.runtime.pollingActive, true);
+    assert.equal(await store.persist(f.snapshot), false, "Fresh comparison acknowledges no semantic change, not another publication attempt");
+    assert.equal(writes, 1);
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+for (const damage of ["projection", "envelope"] as const) {
+  test(`Consolidated runtime projection inspection never repairs damaged state (${damage})`, async () => {
+    const f = createProjectionFixture();
+    try {
+      f.owner.acquire({ cwd: "/repo" });
+      mutateTelegramRuntimeStateSection(f.path, "default", "workspace", () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true });
+      if (damage === "projection") mutateTelegramRuntimeStateSection(f.path, "default", "runtime", () => ({ value: ["bad"], result: true }), { isCurrent: () => true });
+      else writeFileSync(f.path, "{", { mode: 0o600 });
+      const store = f.createStore(), before = readFileSync(f.path, "utf8");
+      assert.equal(store.read(), undefined);
+      assert.equal(readFileSync(f.path, "utf8"), before);
+      if (damage === "envelope") {
+        assert.equal(await store.persist(f.snapshot), false, "Damaged envelope fails closed without repair");
+        assert.equal(readFileSync(f.path, "utf8"), before);
+      } else {
+        assert.equal(await store.persist(f.snapshot), true, "Only a known non-authoritative section may be replaced under current owner authority");
+        assert.deepEqual(readTelegramRuntimeState(f.path).profiles.default?.workspace, { binding: 55 });
+      }
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Connection notices name known causes and one recovery action without raw detail", () => {
   const cases: Array<[unknown, string]> = [
@@ -109,7 +294,6 @@ test("Status helpers build runtime log scope and persisted snapshot projections"
       busFollowers: [{ instanceId: "follower", lastHeartbeatMs: 5 }],
       topicTargets: [{ instanceId: "leader", status: "active" }],
       reservations: [{ slot: "B", reason: "startup" }],
-      syncObservations: [{ syncStatus: "open", observedAtMs: 9 }],
     },
     diagnostics: {
       pendingDispatch: true,
@@ -182,6 +366,86 @@ test("Status snapshot scheduler serializes in-flight publication and retains one
   assert.equal(persistCount, 2);
   releases.shift()?.();
   await Promise.resolve();
+});
+
+test("Status snapshot shutdown cancels timers and fences already-dequeued callbacks", async () => {
+  const callbacks: Array<() => void> = [];
+  const cleared: unknown[] = [];
+  let reads = 0;
+  const schedule = createTelegramRuntimeDiagnosticsSnapshotScheduler({
+    persistSnapshot: async () => { reads += 1; },
+    recordError: error => assert.fail(String(error)),
+    setTimer(callback) { callbacks.push(callback); return { unref() {} }; },
+    clearTimer: handle => { cleared.push(handle); },
+  });
+  schedule();
+  const retired = callbacks.shift()!;
+  await schedule.suspend();
+  assert.equal(cleared.length, 1);
+  schedule();
+  retired();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 0);
+  assert.equal(callbacks.length, 0);
+  schedule.resume();
+  schedule();
+  retired();
+  callbacks.shift()!();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 1);
+  await schedule.suspend();
+});
+
+test("Status snapshot shutdown drains publication and discards predecessor reruns", async () => {
+  const callbacks: Array<() => void> = [];
+  let release: (() => void) | undefined;
+  let writes = 0, stopped = false;
+  const schedule = createTelegramRuntimeDiagnosticsSnapshotScheduler({
+    persistSnapshot: () => new Promise<void>(resolve => { writes += 1; release = resolve; }),
+    recordError: error => assert.fail(String(error)),
+    setTimer(callback) { callbacks.push(callback); return { unref() {} }; },
+    clearTimer() {},
+  });
+  schedule();
+  callbacks.shift()!();
+  await Promise.resolve();
+  schedule();
+  const stop = schedule.suspend().then(() => { stopped = true; });
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  release!();
+  await stop;
+  assert.equal(callbacks.length, 0);
+  assert.equal(writes, 1);
+  schedule.resume();
+  schedule();
+  callbacks.shift()!();
+  await Promise.resolve();
+  assert.equal(writes, 2);
+  release!();
+  await schedule.suspend();
+});
+
+test("Status snapshot queued microtasks cannot renew a revoked session scope", async () => {
+  const callbacks: Array<() => void> = [];
+  let session = 1, writes = 0;
+  const schedule = createTelegramRuntimeDiagnosticsSnapshotScheduler({
+    captureScope() { const captured = session; return () => session === captured; },
+    persistSnapshot: async () => { writes += 1; },
+    recordError: error => assert.fail(String(error)),
+    setTimer(callback) { callbacks.push(callback); return { unref() {} }; },
+    clearTimer() {},
+  });
+  schedule();
+  callbacks.shift()!();
+  session += 1;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes, 0);
+  schedule();
+  callbacks.shift()!();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes, 1);
+  await schedule.suspend();
 });
 
 test("Status bar text renders bridge connection and queue states", () => {
@@ -883,13 +1147,13 @@ test("Bridge status runtime builds status state from live ports", () => {
     "- pending model switch: yes",
     "",
     "diagnostics:",
-    "- state: ~/.pi/agent/tmp/telegram/state.json",
-    "- logs: ~/.pi/agent/tmp/telegram/logs.jsonl",
+    "- state: ~/.pi/agent/tmp/pi-telegram/state.json",
+    "- logs: ~/.pi/agent/tmp/pi-telegram/logs.jsonl",
     "- full dump: /telegram-status --debug",
   ]);
 });
 
-test("Bridge status lines render named-profile diagnostic paths", () => {
+test("Bridge status lines retain the named profile with shared diagnostic paths", () => {
   const lines = buildTelegramBridgeStatusLines({
     activeProfileName: "work",
     botUsername: "work_bot",
@@ -901,12 +1165,9 @@ test("Bridge status lines render named-profile diagnostic paths", () => {
     queuedItems: [],
     recentRuntimeEvents: [],
   });
-  assert.ok(
-    lines.includes("- state: ~/.pi/agent/tmp/telegram/state.work.json"),
-  );
-  assert.ok(
-    lines.includes("- logs: ~/.pi/agent/tmp/telegram/logs.work.jsonl"),
-  );
+  assert.ok(lines.includes("- profile: work"));
+  assert.ok(lines.includes("- state: ~/.pi/agent/tmp/pi-telegram/state.json"));
+  assert.ok(lines.includes("- logs: ~/.pi/agent/tmp/pi-telegram/logs.jsonl"));
 });
 
 test("Bridge status lines distinguish unknown bot identity from missing config", () => {

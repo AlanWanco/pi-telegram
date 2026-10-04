@@ -8,7 +8,7 @@ import { type MenuModel, type ThinkingLevel } from "./model.ts";
 export interface TelegramThinkingMenuCallbackDeps {
     setThinkingLevel: (level: ThinkingLevel) => void;
     getCurrentThinkingLevel: () => ThinkingLevel;
-    updateStatusMessage: () => Promise<void>;
+    updateThinkingMenuMessage: () => Promise<void>;
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
     isVoiceReplyActive?: () => boolean;
 }

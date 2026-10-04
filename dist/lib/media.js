@@ -6,7 +6,7 @@
 import { basename, dirname } from "node:path";
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const TELEGRAM_REPLY_CONTEXT_MAX_LENGTH = 1000;
-export function guessExtensionFromMime(mimeType, fallback) {
+function guessExtensionFromMime(mimeType, fallback) {
     if (!mimeType)
         return fallback;
     const normalized = mimeType.toLowerCase();
@@ -162,7 +162,7 @@ export function extractTelegramForwardContextText(message, allowedUserId) {
         return "";
     return `from: ${origin}`;
 }
-export function extractTelegramReplyContextText(message) {
+function extractTelegramReplyContextText(message) {
     const quoted = (extractTelegramRichMessageText(message.reply_to_message?.rich_message) ||
         message.reply_to_message?.text ||
         message.reply_to_message?.caption ||
@@ -195,7 +195,7 @@ export function buildTelegramReplyContextBlock(message, replyFiles = [], replyOu
     }
     return "";
 }
-export function appendTelegramReplyContext(text, replyContext) {
+function appendTelegramReplyContext(text, replyContext) {
     if (!replyContext)
         return text;
     return text ? `${text}\n\n${replyContext}` : `_\n\n${replyContext}`;
@@ -216,7 +216,7 @@ export function extractTelegramMessagesPromptText(messages) {
 export function extractFirstTelegramMessageText(messages) {
     return messages.map(extractTelegramMessageText).find(Boolean) ?? "";
 }
-export function hasTelegramMessagePromptContent(message) {
+function hasTelegramMessagePromptContent(message) {
     return (!!extractTelegramMessageText(message) ||
         (Array.isArray(message.photo) && message.photo.length > 0) ||
         !!message.document ||
@@ -422,7 +422,7 @@ export async function downloadTelegramMessageFiles(messages, deps) {
     const downloaded = [];
     for (const file of collectTelegramFileInfos(messages)) {
         downloaded.push({
-            path: await deps.downloadFile(file.file_id, file.fileName),
+            path: await deps.downloadFile(file.file_id, file.fileName, file.source),
             fileName: file.fileName,
             isImage: file.isImage,
             mimeType: file.mimeType,
@@ -463,6 +463,7 @@ function collectTelegramRichBlockFileInfos(blocks, messageId) {
                         files.push({
                             file_id: photo.file_id,
                             fileName: `photo-${messageId}-${mediaIndex}.jpg`,
+                            index: mediaIndex,
                             mimeType: "image/jpeg",
                             kind: "photo",
                             isImage: true,
@@ -489,6 +490,8 @@ function collectTelegramRichBlockFileInfos(blocks, messageId) {
                     const fallbackExtension = kind === "voice" ? ".ogg" : kind === "audio" ? ".mp3" : ".mp4";
                     files.push({
                         file_id: fileId,
+                        index: mediaIndex,
+                        ...(typeof fileName === "string" ? { userFileName: fileName } : {}),
                         fileName: typeof fileName === "string"
                             ? fileName
                             : `${kind}-${messageId}-${mediaIndex}${guessExtensionFromMime(typeof mimeType === "string" ? mimeType : undefined, fallbackExtension)}`,
@@ -512,6 +515,7 @@ function collectTelegramRichBlockFileInfos(blocks, messageId) {
 export function collectTelegramFileInfos(messages) {
     const files = [];
     for (const message of messages) {
+        const firstOfMessage = files.length;
         files.push(...collectTelegramRichBlockFileInfos(message.rich_message?.blocks, message.message_id));
         if (Array.isArray(message.photo) && message.photo.length > 0) {
             const photo = [...message.photo]
@@ -533,6 +537,7 @@ export function collectTelegramFileInfos(messages) {
             files.push({
                 file_id: message.document.file_id,
                 fileName,
+                ...(message.document.file_name ? { userFileName: message.document.file_name } : {}),
                 mimeType: message.document.mime_type,
                 kind: "document",
                 isImage: isImageMimeType(message.document.mime_type),
@@ -544,6 +549,7 @@ export function collectTelegramFileInfos(messages) {
             files.push({
                 file_id: message.video.file_id,
                 fileName,
+                ...(message.video.file_name ? { userFileName: message.video.file_name } : {}),
                 mimeType: message.video.mime_type,
                 kind: "video",
                 isImage: false,
@@ -556,6 +562,7 @@ export function collectTelegramFileInfos(messages) {
             files.push({
                 file_id: message.audio.file_id,
                 fileName,
+                ...(message.audio.file_name ? { userFileName: message.audio.file_name } : {}),
                 mimeType: message.audio.mime_type,
                 kind: "audio",
                 isImage: false,
@@ -577,19 +584,30 @@ export function collectTelegramFileInfos(messages) {
             files.push({
                 file_id: message.animation.file_id,
                 fileName,
+                ...(message.animation.file_name ? { userFileName: message.animation.file_name } : {}),
                 mimeType: message.animation.mime_type,
                 kind: "animation",
                 isImage: false,
             });
         }
         if (message.sticker) {
+            // Sticker format is defined by Bot API flags, not a documented MIME field.
+            const video = message.sticker.is_video === true;
+            const animated = message.sticker.is_animated === true;
+            const extension = video ? ".webm" : animated ? ".tgs" : ".webp";
             files.push({
                 file_id: message.sticker.file_id,
-                fileName: `sticker-${message.message_id}.webp`,
-                mimeType: "image/webp",
+                fileName: `sticker-${message.message_id}${extension}`,
+                mimeType: video ? "video/webm" : animated ? "application/x-tgsticker" : "image/webp",
                 kind: "sticker",
-                isImage: true,
+                isImage: !video && !animated,
             });
+        }
+        for (const file of files.slice(firstOfMessage)) {
+            file.source = { kind: file.kind, messageId: message.message_id,
+                ...(file.index !== undefined ? { index: file.index } : {}),
+                ...(file.userFileName ? { userFileName: file.userFileName } : {}),
+                ...(message.chat ? { chat: message.chat } : {}) };
         }
     }
     const seenFileIds = new Set();

@@ -3,7 +3,6 @@
  * Zones: filesystem diagnostics, unclean-shutdown recovery
  * Owns fail-safe classification of temporary ownership and routing artifacts
  */
-import { renameSync } from "node:fs";
 import { type TelegramFileTransactionOptions } from "./locks.ts";
 export type TelegramRuntimeArtifactKind = "owners" | "state" | "transaction";
 export interface TelegramRuntimeCorruptArtifact {
@@ -35,19 +34,19 @@ export type TelegramRuntimeRecoveryResult = {
 } | {
     kind: "blocked-live-owner";
     livePids: number[];
-    quarantineDir?: string;
+    deletedPaths?: string[];
 } | {
     kind: "recovered";
     artifacts: TelegramRuntimeCorruptArtifact[];
-    quarantineDir: string;
+    /** Damaged disposable artifacts deleted per the approved corruption policy; nothing is quarantined. */
+    deletedPaths: string[];
 };
 export interface TelegramRuntimeRecoveryOptions extends TelegramRuntimeRecoveryClassificationOptions {
     recoveryTransactionPath?: string;
-    quarantineRoot?: string;
     pid?: number;
     getNowMs?: () => number;
-    quarantineRename?: typeof renameSync;
-    quarantineRenameRetryDelayMs?: number;
+    /** Fault-injection seam; production uses bounded-retry recursive removal. */
+    removePath?: (path: string) => void;
     transactionOptions?: TelegramFileTransactionOptions;
 }
 export type TelegramPollingStartRecoveryDecision = {
@@ -74,13 +73,34 @@ export interface TelegramPollingStartRecoveryHandlerDeps {
  */
 export declare function classifyTelegramRuntimeRecovery(options: TelegramRuntimeRecoveryClassificationOptions): TelegramRuntimeRecoveryClassification;
 /**
- * Quarantine classifier-approved disposable corruption under two guards.
+ * Delete classifier-approved disposable corruption under two guards.
  *
  * A dedicated recovery transaction serializes recoverers. The ownership
  * transaction then prevents a new Telegram owner from appearing between the
- * final classification and mutation. Every artifact is renamed within its
- * filesystem; durable config and diagnostics never enter the candidate set.
+ * final classification and mutation. Damaged ownership debris and canonical
+ * state are deleted (operator policy: unfinished Restores in unreadable state
+ * are acceptable loss). Durable config and diagnostics never enter the set.
  */
 export declare function recoverTelegramRuntimeState(options: TelegramRuntimeRecoveryOptions): TelegramRuntimeRecoveryResult;
+/**
+ * Remove recovery folders written by earlier releases (runtime root and session folders).
+ * Current releases delete damaged files instead of quarantining them; nothing reads these copies.
+ */
+export declare function removeTelegramLegacyRecoveryStorage(runtimeDir: string): string[];
+export interface TelegramSessionFolderSweeperDeps {
+    getSessionsDir: () => string;
+    getProfileName: () => string | undefined;
+    /** Sessions holding a Workspace slot binding, live registrations and this process's own session. */
+    getKeptSessionIds: () => Iterable<string | undefined>;
+    getNowMs?: () => number;
+    intervalMs?: number;
+}
+/**
+ * Leader housekeeping (operator policy): a session without a Workspace slot loses its
+ * current-profile journal family; the folder disappears once no profile uses it.
+ */
+export declare function createTelegramSessionFolderSweeper(deps: TelegramSessionFolderSweeperDeps): {
+    sweep: () => string[];
+};
 /** Build the `/telegram-connect` recovery boundary around runtime artifacts. */
 export declare function createTelegramPollingStartRecoveryHandler(deps: TelegramPollingStartRecoveryHandlerDeps): () => Promise<TelegramPollingStartRecoveryDecision>;

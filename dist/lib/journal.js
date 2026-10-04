@@ -6,28 +6,29 @@
  * It does not own polling, update execution, queue admission, or follower routing.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, constants, closeSync, fstatSync, lstatSync, openSync, opendirSync, readSync, realpathSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
+import { chmodSync, constants, closeSync, fstatSync, lstatSync, openSync, opendirSync, readSync, realpathSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { renameTelegramPathWithRetry, withTelegramFileTransaction, } from "./locks.js";
 import { getTelegramProcessLiveness, } from "./bus.js";
-import { getTelegramProfilePathSuffix, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
+import { decodeTelegramSessionDirectoryName, getTelegramProfilePathSuffix, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
 import { runWithTelegramWorkspaceAdmissions, } from "./workspace-admission.js";
+import { isWireRecord as isRecord, hasOnlyWireKeys as hasOnlyKeys, isNonNegativeWireInteger as isSafeNonNegativeInteger, isNonEmptyWireString as isNonEmptyString, } from "./wire.js";
 export const TELEGRAM_UPDATE_JOURNAL_VERSION = 1;
 export const TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION = 2;
 export const TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION = 3;
 // Receipt and binding identities survive storage-schema upgrades.
 const TELEGRAM_UPDATE_JOURNAL_IDENTITY_VERSION = 1;
-export const TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES = 10_000;
-export const TELEGRAM_UPDATE_JOURNAL_MAX_BYTES = 32 * 1024 * 1024;
-export const TELEGRAM_UPDATE_JOURNAL_FAILURE_ID_MAX_LENGTH = 128;
+const TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES = 10_000;
+const TELEGRAM_UPDATE_JOURNAL_MAX_BYTES = 32 * 1024 * 1024;
+const TELEGRAM_UPDATE_JOURNAL_FAILURE_ID_MAX_LENGTH = 128;
 export const TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH = 256;
-export const TELEGRAM_UPDATE_JOURNAL_INPUT_BINDING_MAX_LENGTH = 256;
+const TELEGRAM_UPDATE_JOURNAL_INPUT_BINDING_MAX_LENGTH = 256;
 const TELEGRAM_UPDATE_JOURNAL_INPUT_PROJECTION_HEADROOM_BYTES = 4 * 1024;
 const TELEGRAM_UPDATE_JOURNAL_INPUT_TRANSITION_HEADROOM_BYTES = 64;
-export const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_ID_MAX_LENGTH = 128;
-export const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MIN_LENGTH = 32;
-export const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MAX_LENGTH = 256;
+const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_ID_MAX_LENGTH = 128;
+const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MIN_LENGTH = 32;
+const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MAX_LENGTH = 256;
 export const TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH = 128;
 export const TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH = 512;
 function escapeTelegramJournalPathPattern(value) {
@@ -68,7 +69,93 @@ export function discoverTelegramFollowerJournalPaths(input) {
     }
     return { paths: Array.from(paths).sort(), complete };
 }
-export const TELEGRAM_UPDATE_JOURNAL_TERMINAL_REASON_MAX_LENGTH = 256;
+/** Bounded read-only session-family discovery, not writer closure or deletion authority. */
+export function discoverTelegramSessionJournalPaths(input) {
+    const maxEntries = input.maxDirectoryEntries ?? 10_000;
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1)
+        return { paths: [], complete: false };
+    const root = join(input.directory, "sessions");
+    const suffix = getTelegramProfilePathSuffix(input.profileName);
+    const paths = new Set();
+    let remaining = maxEntries;
+    let complete = true;
+    const scan = (directory) => {
+        const entries = [];
+        const handle = opendirSync(directory);
+        try {
+            for (;;) {
+                const entry = handle.readSync();
+                if (!entry)
+                    break;
+                if (--remaining < 0) {
+                    complete = false;
+                    break;
+                }
+                entries.push(entry);
+            }
+        }
+        finally {
+            handle.closeSync();
+        }
+        return entries;
+    };
+    try {
+        const stat = lstatSync(root);
+        if (!stat.isDirectory() || stat.isSymbolicLink())
+            return { paths: [], complete: false };
+    }
+    catch (error) {
+        return { paths: [], complete: error.code === "ENOENT" };
+    }
+    try {
+        for (const session of scan(root)) {
+            if (!complete)
+                break;
+            if (!session.isDirectory() || decodeTelegramSessionDirectoryName(session.name) === undefined) {
+                complete = false;
+                break;
+            }
+            const directory = join(root, session.name);
+            const sessionStat = lstatSync(directory);
+            if (!sessionStat.isDirectory() || sessionStat.isSymbolicLink()) {
+                complete = false;
+                break;
+            }
+            for (const entry of scan(directory)) {
+                if (!complete)
+                    break;
+                // The leader polling journal and legacy recovery folders are not recipient custody.
+                if (entry.name === "recovery" || /^inbox(?:\.[a-zA-Z0-9._-]+)?\.json(?:\.segments|\.retained)?$/u.test(entry.name))
+                    continue;
+                const match = /^journal\.([a-f0-9]{16})(\.[a-zA-Z0-9._-]+)?\.json(\.segments|\.retained)?$/u.exec(entry.name);
+                if (!match) {
+                    complete = false;
+                    break;
+                }
+                const stat = lstatSync(join(directory, entry.name));
+                if (stat.isSymbolicLink() || (match[3] ? !stat.isDirectory() : !stat.isFile())) {
+                    complete = false;
+                    break;
+                }
+                if ((match[2] ?? "") !== suffix)
+                    continue;
+                paths.add(join(directory, entry.name.replace(/\.(?:segments|retained)$/u, "")));
+            }
+        }
+    }
+    catch {
+        complete = false;
+    }
+    return { paths: Array.from(paths).sort(), complete };
+}
+/** Transitional discovery covers both retained flat recipients and session-owned families. */
+export function discoverTelegramRecipientJournalPaths(input) {
+    const legacy = discoverTelegramFollowerJournalPaths(input);
+    const sessions = discoverTelegramSessionJournalPaths(input);
+    return { paths: Array.from(new Set([...legacy.paths, ...sessions.paths])).sort(),
+        complete: legacy.complete && sessions.complete };
+}
+const TELEGRAM_UPDATE_JOURNAL_TERMINAL_REASON_MAX_LENGTH = 256;
 export const TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT = 256;
 export const TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_BYTES = 4 * 1024 * 1024;
 export class TelegramUpdateJournalError extends Error {
@@ -157,7 +244,7 @@ export function getTelegramUpdateJournalAdmissionScopes(updates) {
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([, scope]) => scope);
 }
-export function listTelegramUpdateJournalLegacyCustodyCandidates(snapshot) {
+function listTelegramUpdateJournalLegacyCustodyCandidates(snapshot) {
     return snapshot.entries.flatMap(entry => {
         const evidence = createTelegramUpdateJournalLegacyCustodyEvidence(entry);
         return evidence ? [{ updateId: evidence.updateId, state: evidence.state,
@@ -194,24 +281,15 @@ export function normalizeTelegramUpdateJournalLegacyCustodyDispositionAuthority(
         evidenceSha256: expected.evidenceSha256, action: value.action,
         operatorAuthorityId: value.operatorAuthorityId, authorizedAtMs: value.authorizedAtMs };
 }
+export const TELEGRAM_ROUTING_INPUT_TTL_MS = 60 * 60 * 1000;
+export function createTelegramUpdateJournalEntryDigest(entry) {
+    return { updateId: entry.updateId, sourceSha256: createHash("sha256").update(JSON.stringify(entry)).digest("hex") };
+}
 function createJournalError(code, path, detail, cause) {
     return new TelegramUpdateJournalError(code, path, `Telegram update journal ${detail}: ${path}`, cause === undefined ? undefined : { cause });
 }
-function isRecord(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-}
-function hasOnlyKeys(value, allowedKeys) {
-    const allowed = new Set(allowedKeys);
-    return Object.keys(value).every((key) => allowed.has(key));
-}
-function isSafeNonNegativeInteger(value) {
-    return Number.isSafeInteger(value) && value >= 0;
-}
 function isSafePositiveInteger(value) {
     return Number.isSafeInteger(value) && value > 0;
-}
-function isNonEmptyString(value) {
-    return typeof value === "string" && value.length > 0;
 }
 function isBoundedString(value, maxLength) {
     return isNonEmptyString(value) && value.length <= maxLength;
@@ -433,8 +511,14 @@ function validateJournalOperatorDisposition(value, path) {
         terminalReason: value.terminalReason };
 }
 function journalRequiresExclusion(version) {
-    return version === TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION ||
-        version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
+    return version === TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION || journalHasCustodyFields(version);
+}
+function journalHasCustodyFields(version) {
+    return version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION;
+}
+/** Only legacy v1 carries routing-lifetime, scoped-ACK and pairing-free queue-receipt semantics. */
+export function isTelegramUpdateJournalLegacyFamilyVersion(version) {
+    return version === TELEGRAM_UPDATE_JOURNAL_VERSION;
 }
 function validateJournalInputClaim(value, path, updateId) {
     if (!isRecord(value) ||
@@ -494,6 +578,7 @@ function validateJournalEntry(value, path, version) {
             "updateId",
             "update",
             "admittedAtMs",
+            ...(isTelegramUpdateJournalLegacyFamilyVersion(version) ? ["routingInput"] : []),
             "state",
             "queueKind",
             "queueReceiptId",
@@ -505,7 +590,7 @@ function validateJournalEntry(value, path, version) {
             "terminalReason",
             "terminalFailureId",
             ...(journalRequiresExclusion(version) ? ["preApprovalExcluded"] : []),
-            ...(version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION
+            ...(journalHasCustodyFields(version)
                 ? ["inputClaim", "inputProvenance"] : []),
         ]) ||
         !isSafeNonNegativeInteger(value.updateId) ||
@@ -519,6 +604,20 @@ function validateJournalEntry(value, path, version) {
     const update = validateJournaledUpdate(value.update, path);
     if (update.update_id !== value.updateId) {
         throw createJournalError("invalid", path, "contains an entry/update id mismatch");
+    }
+    let routingInput;
+    if (value.routingInput !== undefined) {
+        const routing = value.routingInput;
+        if (!isRecord(routing) || !hasOnlyKeys(routing, ["operatorUserId", "publishedAtMs", "expiresAtMs", "phase"]) ||
+            !isSafePositiveInteger(routing.operatorUserId) || !isSafeNonNegativeInteger(routing.publishedAtMs) ||
+            routing.publishedAtMs < value.admittedAtMs || !isSafeNonNegativeInteger(routing.expiresAtMs) ||
+            routing.expiresAtMs !== routing.publishedAtMs + TELEGRAM_ROUTING_INPUT_TTL_MS ||
+            (routing.phase !== "waiting" && routing.phase !== "selected") ||
+            (routing.phase === "waiting" && value.state === "queued")) {
+            throw createJournalError("invalid", path, "contains invalid routing input lifetime");
+        }
+        routingInput = { operatorUserId: routing.operatorUserId, publishedAtMs: routing.publishedAtMs,
+            expiresAtMs: routing.expiresAtMs, phase: routing.phase };
     }
     const queueKind = value.queueKind;
     const queueReceiptId = value.queueReceiptId;
@@ -595,6 +694,7 @@ function validateJournalEntry(value, path, version) {
         ...(inputClaim ? { inputClaim } : {}),
         ...(inputProvenance ? { inputProvenance } : {}),
         admittedAtMs: value.admittedAtMs,
+        ...(routingInput ? { routingInput } : {}),
         state: value.state,
         ...(queueKind === "prompt" || queueKind === "control"
             ? { queueKind }
@@ -634,6 +734,29 @@ function assertSupportedJournalVersion(value, path, version = TELEGRAM_UPDATE_JO
         throw createJournalError("unsupported-version", path, `uses unsupported version ${String(value.version)}`);
     }
 }
+function validateJournalSourceCompletion(value, path) {
+    if (!isRecord(value) || !hasOnlyKeys(value, ["updateId", "sourceSha256", "completionSha256"]) ||
+        !isSafeNonNegativeInteger(value.updateId) || typeof value.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(value.sourceSha256) ||
+        typeof value.completionSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(value.completionSha256)) {
+        throw createJournalError("invalid", path, "has invalid source completion evidence");
+    }
+    return { updateId: value.updateId, sourceSha256: value.sourceSha256, completionSha256: value.completionSha256 };
+}
+function validateJournalSourceCompletions(value, path, version, allowEmpty = false) {
+    if (!isTelegramUpdateJournalLegacyFamilyVersion(version) || !Array.isArray(value) || !allowEmpty && !value.length) {
+        throw createJournalError("invalid", path, "has invalid source completion collection");
+    }
+    const completions = value.map(item => validateJournalSourceCompletion(item, path));
+    const scopes = new Set();
+    for (let index = 0; index < completions.length; index++) {
+        const completion = completions[index];
+        if ((index > 0 && completions[index - 1].updateId >= completion.updateId) || scopes.has(completion.completionSha256)) {
+            throw createJournalError("invalid", path, "has duplicate or unordered source completion evidence");
+        }
+        scopes.add(completion.completionSha256);
+    }
+    return completions;
+}
 function parseJournalFile(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERSION) {
     assertSupportedJournalVersion(value, path, version);
     if (journalRequiresExclusion(version) &&
@@ -649,6 +772,7 @@ function parseJournalFile(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERSION
             "botIdentity",
             "entries",
             "operatorDispositions",
+            "sourceCompletions",
         ]) ||
         !Number.isSafeInteger(value.version) ||
         (value.revision !== undefined &&
@@ -707,6 +831,14 @@ function parseJournalFile(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERSION
         }
     }
     const operatorDispositions = (value.operatorDispositions ?? []).map((disposition) => validateJournalOperatorDisposition(disposition, path));
+    const sourceCompletions = value.sourceCompletions === undefined ? [] : validateJournalSourceCompletions(value.sourceCompletions, path, version);
+    const botIdentity = validateBotIdentity(value.botIdentity, path);
+    const activeIds = new Set(entries.map(entry => entry.updateId));
+    const discardedIds = new Set(operatorDispositions.filter(disposition => disposition.action === "discard").map(disposition => disposition.updateId));
+    if (sourceCompletions.some(completion => activeIds.has(completion.updateId) || discardedIds.has(completion.updateId) ||
+        value.acceptedThroughUpdateId !== undefined && completion.updateId > value.acceptedThroughUpdateId)) {
+        throw createJournalError("invalid", path, "has contradictory source completion evidence");
+    }
     const dispositionFailureIds = new Set();
     const entriesByUpdateId = new Map(entries.map((entry) => [entry.updateId, entry]));
     for (const disposition of operatorDispositions) {
@@ -729,10 +861,64 @@ function parseJournalFile(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERSION
             ? { acceptedThroughUpdateId: value.acceptedThroughUpdateId }
             : {}),
         profile: value.profile,
-        botIdentity: validateBotIdentity(value.botIdentity, path),
+        botIdentity,
         entries,
         ...(operatorDispositions.length > 0 ? { operatorDispositions } : {}),
+        ...(sourceCompletions.length > 0 ? { sourceCompletions } : {}),
     };
+}
+function assertJournalRoutingInputContinuity(file, entries, path) {
+    const previous = new Map(file.entries.map(entry => [entry.updateId, entry.routingInput]));
+    for (const entry of entries) {
+        const retained = previous.get(entry.updateId), next = entry.routingInput;
+        if (retained && (!next || next.operatorUserId !== retained.operatorUserId || next.publishedAtMs !== retained.publishedAtMs ||
+            next.expiresAtMs !== retained.expiresAtMs || (retained.phase === "selected" && next.phase !== "selected"))) {
+            throw createJournalError("invalid", path, "regresses retained routing input lifetime");
+        }
+    }
+}
+function assertJournalSourceCompletionContinuity(file, segment, path) {
+    assertJournalRoutingInputContinuity(file, segment.upsertedEntries, path);
+    if (segment.sourceCompletions === undefined)
+        return;
+    const previous = new Map((file.sourceCompletions ?? []).map(completion => [completion.updateId, completion]));
+    const next = new Map(segment.sourceCompletions.map(completion => [completion.updateId, completion]));
+    if ([...previous].some(([id, completion]) => !isDeepStrictEqual(completion, next.get(id)))) {
+        throw createJournalError("invalid", path, "regresses retained source completion evidence");
+    }
+    const entries = new Map(file.entries.map(entry => [entry.updateId, entry]));
+    const removed = new Set(segment.removedUpdateIds), upserted = new Set(segment.upsertedEntries.map(entry => entry.updateId));
+    const upsertedReceipts = new Set(segment.upsertedEntries.map(entry => entry.queueReceiptId));
+    // Grouped markers share one whole-receipt check rather than rescanning the group per source.
+    const queueGroups = new Map(), queueRemovals = new Map();
+    for (const entry of file.entries) {
+        if (!entry.queueReceiptId)
+            continue;
+        const group = queueGroups.get(entry.queueReceiptId) ?? [];
+        group.push(entry);
+        queueGroups.set(entry.queueReceiptId, group);
+    }
+    const queueWasRemoved = (source) => {
+        const receiptId = source.queueReceiptId;
+        if (!receiptId || !source.queueOwner)
+            return false;
+        if (queueRemovals.has(receiptId))
+            return queueRemovals.get(receiptId);
+        const group = queueGroups.get(receiptId);
+        const valid = !!group?.length && !upsertedReceipts.has(receiptId) && group.every(entry => removed.has(entry.updateId) && !upserted.has(entry.updateId) && entry.state === "queued" && entry.queueKind === source.queueKind &&
+            entry.queueHandoff === undefined && !!entry.queueOwner && areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, source.queueOwner));
+        queueRemovals.set(receiptId, valid);
+        return valid;
+    };
+    for (const completion of segment.sourceCompletions) {
+        if (previous.has(completion.updateId))
+            continue;
+        const source = entries.get(completion.updateId);
+        if (!removed.has(completion.updateId) || !source || (source.state === "queued" && !queueWasRemoved(source)) || source.state === "failed" ||
+            createTelegramUpdateJournalEntryDigest(source).sourceSha256 !== completion.sourceSha256) {
+            throw createJournalError("invalid", path, "source completion does not match its removal revision");
+        }
+    }
 }
 function parseJournalSegment(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERSION) {
     assertSupportedJournalVersion(value, path, version);
@@ -751,6 +937,7 @@ function parseJournalSegment(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERS
             "upsertedEntries",
             "removedUpdateIds",
             "operatorDispositions",
+            "sourceCompletions",
         ]) ||
         value.version !== version ||
         !isSafePositiveInteger(value.revision) ||
@@ -790,6 +977,7 @@ function parseJournalSegment(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERS
         removedUpdateIds.push(updateId);
     }
     const operatorDispositions = (value.operatorDispositions ?? []).map((disposition) => validateJournalOperatorDisposition(disposition, path));
+    const segmentBotIdentity = validateBotIdentity(value.botIdentity, path);
     return {
         version,
         revision: value.revision,
@@ -798,12 +986,13 @@ function parseJournalSegment(value, path, version = TELEGRAM_UPDATE_JOURNAL_VERS
             ? { acceptedThroughUpdateId: value.acceptedThroughUpdateId }
             : {}),
         profile: value.profile,
-        botIdentity: validateBotIdentity(value.botIdentity, path),
+        botIdentity: segmentBotIdentity,
         upsertedEntries,
         removedUpdateIds,
         ...(value.operatorDispositions !== undefined
             ? { operatorDispositions }
             : {}),
+        ...(value.sourceCompletions !== undefined ? { sourceCompletions: validateJournalSourceCompletions(value.sourceCompletions, path, version, true) } : {}),
     };
 }
 /**
@@ -833,6 +1022,11 @@ export function inspectTelegramInputCustodySourceStatus(input) {
 export function inspectTelegramUpdateJournalFamily(input) {
     return acquireTelegramUpdateJournalFamily(input).evidence;
 }
+/** Classifies private originals against exact discard tombstones; never replay or deletion authority. */
+export function inspectTelegramUpdateJournalRetention(input) {
+    const acquired = acquireTelegramUpdateJournalFamily(input, undefined, true);
+    return { evidence: acquired.evidence, retainedInputs: acquired.retainedInputs ?? [] };
+}
 /**
  * Read-only source evidence for cooperating writers serialized by the caller through
  * consumption; never readiness, recovery, or permission to publish. Ancestors retain
@@ -845,7 +1039,7 @@ export function inspectTelegramUpdateJournalFamily(input) {
  */
 export function readTelegramUpdateJournalSource(input) {
     const version = input.version;
-    if (version !== 1 && version !== 2 && version !== 3) {
+    if (version !== 1 && version !== 2 && version !== 3 && version !== 4) {
         throw createJournalError("unsupported-version", input.path, "requires a selected source version");
     }
     return acquireTelegramUpdateJournalFamily({
@@ -854,7 +1048,7 @@ export function readTelegramUpdateJournalSource(input) {
         limits: { ...input.limits },
     }, version).evidence;
 }
-function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
+function acquireTelegramUpdateJournalFamily(input, selectedVersion, inspectRetention = false) {
     const { path, limits } = input;
     const acquiredSegments = [];
     let snapshotRevision = 0;
@@ -906,7 +1100,7 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
     const charge = (value) => {
         if (!isRecord(value))
             return;
-        for (const key of ["entries", "upsertedEntries", "removedUpdateIds", "operatorDispositions"]) {
+        for (const key of ["entries", "upsertedEntries", "removedUpdateIds", "operatorDispositions", "sourceCompletions"]) {
             const collection = value[key];
             if (!Array.isArray(collection))
                 continue;
@@ -948,18 +1142,18 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
         }
     };
     const segmentDirectory = getTelegramUpdateJournalSegmentDirectory(path);
-    const enumerate = () => {
+    const enumerate = (target = segmentDirectory, pattern = /^\d{16}\.json$/u, usedFiles = files) => {
         const names = [];
-        const directory = opendirSync(segmentDirectory, { bufferSize: 1 });
+        const directory = opendirSync(target, { bufferSize: 1 });
         try {
             for (;;) {
                 const entry = directory.readSync();
                 if (!entry)
                     break;
-                if (names.length >= limits.maxFiles - files)
+                if (names.length >= limits.maxFiles - usedFiles)
                     capacity();
-                if (!/^\d{16}\.json$/u.test(entry.name) || !entry.isFile() || entry.isSymbolicLink())
-                    fail("has an unexpected segment entry");
+                if (!pattern.test(entry.name) || !entry.isFile() || entry.isSymbolicLink())
+                    fail("has an unexpected journal evidence entry");
                 names.push(entry.name);
             }
         }
@@ -1027,6 +1221,7 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
                 if (segment.acceptedThroughUpdateId !== undefined && file.acceptedThroughUpdateId !== undefined &&
                     segment.acceptedThroughUpdateId < file.acceptedThroughUpdateId)
                     fail("regresses the admission cursor");
+                assertJournalSourceCompletionContinuity(file, segment, target);
                 const entries = new Map(file.entries.map(entry => [entry.updateId, entry]));
                 for (const id of segment.removedUpdateIds)
                     entries.delete(id);
@@ -1046,16 +1241,70 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
                     ...(segment.acceptedThroughUpdateId !== undefined ? { acceptedThroughUpdateId: segment.acceptedThroughUpdateId } : {}),
                     entries: [...entries.values()].sort((a, b) => a.updateId - b.updateId),
                     operatorDispositions: segment.operatorDispositions ?? file.operatorDispositions,
+                    sourceCompletions: segment.sourceCompletions ?? file.sourceCompletions,
                 };
                 charge(next);
                 file = parseJournalFile(next, target, file.version);
             }
         }
+        const retainedInputs = [];
+        const retentionDirectory = `${path}.retained`;
+        const retention = inspectRetention ? observe(retentionDirectory, true, true) : undefined;
+        const retentionPattern = /^abandon-[a-f0-9]{64}\.json$/u;
+        const retentionNames = retention ? enumerate(retentionDirectory, retentionPattern) : [];
+        if (retentionNames.length > limits.maxEntries)
+            capacity();
+        if (retention) {
+            if (!file || file.version !== 1)
+                fail("private retention requires its exact v1 journal snapshot");
+            const current = file;
+            const bindingKeys = new Set([expected, current.botIdentity].map(botIdentity => createTelegramUpdateJournalBindingKey({ path, profileName: input.profile, botIdentity })));
+            const updateIds = new Set();
+            for (const name of retentionNames) {
+                const target = join(retentionDirectory, name);
+                const before = observe(target, false);
+                if (before.nlink !== 1n)
+                    fail("has linked private retention evidence");
+                const raw = read(target, before);
+                files += 1;
+                if (limits.maxWork - work < 2)
+                    capacity();
+                work += 2;
+                if (!isRecord(raw))
+                    throw createJournalError("invalid", target, "private retention is not an evidence record");
+                if (typeof raw.journalBindingKey !== "string" || !bindingKeys.has(raw.journalBindingKey))
+                    throw createJournalError("invalid", target, "has foreign private retention evidence");
+                const entry = validateJournalEntry(raw.entry, target, 1);
+                const disposition = validateJournalOperatorDisposition(raw.requestedDisposition, target);
+                const digest = createHash("sha256").update(JSON.stringify({ journalBindingKey: raw.journalBindingKey, entry })).digest("hex");
+                if (!("dispositionKind" in disposition) || disposition.dispositionKind !== "legacy-custody" ||
+                    disposition.action !== "discard" || entry.state !== "pending" || disposition.updateId !== entry.updateId ||
+                    disposition.evidenceSha256 !== digest || disposition.failureId !== `abandon-${digest}` ||
+                    name !== `${disposition.failureId}.json` || !isDeepStrictEqual(raw, { version: 1, kind: "pending-input-retention",
+                    journalBindingKey: raw.journalBindingKey, entry, requestedDisposition: disposition }))
+                    fail("has inconsistent private retention evidence");
+                if (updateIds.has(entry.updateId))
+                    fail("has duplicate private retention sources");
+                updateIds.add(entry.updateId);
+                const committed = current.operatorDispositions?.find(value => value.failureId === disposition.failureId || value.updateId === entry.updateId);
+                if (committed && (!isDeepStrictEqual(committed, disposition) || current.entries.some(value => value.updateId === entry.updateId)))
+                    fail("private retention contradicts its journal disposition");
+                retainedInputs.push({ path: target, journalBindingKey: raw.journalBindingKey,
+                    failureId: disposition.failureId, updateId: entry.updateId, state: committed ? "committed" : "uncommitted" });
+            }
+        }
+        if (inspectRetention && file?.operatorDispositions?.some(disposition => "dispositionKind" in disposition && disposition.dispositionKind === "legacy-custody" &&
+            disposition.action === "discard" && /^abandon-[a-f0-9]{64}$/u.test(disposition.failureId) &&
+            !retainedInputs.some(original => original.updateId === disposition.updateId && original.state === "committed")))
+            fail("committed abandonment lost its private original");
         // Re-enumeration has the same bound, rather than allocating an unbounded census.
         files = snapshot ? 1 : 0;
         if (segments && !isDeepStrictEqual(names, enumerate()))
             fail("changed segment namespace");
         files += names.length;
+        if (retention && !isDeepStrictEqual(retentionNames, enumerate(retentionDirectory, retentionPattern)))
+            fail("changed private retention namespace");
+        files += retentionNames.length;
         for (const [target, before] of observed) {
             const after = status(target);
             const compare = selectedVersion !== undefined && ancestors.has(target) ? sameAncestor : same;
@@ -1079,6 +1328,7 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
             evidence: file ? { kind: "present", file, ...(knownBotId !== undefined ? { knownBotId } : {}), accounting: { files, bytes, work } } : { kind: "absent" },
             snapshotRevision,
             segments: acquiredSegments,
+            ...(inspectRetention ? { retainedInputs } : {}),
         };
     }
     catch (error) {
@@ -1087,13 +1337,14 @@ function acquireTelegramUpdateJournalFamily(input, selectedVersion) {
         throw createJournalError("io", path, "could not establish strict journal evidence", error);
     }
 }
-/**
- * Canonical namespace evidence only, never source readiness or authorization.
- * Caller-proven serialization/quiescence is mandatory through consumption.
- * Recensus detects observable changes, not hostile same-user path swaps; arbitrary
- * consumer references and archive consumption require separate audits.
- */
 export function inspectTelegramProfileJournalNamespace(input) {
+    return inspectTelegramJournalNamespace(input, false);
+}
+/** Read-only evidence over polling, retained flat recipients and role-neutral session journals. */
+export function inspectTelegramSessionJournalNamespace(input) {
+    return inspectTelegramJournalNamespace(input, true);
+}
+function inspectTelegramJournalNamespace(input, includeSessions) {
     const { directory, profile, limits } = input;
     const fail = (message) => { throw createJournalError("invalid", directory, message); };
     const capacity = () => { throw createJournalError("capacity", directory, "exceeds namespace inspection resource limits"); };
@@ -1114,7 +1365,15 @@ export function inspectTelegramProfileJournalNamespace(input) {
             size: value.size, mtimeNs: value.mtimeNs, ctimeNs: value.ctimeNs };
     };
     const suffix = profile === "default" ? "" : `.${profile}`;
-    const polling = `inbox${suffix}.json`;
+    const pollingPath = input.pollingPath ?? join(directory, `inbox${suffix}.json`);
+    const polling = relative(directory, pollingPath);
+    {
+        const parts = polling.split(sep);
+        if (!isAbsolute(pollingPath) || resolve(pollingPath) !== pollingPath || parts.at(-1) !== `inbox${suffix}.json` ||
+            !(parts.length === 1 || (parts.length === 3 && parts[0] === "sessions" &&
+                decodeTelegramSessionDirectoryName(parts[1]) !== undefined)))
+            fail("requires a canonical polling journal path");
+    }
     try {
         const root = lstatSync(directory);
         if (!root.isDirectory() || root.isSymbolicLink() || realpathSync(directory) !== directory)
@@ -1122,51 +1381,106 @@ export function inspectTelegramProfileJournalNamespace(input) {
         const beforeRoot = metadata(directory);
         const census = () => {
             const entries = new Map();
-            const followers = new Set();
-            const handle = opendirSync(directory, { bufferSize: 1 });
-            try {
-                for (;;) {
-                    const entry = handle.readSync();
-                    if (!entry)
-                        break;
-                    if (entries.size >= limits.maxDirectoryEntries)
-                        capacity();
-                    if (entry.name.toLowerCase() === "recovery")
-                        fail("retains unclassified recovery storage");
-                    const target = join(directory, entry.name);
-                    entries.set(entry.name, metadata(target));
-                    if (!/inbox/iu.test(entry.name))
-                        continue;
-                    const match = /^(inbox|follower-inbox-[a-f0-9]{16})(?:\.([a-z0-9]{1,32}))?\.json(\.segments)?$/u.exec(entry.name);
-                    if (!match || match[2] === "default")
-                        fail("has a noncanonical journal-like entry");
-                    const value = lstatSync(target);
-                    if (value.isSymbolicLink() || !(match[3] ? value.isDirectory() : value.isFile()))
-                        fail("has a linked or unexpected journal type");
-                    if ((match[2] ?? "default") !== profile)
-                        continue;
-                    if (match[1] !== "inbox")
-                        followers.add(entry.name.replace(/\.segments$/u, ""));
+            const families = new Map(), profiles = new Set();
+            const scan = (parent, visit) => {
+                const handle = opendirSync(parent, { bufferSize: 1 });
+                try {
+                    for (;;) {
+                        const entry = handle.readSync();
+                        if (!entry)
+                            break;
+                        if (entries.size >= limits.maxDirectoryEntries)
+                            capacity();
+                        const target = join(parent, entry.name);
+                        const key = relative(directory, target);
+                        if (entries.has(key))
+                            fail("repeated an observed namespace entry");
+                        entries.set(key, metadata(target));
+                        visit(entry.name, target);
+                    }
                 }
-            }
-            finally {
-                handle.closeSync();
-            }
-            return { entries: [...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0), followers: [...followers].sort() };
+                finally {
+                    handle.closeSync();
+                }
+            };
+            const requireType = (target, isDirectory) => {
+                const value = lstatSync(target);
+                if (value.isSymbolicLink() || !(isDirectory ? value.isDirectory() : value.isFile()) ||
+                    (!isDirectory && value.nlink !== 1))
+                    fail("has a linked or unexpected journal type");
+            };
+            const evidenceDirectory = (target, retained) => scan(target, (name, path) => {
+                if (!(retained ? /^abandon-[a-f0-9]{64}\.json$/u : /^\d{16}\.json$/u).test(name))
+                    fail("has an unclassified journal evidence entry");
+                requireType(path, false);
+            });
+            const session = (target) => scan(target, (name, path) => {
+                if (name === "recovery")
+                    return;
+                const match = /^(?:journal\.[a-f0-9]{16}|inbox)(?:\.([a-z0-9]{1,32}))?\.json(\.(?:segments|retained))?$/u.exec(name);
+                if (!match || match[1] === "default")
+                    fail("has an unclassified session journal entry");
+                requireType(path, !!match[2]);
+                if (match[2])
+                    evidenceDirectory(path, match[2] === ".retained");
+                const base = path.replace(/\.(?:segments|retained)$/u, ""), familyProfile = match[1] ?? "default";
+                profiles.add(familyProfile);
+                if (familyProfile === profile && base !== pollingPath)
+                    families.set(base, "session");
+            });
+            scan(directory, (name, target) => {
+                // Legacy quarantine folders are disposable housekeeping, never journal authority.
+                if (name.toLowerCase() === "recovery")
+                    return;
+                if (name.toLowerCase() === "sessions") {
+                    if (!includeSessions)
+                        fail("requires session-qualified namespace inspection");
+                    if (name !== "sessions")
+                        fail("has a noncanonical session root");
+                    requireType(target, true);
+                    scan(target, (sessionName, sessionPath) => {
+                        if (decodeTelegramSessionDirectoryName(sessionName) === undefined)
+                            fail("has a noncanonical session directory");
+                        requireType(sessionPath, true);
+                        session(sessionPath);
+                    });
+                    return;
+                }
+                if (includeSessions && /^journal\./iu.test(name))
+                    fail("has a misplaced session journal");
+                if (!/inbox/iu.test(name))
+                    return;
+                const match = /^(inbox|follower-inbox-[a-f0-9]{16})(?:\.([a-z0-9]{1,32}))?\.json(\.(?:segments|retained))?$/u.exec(name);
+                if (!match || match[2] === "default" || (!includeSessions && match[3] === ".retained"))
+                    fail("has a noncanonical journal-like entry");
+                requireType(target, !!match[3]);
+                if (includeSessions && match[3])
+                    evidenceDirectory(target, match[3] === ".retained");
+                const base = target.replace(/\.(?:segments|retained)$/u, ""), familyProfile = match[2] ?? "default";
+                profiles.add(familyProfile);
+                if (familyProfile === profile && base !== pollingPath)
+                    families.set(base, match[1] === "inbox" ? "session" : "follower");
+            });
+            return { entries: [...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+                families: [...families].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0), profiles: [...profiles].sort() };
         };
         const before = census();
+        const sourceInventory = [[pollingPath, "polling"], ...before.families];
         const sources = [];
+        const retainedInputs = [];
         const accounting = { directoryEntries: before.entries.length, files: 0, bytes: 0, work: 0 };
         let knownBotId = expected.botId;
-        for (const name of [polling, ...before.followers]) {
+        for (const [path, role] of sourceInventory) {
             const remaining = { maxFiles: limits.maxFiles - accounting.files, maxBytes: limits.maxBytes - accounting.bytes,
                 maxWork: limits.maxWork - accounting.work, maxEntries: limits.maxEntries };
             if (remaining.maxFiles <= 0 || remaining.maxBytes <= 0 || remaining.maxWork <= 0)
                 capacity();
-            const path = join(directory, name);
-            const evidence = inspectTelegramUpdateJournalFamily({ directory, path, profile,
-                botIdentity: { ...expected, ...(knownBotId !== undefined ? { botId: knownBotId } : {}) }, limits: remaining });
-            if (evidence.kind === "absent" && (name !== polling || before.entries.some(([entry]) => entry === polling || entry === `${polling}.segments`))) {
+            const acquire = () => acquireTelegramUpdateJournalFamily({ directory, path, profile,
+                botIdentity: { ...expected, ...(knownBotId !== undefined ? { botId: knownBotId } : {}) }, limits: remaining }, undefined, includeSessions);
+            const acquired = input.withSourceReference ? input.withSourceReference(path, acquire) : acquire();
+            const evidence = acquired.evidence;
+            retainedInputs.push(...(acquired.retainedInputs ?? []).map(original => ({ ...original, journalPath: path })));
+            if (evidence.kind === "absent" && (role !== "polling" || before.entries.some(([entry]) => entry === polling || entry === `${polling}.segments`))) {
                 fail("lost a discovered journal family");
             }
             if (evidence.kind === "present") {
@@ -1175,17 +1489,48 @@ export function inspectTelegramProfileJournalNamespace(input) {
                 accounting.bytes += evidence.accounting.bytes;
             }
             accounting.work += evidence.kind === "present" ? Math.max(1, evidence.accounting.work) : 1;
-            sources.push({ role: name === polling ? "polling" : "follower", path, evidence });
+            sources.push({ role, path, evidence });
         }
-        if (!isDeepStrictEqual(before, census()) || !isDeepStrictEqual(beforeRoot, metadata(directory)))
+        const namespaceCurrent = () => {
+            try {
+                return isDeepStrictEqual(beforeRoot, metadata(directory)) && isDeepStrictEqual(before, census()) &&
+                    isDeepStrictEqual(beforeRoot, metadata(directory));
+            }
+            catch {
+                return false;
+            }
+        };
+        if (!namespaceCurrent())
             fail("changed observed root namespace or identity");
-        return { sources, accounting, ...(knownBotId !== undefined ? { knownBotId } : {}) };
+        return { sources, accounting, ...(includeSessions ? { retainedInputs } : {}), ...(knownBotId !== undefined ? { knownBotId } : {}) };
     }
     catch (error) {
         if (error instanceof TelegramUpdateJournalError)
             throw error;
         throw createJournalError("io", directory, "could not establish canonical namespace evidence", error);
     }
+}
+/** Complete-empty protection only; caller holds source serialization through consumption. Never deletion authority. */
+export function isTelegramThreadCleanupJournalNamespaceClear(input) {
+    if (!input.requiredJournalBindingKeys.length || input.requiredJournalBindingKeys.length > input.limits.maxDirectoryEntries)
+        throw new Error("Telegram temporary cleanup requires bounded exact journal references.");
+    const requiredPaths = new Set();
+    for (const key of input.requiredJournalBindingKeys) {
+        const path = getTelegramUpdateJournalBindingPath(key);
+        const identities = [input.botIdentity, { tokenSha256: input.botIdentity.tokenSha256 }];
+        if (!path || !identities.some(botIdentity => key === createTelegramUpdateJournalBindingKey({
+            path, profileName: input.profile, botIdentity,
+        })))
+            throw new Error("Telegram temporary cleanup has foreign or malformed journal references.");
+        requiredPaths.add(path);
+    }
+    const namespace = inspectTelegramSessionJournalNamespace(input);
+    if (namespace.sources.filter(source => source.role === "polling").length !== 1 ||
+        namespace.retainedInputs?.some(original => original.state !== "committed") ||
+        [...requiredPaths].some(path => !namespace.sources.some(source => source.path === path && source.evidence.kind === "present")))
+        return false;
+    // Original Telegram targets do not certify execution ownership. No nonempty family gets a source exemption.
+    return namespace.sources.every(source => source.evidence.kind === "absent" || source.evidence.file.entries.length === 0);
 }
 function cloneEntry(entry) {
     return {
@@ -1201,6 +1546,7 @@ function cloneEntry(entry) {
             ? { queueHandoff: cloneJournalQueueHandoff(entry.queueHandoff) }
             : {}),
         ...(entry.failure ? { failure: { ...entry.failure } } : {}),
+        ...(entry.routingInput ? { routingInput: { ...entry.routingInput } } : {}),
     };
 }
 function cloneFile(file) {
@@ -1213,6 +1559,7 @@ function cloneFile(file) {
         profile: file.profile,
         botIdentity: { ...file.botIdentity },
         entries: file.entries.map(cloneEntry),
+        ...(file.sourceCompletions?.length ? { sourceCompletions: file.sourceCompletions.map(completion => ({ ...completion })) } : {}),
         ...(file.operatorDispositions?.length
             ? {
                 operatorDispositions: file.operatorDispositions.map((disposition) => ({ ...disposition })),
@@ -1311,6 +1658,53 @@ function mergeBotIdentity(stored, current) {
                 : {}),
         tokenSha256: current.tokenSha256,
     };
+}
+function createPendingRetentionReference(input) {
+    const { path, journalBindingKey, entry, maxBytes } = input;
+    const evidenceSha256 = createHash("sha256").update(JSON.stringify({ journalBindingKey, entry })).digest("hex");
+    const failureId = `abandon-${evidenceSha256}`;
+    const retainedDirectory = `${path}.retained`;
+    const retainedPath = join(retainedDirectory, `${failureId}.json`);
+    const read = () => {
+        let directory;
+        try {
+            directory = lstatSync(retainedDirectory);
+        }
+        catch (error) {
+            if (error.code === "ENOENT")
+                return undefined;
+            throw error;
+        }
+        if (!directory.isDirectory() || directory.isSymbolicLink()) {
+            throw createJournalError("invalid", retainedDirectory, "retention directory is not a regular directory");
+        }
+        let stat;
+        try {
+            stat = lstatSync(retainedPath);
+        }
+        catch (error) {
+            if (error.code === "ENOENT")
+                return undefined;
+            throw error;
+        }
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes + 4096) {
+            throw createJournalError("invalid", retainedPath, "retained input is not a bounded regular file");
+        }
+        const retained = JSON.parse(readFileSync(retainedPath, "utf8"));
+        if (!isRecord(retained))
+            throw createJournalError("invalid", retainedPath, "retained input is not an evidence record");
+        const disposition = validateJournalOperatorDisposition(retained.requestedDisposition, retainedPath);
+        if (!("dispositionKind" in disposition) || disposition.dispositionKind !== "legacy-custody" ||
+            disposition.failureId !== failureId || disposition.updateId !== entry.updateId ||
+            disposition.action !== "discard" || disposition.evidenceSha256 !== evidenceSha256 ||
+            !isDeepStrictEqual(retained, { version: 1, kind: "pending-input-retention", journalBindingKey,
+                entry, requestedDisposition: disposition })) {
+            throw createJournalError("conflict", retainedPath, "retained input does not match abandonment evidence");
+        }
+        return { version: 1, kind: "pending-input-retention", journalBindingKey, entry,
+            requestedDisposition: disposition };
+    };
+    return { evidenceSha256, failureId, retainedPath, read };
 }
 function writeJournalFile(path, serialized, onPublicationBoundary, stagingPath = path) {
     const tempPath = `${stagingPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -1432,6 +1826,19 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(deps) {
         });
         const path = deps.getJournalPath(configuredProfileName);
         const workspaceAdmission = deps.getWorkspaceAdmission?.();
+        const sourceAccess = { directory: dirname(path), limits: {
+                maxFiles: 1024, maxBytes: TELEGRAM_UPDATE_JOURNAL_MAX_BYTES * 2,
+                maxEntries: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES, maxWork: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES * 1024,
+            } };
+        const options = { path, profileName, botIdentity,
+            ...(deps.getQueueRuntimeIdentity ? { queueRuntimeIdentity: deps.getQueueRuntimeIdentity() } : {}),
+            ...(workspaceAdmission ? { workspaceAdmission } : {}),
+            ...(deps.withWriterAdmission ? { withWriterAdmission: deps.withWriterAdmission } : {}),
+            ...(deps.withSourceSerialization ? { withSourceSerialization: deps.withSourceSerialization } : {}),
+            ...(deps.onRecovery ? { onRecovery: deps.onRecovery } : {}) };
+        const journal = createTelegramUpdateJournalStore(options);
+        // Scoped completion and receipt observation use strict private handles; ordinary recovery stays unchanged.
+        const completionJournal = deps.withSourceSerialization ? createTelegramUpdateJournalStore({ ...options, sourceAccess }) : undefined;
         return {
             runtimeKey: JSON.stringify({
                 path,
@@ -1446,27 +1853,25 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(deps) {
             readForProtection() {
                 // Protection must never turn corruption/recovery into empty-work evidence.
                 const evidence = inspectTelegramUpdateJournalFamily({
-                    directory: dirname(path), path, profile: profileName, botIdentity,
-                    limits: {
-                        maxFiles: 1024,
-                        maxBytes: TELEGRAM_UPDATE_JOURNAL_MAX_BYTES * 2,
-                        maxEntries: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES,
-                        maxWork: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES * 1024,
-                    },
+                    ...sourceAccess, path, profile: profileName, botIdentity,
                 });
-                return { entries: evidence.kind === "present" ? evidence.file.entries : [] };
+                return { entries: evidence.kind === "present" ? evidence.file.entries : [], exists: evidence.kind === "present" };
             },
-            journal: createTelegramUpdateJournalStore({
-                path,
-                profileName,
-                botIdentity,
-                ...(deps.getQueueRuntimeIdentity
-                    ? { queueRuntimeIdentity: deps.getQueueRuntimeIdentity() }
-                    : {}),
-                ...(workspaceAdmission ? { workspaceAdmission } : {}),
-                ...(deps.withWriterAdmission ? { withWriterAdmission: deps.withWriterAdmission } : {}),
-                ...(deps.onRecovery ? { onRecovery: deps.onRecovery } : {}),
-            }),
+            journal: completionJournal ? { ...journal,
+                removeCompletedExact(updateIds, expectedSources, completions) {
+                    return completions !== undefined ? completionJournal.removeCompletedExact(updateIds, expectedSources, completions)
+                        : journal.removeCompletedExact(updateIds, expectedSources);
+                },
+                completeQueuedExact(receipts, completions) { return completionJournal.completeQueuedExact(receipts, completions); },
+                inspectSourceCompletion(expected) { return completionJournal.inspectSourceCompletion(expected); },
+                inspectQueuedReceipt(expected) { return completionJournal.inspectQueuedReceipt(expected); },
+                isQueueReceiptCurrent(receipt, owner) {
+                    if (receipt.journalBindingKey !== createTelegramUpdateJournalBindingKey({ path, profileName, botIdentity }))
+                        return false;
+                    return completionJournal.inspectQueuedReceipt({ queueKind: receipt.queueKind, receiptId: receipt.receiptId,
+                        sourceUpdateIds: [...receipt.sourceUpdateIds], queueOwner: { ...owner } }) !== undefined;
+                },
+            } : journal,
         };
     };
 }
@@ -1511,42 +1916,200 @@ export function withTelegramResolvedUpdateJournalReference(input) {
     return input.registry.withReference({ referenceClass: input.referenceClass,
         recoveryKey: binding.recoveryKey }, () => input.operation(binding));
 }
+function validateQueuedReceiptObservation(expected, path) {
+    if (!isRecord(expected) || !hasOnlyKeys(expected, ["queueKind", "receiptId", "sourceUpdateIds", "queueOwner"]) || (expected.queueKind !== "prompt" && expected.queueKind !== "control") ||
+        !isNonEmptyString(expected.receiptId) ||
+        !Array.isArray(expected.sourceUpdateIds) || expected.sourceUpdateIds.length === 0 ||
+        expected.sourceUpdateIds.length > TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES ||
+        expected.sourceUpdateIds.some((id, index) => !isSafeNonNegativeInteger(id) || (index > 0 && id <= expected.sourceUpdateIds[index - 1]))) {
+        throw createJournalError("invalid", path, "received invalid queue receipt observation authority");
+    }
+    return validateJournalQueueOwner(expected.queueOwner, path);
+}
+function inspectJournalQueuedReceipt(file, expected, path) {
+    if (!isTelegramUpdateJournalLegacyFamilyVersion(file.version))
+        throw createJournalError("invalid", path, "queue receipt observation requires an exact legacy v1 source handle");
+    const { queueOwner } = expected;
+    const entries = file.entries.filter(entry => entry.queueReceiptId === expected.receiptId);
+    if (entries.length !== expected.sourceUpdateIds.length || entries.some((entry, index) => entry.updateId !== expected.sourceUpdateIds[index] || entry.state !== "queued" || entry.queueKind !== expected.queueKind ||
+        entry.queueHandoff !== undefined || !isDeepStrictEqual(entry.queueOwner, queueOwner)))
+        return undefined;
+    return { receipt: { queueKind: expected.queueKind, receiptId: expected.receiptId,
+            sourceUpdateIds: [...expected.sourceUpdateIds], queueOwner: { ...queueOwner } },
+        sources: entries.map(createTelegramUpdateJournalEntryDigest),
+        queueOwnerSha256: createHash("sha256").update(JSON.stringify(queueOwner)).digest("hex") };
+}
+function inspectJournalSourceCompletion(file, completion, path) {
+    if (!isTelegramUpdateJournalLegacyFamilyVersion(file.version))
+        throw createJournalError("invalid", path, "source completion requires a legacy v1 source");
+    const retained = file.sourceCompletions?.find(value => value.updateId === completion.updateId);
+    if (!retained)
+        return undefined;
+    if (!isDeepStrictEqual(retained, completion))
+        throw createJournalError("conflict", path, "source completion belongs to another exact scope");
+    return { ...retained };
+}
+/** Operator-distinct authority: routing never treats it as an owner cancellation. */
+export const TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX = "session-successor:";
+function isAdoptablePendingEntry(entry) {
+    return entry.state === "pending" && !entry.inputClaim && !entry.inputProvenance && !entry.routingInput &&
+        !entry.queueOwner && !entry.queueHandoff && !entry.queueReceiptId && !entry.queueKind && !entry.failure &&
+        entry.preApprovalExcluded !== true;
+}
 export function createTelegramUpdateJournalBindingRuntime(deps) {
     const resolveLeader = createTelegramUpdateJournalRuntimeBindingResolver({
         ...deps.base,
         getJournalPath: deps.getLeaderJournalPath,
     });
-    const createFollowerResolver = (bindingKey, includeQueueRuntimeIdentity) => createTelegramUpdateJournalRuntimeBindingResolver({
-        getProfileName: deps.base.getProfileName,
-        getBotToken: deps.base.getBotToken,
-        getBotId: deps.base.getBotId,
-        ...(includeQueueRuntimeIdentity && deps.base.getQueueRuntimeIdentity
-            ? { getQueueRuntimeIdentity: deps.base.getQueueRuntimeIdentity }
-            : {}),
-        ...(deps.base.withWriterAdmission
-            ? { withWriterAdmission: deps.base.withWriterAdmission } : {}),
-        ...(deps.base.getWorkspaceAdmission
-            ? { getWorkspaceAdmission: deps.base.getWorkspaceAdmission }
-            : {}),
-        ...(deps.base.onRecovery ? { onRecovery: deps.base.onRecovery } : {}),
-        getJournalPath(profileName) {
-            return deps.getFollowerJournalPath(bindingKey, profileName);
-        },
-    });
-    const resolveFollower = () => createFollowerResolver(deps.getActiveFollowerBindingKey(), true)();
+    const createFollowerResolver = (bindingKey, includeQueueRuntimeIdentity, sessionId, legacy = false) => {
+        // Session-aware composition must not fall back to a process journal before preparation supplies its ID.
+        if (!legacy && deps.getActiveFollowerSessionId && !sessionId)
+            return () => undefined;
+        return createTelegramUpdateJournalRuntimeBindingResolver({
+            getProfileName: deps.base.getProfileName,
+            getBotToken: deps.base.getBotToken,
+            getBotId: deps.base.getBotId,
+            ...(includeQueueRuntimeIdentity && deps.base.getQueueRuntimeIdentity
+                ? { getQueueRuntimeIdentity: deps.base.getQueueRuntimeIdentity }
+                : {}),
+            ...(deps.base.withWriterAdmission
+                ? { withWriterAdmission: deps.base.withWriterAdmission } : {}),
+            // Follower journals need the same strict exact-receipt ports as the leader; without them queue publication cannot complete.
+            ...(deps.base.withSourceSerialization
+                ? { withSourceSerialization: deps.base.withSourceSerialization } : {}),
+            ...(deps.base.getWorkspaceAdmission
+                ? { getWorkspaceAdmission: deps.base.getWorkspaceAdmission }
+                : {}),
+            ...(deps.base.onRecovery ? { onRecovery: deps.base.onRecovery } : {}),
+            getJournalPath(profileName) {
+                return deps.getFollowerJournalPath(bindingKey, profileName, sessionId);
+            },
+        });
+    };
+    const resolveFollower = () => createFollowerResolver(deps.getActiveFollowerBindingKey(), true, deps.getActiveFollowerSessionId?.())();
     const resolveActive = () => deps.isFollowerRegistered() ? resolveFollower() : resolveLeader();
-    return {
+    const inspectHistoricalSource = (journalBindingKey, operation) => {
+        const path = getTelegramUpdateJournalBindingPath(journalBindingKey);
+        const token = deps.base.getBotToken(), botId = deps.base.getBotId();
+        const profile = deps.base.getProfileName() ?? TELEGRAM_DEFAULT_PROFILE_NAME;
+        if (!path || !token)
+            return undefined;
+        const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: token, botId });
+        const keys = [botIdentity, { tokenSha256: botIdentity.tokenSha256 }].map(identity => createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: identity }));
+        if (!keys.includes(journalBindingKey))
+            return undefined;
+        const getRoot = () => deps.getRuntimeDir?.() ?? dirname(deps.getLeaderJournalPath(profile));
+        const root = getRoot();
+        const parts = relative(root, path).split(sep);
+        const suffix = escapeTelegramJournalPathPattern(getTelegramProfilePathSuffix(profile));
+        const flat = new RegExp(`^(?:inbox|follower-inbox-[a-f0-9]{16})${suffix}\\.json$`, "u");
+        const session = new RegExp(`^(?:journal\\.[a-f0-9]{16}|inbox)${suffix}\\.json$`, "u");
+        if (!isAbsolute(root) || resolve(root) !== root || !isAbsolute(path) || resolve(path) !== path ||
+            !(parts.length === 1 && flat.test(parts[0]) || parts.length === 3 && parts[0] === "sessions" &&
+                decodeTelegramSessionDirectoryName(parts[1]) !== undefined && session.test(parts[2])))
+            return undefined;
+        const current = () => deps.base.getBotToken() === token && deps.base.getBotId() === botId &&
+            (deps.base.getProfileName() ?? TELEGRAM_DEFAULT_PROFILE_NAME) === profile && getRoot() === root;
+        const inspect = () => {
+            if (!current())
+                return undefined;
+            const observed = inspectTelegramUpdateJournalRetention({ directory: root, path, profile, botIdentity,
+                limits: { maxFiles: 1024, maxBytes: TELEGRAM_UPDATE_JOURNAL_MAX_BYTES * 2,
+                    maxEntries: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES, maxWork: TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES * 1024 } });
+            if (observed.evidence.kind !== "present" || !current())
+                return undefined;
+            return operation(observed.evidence.file, observed.retainedInputs, path);
+        };
+        const result = deps.base.withSourceSerialization ? deps.base.withSourceSerialization(inspect) : inspect();
+        return current() ? result : undefined;
+    };
+    let preparedFollower;
+    const runtime = {
         resolveLeader,
         resolveFollower,
         resolveActive,
         getActiveRecoveryKey: () => resolveActive()?.recoveryKey,
-        createRecipientResolver: (bindingKey) => createFollowerResolver(bindingKey, false),
+        prepareActiveFollowerSuccession(isCurrent) {
+            const recipientBindingKey = deps.getActiveFollowerBindingKey();
+            const sessionId = deps.getActiveFollowerSessionId?.();
+            if (!sessionId)
+                return undefined;
+            const previous = preparedFollower;
+            const result = previous && previous.recipientBindingKey === recipientBindingKey && previous.sessionId !== sessionId
+                ? runtime.adoptPredecessorPending({ recipientBindingKey, predecessorSessionId: previous.sessionId,
+                    successorSessionId: sessionId, isCurrent })
+                : undefined;
+            // Only a completed adoption advances the predecessor; failures retry idempotently on the next preparation.
+            preparedFollower = { recipientBindingKey, sessionId };
+            return result;
+        },
+        inspectSourceAbandonment(journalBindingKey, updateId) {
+            if (!isSafeNonNegativeInteger(updateId))
+                throw new Error("Telegram abandonment proof requires an exact update ID.");
+            return inspectHistoricalSource(journalBindingKey, (file, originals) => {
+                const original = originals.find(value => value.updateId === updateId && value.state === "committed" &&
+                    value.journalBindingKey === journalBindingKey);
+                if (!original)
+                    return undefined;
+                const disposition = file.operatorDispositions?.find(value => value.failureId === original.failureId);
+                if (!disposition || !("dispositionKind" in disposition) || disposition.dispositionKind !== "legacy-custody")
+                    return undefined;
+                return { journalBindingKey, updateId, retainedPath: original.path, operatorAuthorityId: disposition.operatorAuthorityId };
+            });
+        },
+        inspectSourceCompletion(journalBindingKey, expected) {
+            const completion = validateJournalSourceCompletion(expected, getTelegramUpdateJournalBindingPath(journalBindingKey) ?? "journal");
+            return inspectHistoricalSource(journalBindingKey, (file, _originals, path) => inspectJournalSourceCompletion(file, completion, path));
+        },
+        inspectQueuedReceipt(journalBindingKey, expected) {
+            const queueOwner = validateQueuedReceiptObservation(expected, getTelegramUpdateJournalBindingPath(journalBindingKey) ?? "journal");
+            return inspectHistoricalSource(journalBindingKey, (file, _originals, path) => inspectJournalQueuedReceipt(file, { ...expected, queueOwner }, path));
+        },
+        adoptPredecessorPending(input) {
+            const { recipientBindingKey, predecessorSessionId, successorSessionId, isCurrent } = input;
+            if (!recipientBindingKey || !predecessorSessionId || !successorSessionId ||
+                predecessorSessionId === successorSessionId || typeof isCurrent !== "function") {
+                throw new Error("Telegram session adoption requires distinct exact session identities.");
+            }
+            const assertCurrent = () => {
+                if (!isCurrent())
+                    throw new Error("Telegram session adoption lost successor authority.");
+            };
+            assertCurrent();
+            const predecessor = createFollowerResolver(recipientBindingKey, false, predecessorSessionId)();
+            const successor = createFollowerResolver(recipientBindingKey, false, successorSessionId)();
+            if (!predecessor?.readForProtection || !successor || predecessor.recoveryKey === successor.recoveryKey) {
+                throw new Error("Telegram session adoption requires exact predecessor and successor journals.");
+            }
+            const result = { adoptedUpdateIds: [], retainedUpdateIds: [] };
+            // Non-repairing selection; the abandonment CAS rechecks each exact entry under the source lock.
+            const candidates = predecessor.readForProtection().entries.filter(isAdoptablePendingEntry)
+                .sort((left, right) => left.updateId - right.updateId);
+            for (const entry of candidates) {
+                assertCurrent();
+                // Commit away first: a crash afterwards preserves the private original instead of duplicating execution.
+                const committed = predecessor.journal.abandonPending({ journalBindingKey: predecessor.recoveryKey, entry,
+                    operatorAuthorityId: `${TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX}${successorSessionId}`, isCurrent });
+                if (committed.duplicate) {
+                    result.retainedUpdateIds.push(entry.updateId);
+                    continue;
+                }
+                assertCurrent();
+                successor.journal.appendBatch([entry.update]);
+                result.adoptedUpdateIds.push(entry.updateId);
+            }
+            return result;
+        },
+        createRecipientResolver: (bindingKey, sessionId) => createFollowerResolver(bindingKey, false, sessionId),
+        createLegacyRecipientResolver: (bindingKey) => createFollowerResolver(bindingKey, false, undefined, true),
         createPathResolver: (path) => createTelegramUpdateJournalRuntimeBindingResolver({
             getProfileName: deps.base.getProfileName,
             getBotToken: deps.base.getBotToken,
             getBotId: deps.base.getBotId,
             ...(deps.base.withWriterAdmission
                 ? { withWriterAdmission: deps.base.withWriterAdmission } : {}),
+            ...(deps.base.withSourceSerialization
+                ? { withSourceSerialization: deps.base.withSourceSerialization } : {}),
             ...(deps.base.getWorkspaceAdmission
                 ? { getWorkspaceAdmission: deps.base.getWorkspaceAdmission }
                 : {}),
@@ -1554,6 +2117,7 @@ export function createTelegramUpdateJournalBindingRuntime(deps) {
             getJournalPath: () => path,
         }),
     };
+    return runtime;
 }
 export function createTelegramUpdateJournalStore(options) {
     return createJournalStoreCore(options).journal;
@@ -1673,6 +2237,9 @@ function createJournalStoreCore(options, getInputContext) {
         if ((file.operatorDispositions?.length ?? 0) > maxEntries) {
             throw createJournalError("capacity", path, `exceeds its ${maxEntries}-operator-disposition limit`);
         }
+        if ((file.sourceCompletions?.length ?? 0) > maxEntries) {
+            throw createJournalError("capacity", path, `exceeds its ${maxEntries}-source-completion limit`);
+        }
         const serializedBytes = Buffer.byteLength(serialized);
         if (serializedBytes > maxBytes) {
             throw createJournalError("capacity", path, `exceeds its ${maxBytes}-byte limit`);
@@ -1685,7 +2252,7 @@ function createJournalStoreCore(options, getInputContext) {
         botIdentity: { ...expectedIdentity },
         entries: [],
     });
-    const readCurrentStrict = () => {
+    const readCurrentStrict = (allowReconciliation = true) => {
         let source;
         let recoveringMissingSnapshot = false;
         try {
@@ -1711,6 +2278,8 @@ function createJournalStoreCore(options, getInputContext) {
                     throw createJournalError("io", segmentDirectory, "could not be read while the journal snapshot is missing", segmentError);
                 }
                 if (orphanedSegmentNames.length > 0) {
+                    if (!allowReconciliation)
+                        throw createJournalError("invalid", path, "requires explicit missing-snapshot reconciliation");
                     if (withPairingAdmission)
                         throw createJournalError("pairing-evidence", path, "requires explicit missing-snapshot reconciliation");
                     recoveringMissingSnapshot = true;
@@ -1788,6 +2357,7 @@ function createJournalStoreCore(options, getInputContext) {
                 (withPairingAdmission && segment.botIdentity.tokenSha256 !== storedIdentity.tokenSha256)) {
                 throw createJournalError("identity-mismatch", segmentPath, "belongs to another journal identity");
             }
+            assertJournalSourceCompletionContinuity(file, segment, segmentPath);
             const entriesById = new Map(file.entries.map((entry) => [entry.updateId, entry]));
             for (const updateId of segment.removedUpdateIds) {
                 if (recoveringMissingSnapshot && !entriesById.has(updateId)) {
@@ -1824,14 +2394,16 @@ function createJournalStoreCore(options, getInputContext) {
                     : file.operatorDispositions?.length
                         ? { operatorDispositions: file.operatorDispositions }
                         : {}),
+                ...(segment.sourceCompletions !== undefined ? { sourceCompletions: segment.sourceCompletions }
+                    : file.sourceCompletions?.length ? { sourceCompletions: file.sourceCompletions } : {}),
             }, segmentPath, version);
             revision = segment.revision;
         }
         const identityChanged = storedProfile !== profile ||
             !identitiesMatch(file.botIdentity, expectedIdentity) ||
-            (withPairingAdmission && file.botIdentity.tokenSha256 !== expectedIdentity.tokenSha256);
+            ((withPairingAdmission || !!file.sourceCompletions?.length) && file.botIdentity.tokenSha256 !== expectedIdentity.tokenSha256);
         if (identityChanged) {
-            if (file.entries.length > 0 || withPairingAdmission) {
+            if (file.entries.length > 0 || file.sourceCompletions?.length || withPairingAdmission || !allowReconciliation) {
                 throw createJournalError("identity-mismatch", path, storedProfile !== profile
                     ? `belongs to profile ${storedProfile}, not ${profile}`
                     : "belongs to another Telegram bot identity");
@@ -1970,39 +2542,40 @@ function createJournalStoreCore(options, getInputContext) {
                     // Only known schema/JSON corruption may fall through to reset.
                 }
             }
-            const recoveryDirectory = join(dirname(path), "recovery", `${getNowMs()}-${process.pid}-${randomUUID()}`);
-            mkdirSync(recoveryDirectory, { recursive: true, mode: 0o700 });
-            const snapshotQuarantinePath = join(recoveryDirectory, basename(path));
-            const segmentQuarantinePath = join(recoveryDirectory, basename(segmentDirectory));
-            if (snapshotExists &&
-                !renameTelegramPathWithRetry(path, snapshotQuarantinePath)) {
-                throw createJournalError("io", path, "could not quarantine an unrecoverable journal snapshot", error);
-            }
-            if (!renameTelegramPathWithRetry(segmentDirectory, segmentQuarantinePath)) {
-                if (snapshotExists) {
-                    renameTelegramPathWithRetry(snapshotQuarantinePath, path);
+            // Approved corruption policy: delete damaged evidence instead of quarantining it under recovery/.
+            // Segments go first so a fresh revisionless snapshot can never replay them; a crash repeats the reset.
+            const deletedPaths = [];
+            const deleteDamaged = (target, label) => {
+                try {
+                    lstatSync(target);
                 }
-                throw createJournalError("io", segmentDirectory, "could not quarantine an unrecoverable journal segment history", error);
-            }
+                catch (statError) {
+                    if (statError.code === "ENOENT")
+                        return;
+                    throw createJournalError("io", target, `could not inspect an unrecoverable ${label}`, statError);
+                }
+                try {
+                    rmSync(target, { recursive: true, force: true });
+                }
+                catch (removeError) {
+                    throw createJournalError("io", target, `could not delete an unrecoverable ${label}`, removeError);
+                }
+                deletedPaths.push(target);
+            };
+            deleteDamaged(segmentDirectory, "journal segment history");
+            // A regular snapshot is replaced atomically below; anything else cannot be a rename target.
+            if (snapshotExists && !lstatSync(path).isFile())
+                deleteDamaged(path, "journal snapshot");
             const reset = emptyFile();
             const serialized = serializeJournalFile(reset);
             const serializedBytes = assertCapacity(reset, serialized);
-            try {
-                writeJournalFile(path, serialized, onPublicationBoundary);
-            }
-            catch (publicationError) {
-                const segmentsRestored = renameTelegramPathWithRetry(segmentQuarantinePath, segmentDirectory);
-                const snapshotRestored = !snapshotExists ||
-                    renameTelegramPathWithRetry(snapshotQuarantinePath, path);
-                if (!segmentsRestored || !snapshotRestored) {
-                    throw createJournalError("io", path, "reset publication failed after journal evidence was quarantined", publicationError);
-                }
-                throw publicationError;
-            }
+            writeJournalFile(path, serialized, onPublicationBoundary);
+            if (snapshotExists && !deletedPaths.includes(path))
+                deletedPaths.push(path);
             notifyRecovery({
                 kind: "reset",
                 path,
-                quarantinePath: recoveryDirectory,
+                deletedPaths,
                 reason: error.message,
             });
             return { file: reset, exists: true, serializedBytes };
@@ -2048,7 +2621,7 @@ function createJournalStoreCore(options, getInputContext) {
     const inputHeadroomText = "\0".repeat(TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH);
     const inputBindingHeadroomText = "\0".repeat(TELEGRAM_UPDATE_JOURNAL_INPUT_BINDING_MAX_LENGTH);
     const inputHandoffHeadroomText = "\0".repeat(TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_ID_MAX_LENGTH);
-    const getFileWork = (file) => file.entries.length + (file.operatorDispositions?.length ?? 0);
+    const getFileWork = (file) => file.entries.length + (file.operatorDispositions?.length ?? 0) + (file.sourceCompletions?.length ?? 0);
     const advanceInputHeadroomState = (state, entries, projectionSlack) => {
         const revision = (state.file.revision ?? 0) + 1;
         if (!isSafePositiveInteger(revision))
@@ -2190,7 +2763,7 @@ function createJournalStoreCore(options, getInputContext) {
     const createInputHeadroomSegment = (previous, next) => {
         const previousEntries = new Map(previous.entries.map(entry => [entry.updateId, entry]));
         const nextEntries = new Map(next.entries.map(entry => [entry.updateId, entry]));
-        return { version: TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION,
+        return { version,
             revision: next.revision, previousRevision: next.revision - 1,
             profile: next.profile, botIdentity: next.botIdentity,
             upsertedEntries: next.entries.filter(entry => !previousEntries.has(entry.updateId) || !isDeepStrictEqual(previousEntries.get(entry.updateId), entry)),
@@ -2218,7 +2791,7 @@ function createJournalStoreCore(options, getInputContext) {
             : { files: 1, bytes: publishedBytes, work: getFileWork(publishedFile) };
         if (publishedSegment) {
             const segmentWork = publishedSegment.upsertedEntries.length + publishedSegment.removedUpdateIds.length +
-                (publishedSegment.operatorDispositions?.length ?? 0);
+                (publishedSegment.operatorDispositions?.length ?? 0) + (publishedSegment.sourceCompletions?.length ?? 0);
             const segmentBytes = Buffer.byteLength(`${JSON.stringify(publishedSegment, null, 2)}\n`);
             baseRetainedCount += 1;
             baseRetainedBytes += segmentBytes;
@@ -2271,9 +2844,10 @@ function createJournalStoreCore(options, getInputContext) {
         const segmentText = `${JSON.stringify(segment, null, 2)}\n`;
         const segmentBytes = Buffer.byteLength(segmentText);
         const collections = [segment.upsertedEntries.length, segment.removedUpdateIds.length,
-            segment.operatorDispositions?.length ?? 0, file.entries.length, file.operatorDispositions?.length ?? 0];
-        const segmentWork = collections[0] + collections[1] + collections[2];
-        const fileWork = collections[3] + collections[4];
+            segment.operatorDispositions?.length ?? 0, file.entries.length, file.operatorDispositions?.length ?? 0,
+            segment.sourceCompletions?.length ?? 0, file.sourceCompletions?.length ?? 0];
+        const segmentWork = collections[0] + collections[1] + collections[2] + collections[5];
+        const fileWork = collections[3] + collections[4] + collections[6];
         const accounting = source.evidence.accounting;
         // Both the segment-first state and snapshot-first cleanup residue must fit.
         assertSourceResources(accounting.files + 1, accounting.bytes + segmentBytes, accounting.work + segmentWork + fileWork, collections);
@@ -2311,12 +2885,13 @@ function createJournalStoreCore(options, getInputContext) {
         }
         return { file: revisedFile, serializedBytes };
     };
-    const publishMutation = (current, entries, contentChanged, operatorDispositions = current.file.operatorDispositions, acceptedThroughUpdateId = current.file.acceptedThroughUpdateId, publicationBoundary = onPublicationBoundary, inputHeadroom = version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION ? "all" : false) => {
+    const publishMutation = (current, entries, contentChanged, operatorDispositions = current.file.operatorDispositions, acceptedThroughUpdateId = current.file.acceptedThroughUpdateId, publicationBoundary = onPublicationBoundary, inputHeadroom = journalHasCustodyFields(version) ? "all" : false, sourceCompletions = current.file.sourceCompletions) => {
         const botIdentity = current.source ? current.file.botIdentity : mergeBotIdentity(current.file.botIdentity, expectedIdentity);
         if (!contentChanged &&
             isDeepStrictEqual(current.file.botIdentity, botIdentity) &&
             isDeepStrictEqual(current.file.operatorDispositions ?? [], operatorDispositions ?? []) &&
-            current.file.acceptedThroughUpdateId === acceptedThroughUpdateId) {
+            current.file.acceptedThroughUpdateId === acceptedThroughUpdateId &&
+            isDeepStrictEqual(current.file.sourceCompletions ?? [], sourceCompletions ?? [])) {
             return { file: current.file, serializedBytes: current.serializedBytes };
         }
         const file = {
@@ -2330,21 +2905,24 @@ function createJournalStoreCore(options, getInputContext) {
             ...(operatorDispositions?.length
                 ? { operatorDispositions }
                 : {}),
+            ...(sourceCompletions?.length ? { sourceCompletions } : {}),
         };
+        assertJournalRoutingInputContinuity(current.file, entries, path);
         if (withPairingAdmission || current.source)
             parseJournalFile(file, path, version);
         const serialized = serializeJournalFile(file);
         const serializedBytes = assertCapacity(file, serialized);
         const changed = contentChanged ||
             current.file.acceptedThroughUpdateId !== acceptedThroughUpdateId ||
-            !isDeepStrictEqual(current.file.botIdentity, file.botIdentity);
+            !isDeepStrictEqual(current.file.botIdentity, file.botIdentity) ||
+            !isDeepStrictEqual(current.file.sourceCompletions ?? [], sourceCompletions ?? []);
         if (!changed) {
             return { file, serializedBytes: current.serializedBytes };
         }
         if (!current.exists) {
             if (current.source) {
-                const collections = [file.entries.length, file.operatorDispositions?.length ?? 0];
-                assertSourceResources(1, serializedBytes, collections[0] + collections[1], collections);
+                const collections = [file.entries.length, file.operatorDispositions?.length ?? 0, file.sourceCompletions?.length ?? 0];
+                assertSourceResources(1, serializedBytes, collections[0] + collections[1] + collections[2], collections);
             }
             if (inputHeadroom !== false)
                 assertInputProgressHeadroom(current, file, inputHeadroom);
@@ -2379,6 +2957,7 @@ function createJournalStoreCore(options, getInputContext) {
             ...(!isDeepStrictEqual(current.file.operatorDispositions ?? [], operatorDispositions ?? [])
                 ? { operatorDispositions: operatorDispositions ?? [] }
                 : {}),
+            ...(!isDeepStrictEqual(current.file.sourceCompletions ?? [], sourceCompletions ?? []) ? { sourceCompletions: sourceCompletions ?? [] } : {}),
         };
         if (current.source) {
             if (!isSafePositiveInteger(revision))
@@ -2386,7 +2965,7 @@ function createJournalStoreCore(options, getInputContext) {
             const revisedFile = { ...file, revision };
             if (inputHeadroom !== false)
                 assertInputProgressHeadroom(current, revisedFile, inputHeadroom, segment);
-            return publishSourceSegment(current, file, segment, publicationBoundary, version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION);
+            return publishSourceSegment(current, file, segment, publicationBoundary, journalHasCustodyFields(version));
         }
         publishTelegramUpdateJournalSegmentUnlocked(path, segment, publicationBoundary);
         const revisedFile = { ...file, revision };
@@ -2429,6 +3008,175 @@ function createJournalStoreCore(options, getInputContext) {
         }
         return { file: revisedFile, serializedBytes };
     };
+    const removeCompleted = (updateIds, expectedSources, exact = false, completionInput) => runMutation((readCurrent) => {
+        const current = exact && !sourceAccess ? readCurrentStrict(false) : readCurrent();
+        if (completionInput !== undefined && !sourceAccess)
+            throw createJournalError("invalid", path, "source completion requires an exact source handle");
+        const completions = completionInput === undefined ? undefined : validateJournalSourceCompletions(completionInput, path, version);
+        if (exact && expectedSources === undefined)
+            throw createJournalError("invalid", path, "received no exact completion sources");
+        const requestedIds = new Set();
+        for (const updateId of updateIds) {
+            if (!isSafeNonNegativeInteger(updateId))
+                throw createJournalError("invalid", path, "received an invalid removal update id");
+            requestedIds.add(updateId);
+        }
+        if (expectedSources !== undefined) {
+            if (!Array.isArray(expectedSources) || !expectedSources.length)
+                throw createJournalError("invalid", path, "received no exact completion sources");
+            const expectedIds = new Set();
+            for (const expected of expectedSources) {
+                if (!isRecord(expected) || Object.keys(expected).some(key => !["updateId", "sourceSha256"].includes(key)) ||
+                    !isSafeNonNegativeInteger(expected.updateId) || !requestedIds.has(expected.updateId) || expectedIds.has(expected.updateId) ||
+                    typeof expected.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expected.sourceSha256)) {
+                    throw createJournalError("invalid", path, "received an invalid exact completion source");
+                }
+                expectedIds.add(expected.updateId);
+                const entry = current.file.entries.find(value => value.updateId === expected.updateId);
+                if (!entry || createTelegramUpdateJournalEntryDigest(entry).sourceSha256 !== expected.sourceSha256) {
+                    throw createJournalError("conflict", path, "exact completion source changed or disappeared");
+                }
+            }
+        }
+        if (completions) {
+            const guards = new Map((expectedSources ?? []).map(source => [source.updateId, source.sourceSha256]));
+            if (completions.some(completion => guards.get(completion.updateId) !== completion.sourceSha256)) {
+                throw createJournalError("invalid", path, "source completion has no matching exact guard");
+            }
+        }
+        const requestedEntries = current.file.entries.filter(entry => requestedIds.has(entry.updateId));
+        const protectedEntry = requestedEntries.find(entry => entry.state === "failed" || entry.state === "queued");
+        if (protectedEntry)
+            throw createJournalError("conflict", path, protectedEntry.state === "failed"
+                ? `cannot complete terminal update ${protectedEntry.updateId} without an operator disposition`
+                : `cannot complete queued update ${protectedEntry.updateId} without its exact owner receipt`);
+        const removedUpdateIds = requestedEntries.map(entry => entry.updateId);
+        const sourceCompletions = completions
+            ? [...(current.file.sourceCompletions ?? []), ...completions].sort((a, b) => a.updateId - b.updateId) : current.file.sourceCompletions;
+        if (sourceCompletions?.length)
+            validateJournalSourceCompletions(sourceCompletions, path, version);
+        const published = publishMutation(current, current.file.entries.filter(entry => !requestedIds.has(entry.updateId)), removedUpdateIds.length > 0, current.file.operatorDispositions, current.file.acceptedThroughUpdateId, onPublicationBoundary, false, sourceCompletions);
+        return { removedUpdateIds, entryCount: published.file.entries.length, serializedBytes: published.serializedBytes,
+            ...(completions ? { sourceCompletions: completions.map(completion => ({ ...completion })) } : {}) };
+    });
+    const completeQueued = (receipts, completionInput, exact = false) => runMutation((readCurrent) => {
+        if (exact && !sourceAccess)
+            throw createJournalError("invalid", path, "source completion requires an exact source handle");
+        const completions = exact ? validateJournalSourceCompletions(completionInput, path, version) : undefined;
+        if (!Array.isArray(receipts) || receipts.length === 0)
+            throw createJournalError("invalid", path, "received no queued receipts to complete");
+        const current = readCurrent();
+        const receiptIds = new Set(), requestedUpdateIds = new Set();
+        for (const receipt of receipts) {
+            if ((receipt.queueKind !== "prompt" && receipt.queueKind !== "control") || !isNonEmptyString(receipt.receiptId) ||
+                receiptIds.has(receipt.receiptId) || !Array.isArray(receipt.sourceUpdateIds) || receipt.sourceUpdateIds.length === 0) {
+                throw createJournalError("invalid", path, "received an invalid queued completion receipt");
+            }
+            receiptIds.add(receipt.receiptId);
+            const queueOwner = validateJournalQueueOwner(receipt.queueOwner, path);
+            if (queueRuntimeIdentity && (queueOwner.instanceId !== queueRuntimeIdentity.instanceId || queueOwner.processId !== queueRuntimeIdentity.processId ||
+                queueOwner.processBirthId !== queueRuntimeIdentity.processBirthId)) {
+                throw createJournalError("conflict", path, `cannot complete foreign queue receipt ${receipt.receiptId}`);
+            }
+            const sourceUpdateIds = new Set();
+            for (const updateId of receipt.sourceUpdateIds) {
+                if (!isSafeNonNegativeInteger(updateId) || sourceUpdateIds.has(updateId) || requestedUpdateIds.has(updateId)) {
+                    throw createJournalError("invalid", path, "received overlapping queued completion update ids");
+                }
+                sourceUpdateIds.add(updateId);
+                requestedUpdateIds.add(updateId);
+            }
+            const persistedReceiptEntries = current.file.entries.filter(entry => entry.queueReceiptId === receipt.receiptId);
+            if (persistedReceiptEntries.length !== sourceUpdateIds.size || persistedReceiptEntries.some(entry => !sourceUpdateIds.has(entry.updateId) || entry.state !== "queued" || entry.queueKind !== receipt.queueKind || !entry.queueOwner ||
+                entry.queueHandoff !== undefined || !areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, queueOwner))) {
+                throw createJournalError("conflict", path, `cannot complete stale or foreign queue receipt ${receipt.receiptId}`);
+            }
+        }
+        const removedEntries = current.file.entries.filter(entry => requestedUpdateIds.has(entry.updateId));
+        const removedUpdateIds = removedEntries.map(entry => entry.updateId);
+        if (removedUpdateIds.length !== requestedUpdateIds.size)
+            throw createJournalError("conflict", path, "queued completion did not resolve every source update");
+        if (completions) {
+            const sources = new Map(removedEntries.map(entry => [entry.updateId, createTelegramUpdateJournalEntryDigest(entry).sourceSha256]));
+            if (completions.some(completion => sources.get(completion.updateId) !== completion.sourceSha256)) {
+                throw createJournalError("conflict", path, "queued completion source changed or belongs to another receipt");
+            }
+        }
+        const sourceCompletions = completions ? [...(current.file.sourceCompletions ?? []), ...completions].sort((a, b) => a.updateId - b.updateId)
+            : current.file.sourceCompletions;
+        if (sourceCompletions?.length)
+            validateJournalSourceCompletions(sourceCompletions, path, version);
+        const published = publishMutation(current, current.file.entries.filter(entry => !requestedUpdateIds.has(entry.updateId)), true, current.file.operatorDispositions, current.file.acceptedThroughUpdateId, onPublicationBoundary, exact ? false : undefined, sourceCompletions);
+        return { removedUpdateIds, entryCount: published.file.entries.length, serializedBytes: published.serializedBytes,
+            ...(completions ? { sourceCompletions: completions.map(completion => ({ ...completion })) } : {}) };
+    });
+    const mutateRoutingInputs = (input, select, publishedAtMs) => runMutation(readCurrent => {
+        if (!isTelegramUpdateJournalLegacyFamilyVersion(version))
+            throw createJournalError("unsupported-version", path, "routing input lifetime requires a private v1 source");
+        const binding = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+        if (input.journalBindingKey !== binding || !isSafePositiveInteger(input.operatorUserId) ||
+            typeof input.isCurrent !== "function" || !Array.isArray(input.entries) || !input.entries.length || input.entries.length > maxEntries) {
+            throw createJournalError("invalid", path, "invalid routing input lifetime authority");
+        }
+        const assertCurrent = () => { if (!input.isCurrent())
+            throw createJournalError("conflict", path, "routing input lifetime authority ended"); };
+        assertCurrent();
+        const expected = input.entries.map(entry => validateJournalEntry(entry, path, version));
+        if (new Set(expected.map(entry => entry.updateId)).size !== expected.length)
+            throw createJournalError("invalid", path, "duplicate routing input sources");
+        const current = sourceAccess ? readCurrent() : readCurrentStrict(false);
+        const nowMs = select ? getNowMs() : publishedAtMs;
+        if (!isSafeNonNegativeInteger(nowMs) || !Number.isSafeInteger(nowMs + TELEGRAM_ROUTING_INPUT_TTL_MS) || (!select && nowMs > getNowMs()))
+            throw createJournalError("invalid", path, "invalid routing input lifetime clock");
+        let issued = false;
+        const changed = new Map();
+        const result = expected.map(original => {
+            const entry = current.file.entries.find(value => value.updateId === original.updateId);
+            if (!entry || entry.state !== "pending" || original.state !== "pending" || entry.inputClaim || entry.inputProvenance || entry.queueOwner) {
+                throw createJournalError("conflict", path, "routing input source is not unclaimed pending work");
+            }
+            const withoutLifetime = (value) => { const copy = cloneEntry(value); delete copy.routingInput; return copy; };
+            if (!isDeepStrictEqual(entry, original) && (!isDeepStrictEqual(withoutLifetime(entry), withoutLifetime(original)) ||
+                (original.routingInput && !isDeepStrictEqual(original.routingInput, entry.routingInput)))) {
+                throw createJournalError("conflict", path, "routing input source changed");
+            }
+            const lifetime = entry.routingInput;
+            if (lifetime && lifetime.operatorUserId !== input.operatorUserId)
+                throw createJournalError("conflict", path, "routing input belongs to another operator");
+            if (createPendingRetentionReference({ path, journalBindingKey: binding, entry, maxBytes }).read()) {
+                throw createJournalError("conflict", path, "routing input has protected retention");
+            }
+            if (select) {
+                if (!lifetime || (lifetime.phase === "waiting" && nowMs >= lifetime.expiresAtMs))
+                    throw createJournalError("conflict", path, "routing input choice expired or was not armed");
+                if (lifetime.phase === "selected")
+                    return cloneEntry(entry);
+                issued = true;
+                const selected = { ...cloneEntry(entry), routingInput: { ...lifetime, phase: "selected" } };
+                changed.set(entry.updateId, selected);
+                return cloneEntry(selected);
+            }
+            if (lifetime) {
+                if (lifetime.phase !== "waiting")
+                    throw createJournalError("conflict", path, "selected routing input cannot renew its choice");
+                return cloneEntry(entry);
+            }
+            if (nowMs < entry.admittedAtMs)
+                throw createJournalError("conflict", path, "routing input publication predates admission");
+            issued = true;
+            const armed = { ...cloneEntry(entry), routingInput: { operatorUserId: input.operatorUserId,
+                    publishedAtMs: nowMs, expiresAtMs: nowMs + TELEGRAM_ROUTING_INPUT_TTL_MS, phase: "waiting" } };
+            changed.set(entry.updateId, armed);
+            return cloneEntry(armed);
+        });
+        assertCurrent();
+        if (select && issued && result.some(entry => !changed.has(entry.updateId)))
+            throw createJournalError("conflict", path, "routing input selection has mixed prior phases");
+        if (changed.size)
+            publishMutation(current, current.file.entries.map(entry => changed.get(entry.updateId) ?? entry), true, current.file.operatorDispositions, current.file.acceptedThroughUpdateId, (boundary, target) => { onPublicationBoundary?.(boundary, target); assertCurrent(); });
+        assertCurrent();
+        return { issued, entries: result };
+    });
     const journal = {
         read() {
             return runMutation((readCurrent) => {
@@ -2467,9 +3215,12 @@ function createJournalStoreCore(options, getInputContext) {
                 const current = readCurrent();
                 const entriesById = new Map(current.file.entries.map((entry) => [entry.updateId, entry]));
                 const previousAcceptedThroughUpdateId = current.file.acceptedThroughUpdateId;
-                const discardedUpdateIds = new Set((current.file.operatorDispositions ?? [])
-                    .filter((disposition) => disposition.action === "discard")
-                    .map((disposition) => disposition.updateId));
+                const discardedUpdateIds = new Set([
+                    ...(current.file.operatorDispositions ?? [])
+                        .filter((disposition) => disposition.action === "discard")
+                        .map((disposition) => disposition.updateId),
+                    ...(current.file.sourceCompletions ?? []).map(completion => completion.updateId),
+                ]);
                 let admittedAtMs;
                 const addedUpdateIds = [];
                 const duplicateUpdateIds = [];
@@ -2719,6 +3470,7 @@ function createJournalStoreCore(options, getInputContext) {
                     updateId: entry.updateId,
                     update: entry.update,
                     admittedAtMs: entry.admittedAtMs,
+                    ...(entry.routingInput ? { routingInput: { ...entry.routingInput } } : {}),
                     ...(entry.preApprovalExcluded !== undefined ? { preApprovalExcluded: entry.preApprovalExcluded } : {}),
                     state: input.disposition,
                     failure,
@@ -2808,8 +3560,8 @@ function createJournalStoreCore(options, getInputContext) {
         applyLegacyCustodyDisposition(authority) {
             return runMutation((readCurrent) => {
                 const current = readCurrent();
-                if (current.file.version !== TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION)
-                    throw createJournalError("conflict", path, "legacy custody disposition requires a v3 journal");
+                if (!journalHasCustodyFields(current.file.version))
+                    throw createJournalError("conflict", path, "legacy custody disposition requires a custody journal");
                 const existing = current.file.operatorDispositions?.find(candidate => candidate.failureId === authority.dispositionId);
                 if (existing) {
                     if (!("dispositionKind" in existing) || existing.dispositionKind !== "legacy-custody")
@@ -3018,67 +3770,8 @@ function createJournalStoreCore(options, getInputContext) {
                 };
             });
         },
-        completeQueued(receipts) {
-            return runMutation((readCurrent) => {
-                if (!Array.isArray(receipts) || receipts.length === 0) {
-                    throw createJournalError("invalid", path, "received no queued receipts to complete");
-                }
-                const current = readCurrent();
-                const receiptIds = new Set();
-                const requestedUpdateIds = new Set();
-                for (const receipt of receipts) {
-                    if ((receipt.queueKind !== "prompt" &&
-                        receipt.queueKind !== "control") ||
-                        !isNonEmptyString(receipt.receiptId) ||
-                        receiptIds.has(receipt.receiptId) ||
-                        !Array.isArray(receipt.sourceUpdateIds) ||
-                        receipt.sourceUpdateIds.length === 0) {
-                        throw createJournalError("invalid", path, "received an invalid queued completion receipt");
-                    }
-                    receiptIds.add(receipt.receiptId);
-                    const queueOwner = validateJournalQueueOwner(receipt.queueOwner, path);
-                    if (queueRuntimeIdentity &&
-                        (queueOwner.instanceId !== queueRuntimeIdentity.instanceId ||
-                            queueOwner.processId !== queueRuntimeIdentity.processId ||
-                            queueOwner.processBirthId !==
-                                queueRuntimeIdentity.processBirthId)) {
-                        throw createJournalError("conflict", path, `cannot complete foreign queue receipt ${receipt.receiptId}`);
-                    }
-                    const sourceUpdateIds = new Set();
-                    for (const updateId of receipt.sourceUpdateIds) {
-                        if (!isSafeNonNegativeInteger(updateId) ||
-                            sourceUpdateIds.has(updateId) ||
-                            requestedUpdateIds.has(updateId)) {
-                            throw createJournalError("invalid", path, "received overlapping queued completion update ids");
-                        }
-                        sourceUpdateIds.add(updateId);
-                        requestedUpdateIds.add(updateId);
-                    }
-                    const persistedReceiptEntries = current.file.entries.filter((entry) => entry.queueReceiptId === receipt.receiptId);
-                    if (persistedReceiptEntries.length !== sourceUpdateIds.size ||
-                        persistedReceiptEntries.some((entry) => !sourceUpdateIds.has(entry.updateId) ||
-                            entry.state !== "queued" ||
-                            entry.queueKind !== receipt.queueKind ||
-                            !entry.queueOwner ||
-                            entry.queueHandoff !== undefined ||
-                            !areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, queueOwner))) {
-                        throw createJournalError("conflict", path, `cannot complete stale or foreign queue receipt ${receipt.receiptId}`);
-                    }
-                }
-                const removedUpdateIds = current.file.entries
-                    .filter((entry) => requestedUpdateIds.has(entry.updateId))
-                    .map((entry) => entry.updateId);
-                if (removedUpdateIds.length !== requestedUpdateIds.size) {
-                    throw createJournalError("conflict", path, "queued completion did not resolve every source update");
-                }
-                const published = publishMutation(current, current.file.entries.filter((entry) => !requestedUpdateIds.has(entry.updateId)), true);
-                return {
-                    removedUpdateIds,
-                    entryCount: published.file.entries.length,
-                    serializedBytes: published.serializedBytes,
-                };
-            });
-        },
+        completeQueued(receipts) { return completeQueued(receipts); },
+        completeQueuedExact(receipts, completions) { return completeQueued(receipts, completions, true); },
         discardQueued(input) {
             return runMutation((readCurrent) => {
                 if ((input.queueKind !== "prompt" &&
@@ -3194,33 +3887,199 @@ function createJournalStoreCore(options, getInputContext) {
                 };
             });
         },
-        removeCompleted(updateIds) {
+        inspectAbandonedPending(updateId) {
             return runMutation((readCurrent) => {
-                const current = readCurrent();
-                const requestedIds = new Set();
-                for (const updateId of updateIds) {
-                    if (!isSafeNonNegativeInteger(updateId)) {
-                        throw createJournalError("invalid", path, "received an invalid removal update id");
-                    }
-                    requestedIds.add(updateId);
+                if (!isTelegramUpdateJournalLegacyFamilyVersion(version)) {
+                    throw createJournalError("unsupported-version", path, "abandonment inspection requires the legacy v1 source");
                 }
-                const requestedEntries = current.file.entries.filter((entry) => requestedIds.has(entry.updateId));
-                const protectedEntry = requestedEntries.find((entry) => entry.state === "failed" || entry.state === "queued");
-                if (protectedEntry) {
-                    throw createJournalError("conflict", path, protectedEntry.state === "failed"
-                        ? `cannot complete terminal update ${protectedEntry.updateId} without an operator disposition`
-                        : `cannot complete queued update ${protectedEntry.updateId} without its exact owner receipt`);
+                if (!isSafeNonNegativeInteger(updateId))
+                    throw createJournalError("invalid", path, "invalid abandonment update id");
+                // Inspection never repairs or quarantines source evidence.
+                const current = sourceAccess ? readCurrent() : readCurrentStrict(false);
+                const matches = (current.file.operatorDispositions ?? []).filter(item => item.updateId === updateId);
+                const disposition = matches[0];
+                if (matches.length !== 1 || !disposition || !("dispositionKind" in disposition) ||
+                    disposition.dispositionKind !== "legacy-custody" || disposition.action !== "discard" ||
+                    disposition.failureId !== `abandon-${disposition.evidenceSha256}` ||
+                    current.file.entries.some(entry => entry.updateId === updateId))
+                    return undefined;
+                const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+                const retainedPath = join(`${path}.retained`, `${disposition.failureId}.json`);
+                let stat;
+                try {
+                    stat = lstatSync(retainedPath);
                 }
-                const removedUpdateIds = requestedEntries.map((entry) => entry.updateId);
-                const published = publishMutation(current, current.file.entries.filter((entry) => !requestedIds.has(entry.updateId)), removedUpdateIds.length > 0);
-                return {
-                    removedUpdateIds,
-                    entryCount: published.file.entries.length,
-                    serializedBytes: published.serializedBytes,
+                catch (error) {
+                    if (error.code === "ENOENT")
+                        throw createJournalError("conflict", retainedPath, "committed abandonment lost its retained input");
+                    throw error;
+                }
+                if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes + 4096) {
+                    throw createJournalError("invalid", retainedPath, "retained input is not a bounded regular file");
+                }
+                const parsed = JSON.parse(readFileSync(retainedPath, "utf8"));
+                if (!isRecord(parsed))
+                    throw createJournalError("invalid", retainedPath, "retained input is not an evidence record");
+                const entry = validateJournalEntry(parsed.entry, retainedPath, version);
+                const reference = createPendingRetentionReference({ path, journalBindingKey, entry, maxBytes });
+                const retained = reference.read();
+                if (entry.updateId !== updateId || reference.retainedPath !== retainedPath ||
+                    !isDeepStrictEqual(retained?.requestedDisposition, disposition)) {
+                    throw createJournalError("conflict", retainedPath, "retained input does not match committed abandonment");
+                }
+                return { journalBindingKey, updateId, retainedPath, operatorAuthorityId: disposition.operatorAuthorityId };
+            });
+        },
+        inspectPendingRetention(entry) {
+            return runMutation(() => {
+                if (!isTelegramUpdateJournalLegacyFamilyVersion(version)) {
+                    throw createJournalError("unsupported-version", path, "pending retention requires the legacy v1 source");
+                }
+                const expected = validateJournalEntry(entry, path, version);
+                if (expected.state !== "pending")
+                    throw createJournalError("conflict", path, "retention inspection requires a pending source");
+                const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+                const reference = createPendingRetentionReference({ path, journalBindingKey, entry: expected, maxBytes });
+                const retained = reference.read();
+                return retained ? { journalBindingKey, retainedPath: reference.retainedPath,
+                    requestedDisposition: retained.requestedDisposition } : undefined;
+            });
+        },
+        abandonPending(input) {
+            return runMutation((readCurrent) => {
+                if (!isTelegramUpdateJournalLegacyFamilyVersion(version)) {
+                    throw createJournalError("unsupported-version", path, "pending abandonment requires the legacy v1 source");
+                }
+                const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity: expectedIdentity });
+                if (input.journalBindingKey !== journalBindingKey) {
+                    throw createJournalError("identity-mismatch", path, "pending abandonment belongs to another source");
+                }
+                if (!isBoundedString(input.operatorAuthorityId, TELEGRAM_UPDATE_JOURNAL_FAILURE_ID_MAX_LENGTH) ||
+                    !input.operatorAuthorityId.trim() || typeof input.isCurrent !== "function") {
+                    throw createJournalError("invalid", path, "pending abandonment requires explicit operator authority");
+                }
+                const assertCurrent = () => {
+                    if (!input.isCurrent())
+                        throw createJournalError("conflict", path, "pending abandonment lost authority");
                 };
+                assertCurrent();
+                const expected = validateJournalEntry(input.entry, path, version);
+                if (expected.state !== "pending" || expected.inputClaim || expected.inputProvenance ||
+                    expected.queueOwner || expected.queueHandoff || expected.queueReceiptId || expected.failure) {
+                    throw createJournalError("conflict", path, "only an exact unclaimed pending source may be abandoned");
+                }
+                // Never repair/quarantine source evidence while deciding an operator cancellation.
+                const readStrict = sourceAccess ? readCurrent : () => readCurrentStrict(false);
+                const current = readStrict();
+                const { evidenceSha256, failureId, retainedPath, read: readRetention } = createPendingRetentionReference({ path, journalBindingKey, entry: expected, maxBytes });
+                const existing = current.file.operatorDispositions?.find(item => item.failureId === failureId || item.updateId === expected.updateId);
+                const currentEntry = current.file.entries.find(entry => entry.updateId === expected.updateId);
+                const assertRetention = (retained, disposition) => {
+                    if (!retained || !isDeepStrictEqual(retained.requestedDisposition, disposition)) {
+                        throw createJournalError("conflict", retainedPath, "retained input does not match abandonment evidence");
+                    }
+                };
+                if (existing) {
+                    if (currentEntry || !("dispositionKind" in existing) || existing.dispositionKind !== "legacy-custody" ||
+                        existing.failureId !== failureId || existing.action !== "discard" || existing.evidenceSha256 !== evidenceSha256) {
+                        throw createJournalError("conflict", path, "pending source already has another disposition");
+                    }
+                    assertRetention(readRetention(), existing);
+                    assertCurrent();
+                    return { disposition: existing, retainedPath, duplicate: true,
+                        entryCount: current.file.entries.length, serializedBytes: current.serializedBytes };
+                }
+                if (!currentEntry || !isDeepStrictEqual(currentEntry, expected)) {
+                    throw createJournalError("conflict", path, "pending source changed before abandonment");
+                }
+                const nowMs = getNowMs();
+                if (!isSafeNonNegativeInteger(nowMs))
+                    throw createJournalError("invalid", path, "invalid abandonment timestamp");
+                const retained = readRetention();
+                let disposition;
+                if (retained) {
+                    disposition = retained.requestedDisposition;
+                }
+                else {
+                    // Reuse the existing legacy discard tombstone so older v1 readers also refuse replay.
+                    // This is an operator disposition, not a fabricated execution failure or completion.
+                    disposition = { dispositionKind: "legacy-custody", failureId, updateId: expected.updateId,
+                        action: "discard", committedAtMs: nowMs, evidenceSha256,
+                        operatorAuthorityId: input.operatorAuthorityId, authorizedAtMs: nowMs };
+                    const copy = { version: 1, kind: "pending-input-retention",
+                        journalBindingKey, entry: expected, requestedDisposition: disposition };
+                    writeJournalFile(retainedPath, `${JSON.stringify(copy)}\n`, (boundary, target) => {
+                        onPublicationBoundary?.(boundary, target);
+                        assertCurrent();
+                    });
+                }
+                assertCurrent();
+                assertRetention(readRetention(), disposition);
+                const committed = (snapshot) => !snapshot.file.entries.some(entry => entry.updateId === expected.updateId) &&
+                    snapshot.file.operatorDispositions?.some(item => isDeepStrictEqual(item, disposition));
+                try {
+                    const published = publishMutation(current, current.file.entries.filter(entry => entry.updateId !== expected.updateId), true, [...(current.file.operatorDispositions ?? []), disposition], current.file.acceptedThroughUpdateId, (boundary, target) => { onPublicationBoundary?.(boundary, target); assertCurrent(); });
+                    return { disposition, retainedPath, duplicate: false,
+                        entryCount: published.file.entries.length, serializedBytes: published.serializedBytes };
+                }
+                catch (error) {
+                    // A segment may be durable even if later snapshot compaction failed.
+                    // Only exact read-back can turn that unknown acknowledgement into success.
+                    let observed;
+                    try {
+                        observed = readStrict();
+                    }
+                    catch {
+                        throw error;
+                    }
+                    if (!committed(observed))
+                        throw error;
+                    assertRetention(readRetention(), disposition);
+                    return { disposition, retainedPath, duplicate: false,
+                        entryCount: observed.file.entries.length, serializedBytes: observed.serializedBytes };
+                }
+            });
+        },
+        removeCompleted(updateIds) { return removeCompleted(updateIds); },
+        removeCompletedExact(updateIds, expectedSources, completions) { return removeCompleted(updateIds, expectedSources, true, completions); },
+        inspectQueuedReceipt(expected) {
+            return runMutationCore(readCurrent => {
+                if (!sourceAccess || !isTelegramUpdateJournalLegacyFamilyVersion(version)) {
+                    throw createJournalError("invalid", path, "queue receipt observation requires an exact legacy v1 source handle");
+                }
+                const queueOwner = validateQueuedReceiptObservation(expected, path);
+                const current = readCurrent();
+                return inspectJournalQueuedReceipt(current.file, { ...expected, queueOwner }, path);
+            });
+        },
+        inspectSourceCompletion(expected) {
+            return runMutation(readCurrent => {
+                if (!sourceAccess)
+                    throw createJournalError("invalid", path, "source completion requires an exact source handle");
+                const completion = validateJournalSourceCompletion(expected, path);
+                const current = readCurrent();
+                return inspectJournalSourceCompletion(current.file, completion, path);
             });
         },
     };
+    const abandonRoutingPending = journal.abandonPending.bind(journal);
+    if (isTelegramUpdateJournalLegacyFamilyVersion(version))
+        journal.routingInputs = {
+            arm(input) { return mutateRoutingInputs(input, false, input.publishedAtMs).entries; },
+            select(input) { return mutateRoutingInputs(input, true); },
+            expire(input) {
+                const original = validateJournalEntry(input.entry, path, version), lifetime = original.routingInput;
+                if (!lifetime || lifetime.phase !== "waiting" || lifetime.operatorUserId !== input.operatorUserId ||
+                    !isSafePositiveInteger(input.operatorUserId) || typeof input.isCurrent !== "function") {
+                    throw createJournalError("conflict", path, "routing input expiry lacks exact waiting authority");
+                }
+                const current = () => { const now = getNowMs(); return isSafeNonNegativeInteger(now) && now >= lifetime.expiresAtMs && input.isCurrent(); };
+                if (!current())
+                    throw createJournalError("conflict", path, "routing input has not expired under current authority");
+                return abandonRoutingPending({ journalBindingKey: input.journalBindingKey, entry: original,
+                    operatorAuthorityId: `telegram-owner:${input.operatorUserId}`, isCurrent: current });
+            },
+        };
     if (!getInputContext)
         return { journal };
     // Strict source acquisition already requires this exact stored receipt scope.
@@ -3376,7 +4235,7 @@ function createJournalStoreCore(options, getInputContext) {
             const evidence = readTelegramUpdateJournalSource({
                 directory: sourceAccess.directory, path, profile,
                 botIdentity: expectedIdentity, limits: sourceAccess.limits,
-                version: TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION,
+                version,
             });
             return evidence.kind === "present"
                 ? listTelegramUpdateJournalLegacyCustodyCandidates(evidence.file) : [];

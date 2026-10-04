@@ -68,6 +68,7 @@ export declare function createScopedModelPatternPersister(deps: {
 export declare function getExtensionContextModel(ctx: ExtensionContext): ExtensionContext["model"];
 export declare function getExtensionContextCwd(ctx: ExtensionContext): string;
 export declare function getExtensionContextSessionId(ctx: ExtensionContext): string;
+export declare function getExtensionContextSessionId(ctx: ExtensionContext | undefined): string | undefined;
 export declare function isExtensionContextIdle(ctx: ExtensionContext): boolean;
 export declare function hasExtensionContextPendingMessages(ctx: ExtensionContext): boolean;
 export declare function compactExtensionContext(ctx: ExtensionContext, callbacks: Parameters<ExtensionContext["compact"]>[0]): ReturnType<ExtensionContext["compact"]>;

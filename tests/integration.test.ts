@@ -5,7 +5,9 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -17,13 +19,14 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
 import testRoot, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import { runNodeEval } from "./fixtures/node-eval.ts";
+import * as RoutingFixture from "./fixtures/routing.ts";
 import { createTelegramActivityVerbosityRuntime } from "../lib/activity-verbosity.ts";
 import * as AgentMessages from "../lib/agent-messages.ts";
 import * as Bindings from "../lib/bindings.ts";
@@ -38,14 +41,17 @@ import * as WorkspaceAdmission from "../lib/workspace-admission.ts";
 import * as Delivery from "../lib/delivery.ts";
 import * as Routing from "../lib/routing.ts";
 import * as Threads from "../lib/threads.ts";
+import * as ThreadCleanupManager from "../lib/thread-cleanup-manager.ts";
 import * as Turns from "../lib/turns.ts";
 import * as Journal from "../lib/journal.ts";
 import * as Locks from "../lib/locks.ts";
 import * as Lifecycle from "../lib/lifecycle.ts";
+import * as Logging from "../lib/logging.ts";
 import type { ExtensionContext } from "../lib/pi.ts";
 import * as Ownership from "../lib/ownership.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Polling from "../lib/polling.ts";
+import * as Paths from "../lib/paths.ts";
 import * as Sync from "../lib/sync.ts";
 import * as Updates from "../lib/updates.ts";
 import {
@@ -68,6 +74,67 @@ function test(
 function strictFileTest(name: string, fn: RuntimeTestHandler): void {
   void testRoot(name, { concurrency: false, skip: process.platform === "win32", timeout: 5_000 }, fn);
 }
+
+for (const removedFamily of ["sessions", "snapshot-with-segments"] as const) test(
+  `Shutdown diagnostics cannot resurrect a removed journal family (${removedFamily})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-diagnostics-shutdown-"));
+    const sessions = join(dir, "sessions"), path = removedFamily === "sessions"
+      ? join(sessions, "old-session", "inbox.json") : join(dir, "inbox.json");
+    const callbacks: Array<() => void> = [], cleared: unknown[] = [];
+    const session = Lifecycle.createTelegramSessionContextStore<ExtensionContext>();
+    const ctx = { cwd: "/fixture" } as ExtensionContext;
+    session.set(ctx);
+    const journalOptions = { path, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = Journal.createTelegramUpdateJournalStore(journalOptions);
+    const update = (id: number) => ({ update_id: id, message: { message_id: id, text: "fixture" } });
+    let projections = 0, publications = 0;
+    const diagnostics = Logging.createTelegramRuntimeDiagnosticsRuntime<ExtensionContext>({
+      snapshotTimer: {
+        setTimer(callback) { callbacks.push(callback); return { unref() {} }; },
+        clearTimer(handle) { cleared.push(handle); },
+      },
+    });
+    diagnostics.bindStatus({
+      instanceId: "fixture", session, updateStatus() {},
+      getStatusState() {
+        projections += 1;
+        const cursor = journal.read().acceptedThroughUpdateId;
+        return { pollingActive: false, pendingDispatch: false, compactionInProgress: false,
+          activeToolExecutions: 0, pendingModelSwitch: false, queuedItems: [], recentRuntimeEvents: [], lastUpdateId: cursor };
+      },
+      async persistSnapshot() { publications += 1; },
+    });
+    try {
+      journal.appendBatch([update(100)], 100);
+      journal.appendBatch([update(102)], 102);
+      journal.removeCompleted([100, 102]);
+      assert.equal(journal.read().acceptedThroughUpdateId, 102);
+      diagnostics.onSessionStart();
+      diagnostics.scheduleSnapshotPersist();
+      const staleCallback = callbacks.shift()!;
+      await diagnostics.onSessionShutdown();
+      assert.equal(cleared.length, 1);
+      if (removedFamily === "sessions") await rm(sessions, { recursive: true, force: true });
+      else await rm(path);
+      // Simulate an already-dequeued timer at the exact cleanup/reseed boundary; no sleeps or removal retries.
+      staleCallback();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(projections, 0, "Retired status projection must not call the recovering journal reader");
+      assert.equal(publications, 0);
+      if (removedFamily === "sessions") assert.equal(fs.existsSync(sessions), false, "No directory recreated behind recursive rm");
+      else {
+        assert.equal(fs.existsSync(path), false, "No old cursor restored from remaining empty segments");
+        await rm(path + ".segments", { recursive: true, force: true });
+        const next = Journal.createTelegramUpdateJournalStore(journalOptions);
+        next.appendBatch([update(100)], 100);
+        assert.equal(next.read().acceptedThroughUpdateId, 100, "Fresh fixture has no predecessor cursor");
+      }
+    } finally {
+      await diagnostics.onSessionShutdown();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
 let runtimeAgentDir: string | undefined;
@@ -502,9 +569,9 @@ test("Storage reference preparation rejects historical aliases without redirecti
         assert.equal(binding.journal.read().entries[0].state, "queued");
         assert.equal(ledger.read().leases.length, 1);
         references.push({ runtimeKey: binding.runtimeKey, recoveryKey: binding.recoveryKey });
-        assert.equal(JSON.parse(binding.runtimeKey).path, join("work", "tmp", "telegram", "inbox.json"));
-        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "telegram", "inbox.json")));
-        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "telegram", "workspace-admission.json")));
+        assert.equal(JSON.parse(binding.runtimeKey).path, join("work", "tmp", "pi-telegram", "inbox.json"));
+        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "pi-telegram", "inbox.json")));
+        assert.ok(fs.existsSync(join(cwd, "work", "tmp", "pi-telegram", "workspace-admission.json")));
         const before = snapshot(root);
         const denied = /Telegram storage reference does not match its approved absolute path/;
         assert.throws(() => checked.admission.resolve().acquireAdmission({ ...leaseInput,
@@ -631,6 +698,338 @@ test("Cross-instance agent turns route in both leader and follower directions", 
     "forward:follower:follower-generation:99:Aster",
     "local:42:Birch",
   ]);
+});
+
+for (const [scenario, keepRouter, recoverCopy] of [["cold-router", false, false], ["retained-router", true, false], ["protected-restart", true, true]] as const)
+  test(`Retired historical UI protects uncertain delivery and preserves protected-attempt recovery (${scenario})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-history-ui-"));
+  const socketPath = join(dir, "recipient.sock");
+  const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:historical-ui" });
+  const sourceOptions = { path: join(dir, "source.json"), botIdentity };
+  let interruptCommit = false;
+  const source = Journal.createTelegramUpdateJournalStore({ ...sourceOptions, onPublicationBoundary(boundary, target) {
+    if (interruptCommit && boundary === "before-write" && !target.startsWith(`${sourceOptions.path}.retained`)) throw new Error("fixture interrupted source commit");
+  } });
+  const recipientJournal = Journal.createTelegramUpdateJournalStore({ path: join(dir, "recipient.json"), botIdentity });
+  const binding = Journal.createTelegramUpdateJournalBindingKey(sourceOptions);
+  const threadStore = Threads.createTelegramTopicTargetStore({ path: join(dir, "threads.json") });
+  await threadStore.load();
+  for (const [cwd, threadId, instanceId, slot] of [["/repo", 42, "leader-a", "A"], ["/other", 43, "recipient", "B"]] as const) {
+    threadStore.upsert({ profileKey: `cwd:${cwd}`, target: { chatId: 7, threadId }, status: "active",
+      instanceId, slot, createdAtMs: 1, updatedAtMs: 1 });
+  }
+  await threadStore.persist();
+  const original = { update_id: 100, message: { message_id: 12, message_thread_id: 99,
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "original accepted elsewhere" } };
+  let acknowledge!: () => void;
+  const ackGate = new Promise<void>(resolve => { acknowledge = resolve; });
+  let admitted!: () => void;
+  const admissionGate = new Promise<void>(resolve => { admitted = resolve; });
+  let forwards = 0;
+  const admission = BusFollower.createTelegramBusFollowerDurableAdmissionRuntime<string>({ journal: recipientJournal, signalWorker: () => {} });
+  const server = Bus.createTelegramBusLocalServer({ socketPath, async handleEnvelope(envelope) {
+    assert.equal(envelope.kind, "leader.forwardMessage");
+    if (envelope.kind !== "leader.forwardMessage") throw new Error("Unexpected fixture envelope");
+    forwards++;
+    const receipt = await admission.admit(envelope, "recipient-ctx");
+    admitted(); await ackGate;
+    return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result: receipt };
+  } });
+  const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder({ socketPath, createRequestId: () => "history-ui", timeoutMs: 5_000 });
+  const surfaces: Array<{ id: number; text: string; markup: unknown }> = [];
+  let copies = 0;
+  let reviewing = false;
+  const routeOptions: RoutingFixture.RouteHarnessOptions = { threadStore,
+    getAdmissionJournalBinding: () => binding, getCurrentLeaderEpoch: () => 1, isContextActive: () => true,
+    async runWorkspaceOperation(_input, operation) { return operation(); },
+    getTargetOwnership: target => target.chatId === 7 && target.threadId === 43 ? {
+      instanceId: "recipient", ownerGeneration: "recipient-generation", recipientBindingKey: "manual:recipient",
+      protocolIdentity: Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture",
+        capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] }),
+    } : undefined,
+    foreignOwnedUpdateForwarder: forwarder,
+    async editInteractiveMessage(_chat, id, text, _mode, markup) { surfaces.push({ id, text, markup }); },
+    async callApi() { assert.equal(reviewing, false, "Stopping the source must not probe/create/delete a Thread"); return true as never; },
+    async deleteMessage() { assert.fail("Stopping the source must not delete Telegram messages"); },
+  };
+  let harness = RoutingFixture.createRouteHarness(routeOptions);
+  const completed: number[] = [];
+  const executed: number[] = [];
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<RoutingFixture.TestUpdate & Journal.TelegramJournaledUpdate, RoutingFixture.TestContext>({
+    journal: { ...source, abandonPending(input) {
+      copies++; return source.abandonPending(input);
+    } },
+    getJournalBindingKey: () => binding, hasAuthority: () => true,
+    shouldReviewHistoricalInput: (entry, ctx, signal) => harness.routeRuntime.shouldReviewHistoricalInput(entry, ctx, signal),
+    async defaultHandle(update, ctx, execution) { executed.push(update.update_id); await harness.routeRuntime.handleUpdate(update, ctx, execution); },
+    onUpdateCompleted: id => { completed.push(id); },
+  });
+  let nextId = 101;
+  const appendClick = (data: string, messageId = 500, threadId = 42) => {
+    source.appendBatch([{ update_id: nextId++, callback_query: { id: `history-${nextId}`, from: { id: 7, is_bot: false }, data,
+      message: { message_id: messageId, message_thread_id: threadId, chat: { id: 7, type: "private" } } } }]);
+    worker.signal();
+  };
+  const click = async (data: string, messageId = 500, threadId = 42) => { appendClick(data, messageId, threadId); await worker.waitForDrain(); };
+  const action = (suffix: string) => {
+    const data = JSON.stringify(surfaces.at(-1)?.markup).match(new RegExp(`reroutecancel:(?:history|review):[a-z0-9]+:${suffix}`))?.[0];
+    assert.ok(data, `Expected ${suffix}: ${surfaces.at(-1)?.text}`); return data;
+  };
+  try {
+    await server.start();
+    worker.start({ cwd: "/repo" }); await worker.waitForDrain();
+    source.appendBatch([original]); worker.signal(); await worker.waitForDrain();
+    const entry = structuredClone(source.read().entries[0]!);
+    assert.ok(harness.events.some(event => event.includes("reroutecancel:1")),
+      `Fresh original starts with an ordinary chooser: ${JSON.stringify({ events: harness.events, state: worker.getState(), records: threadStore.list() })}`);
+    appendClick("reroute:1:43", 99, 99);
+    await Promise.race([admissionGate, worker.waitForDrain().then(() => { assert.fail("Selection did not reach durable follower admission"); })]);
+    assert.deepEqual(source.read().entries.find(item => item.updateId === 100), entry);
+    const acceptedRecipient = structuredClone(recipientJournal.read());
+    assert.equal(acceptedRecipient.entries.length, 1);
+    const stopping = worker.stop(); acknowledge(); await stopping;
+    assert.deepEqual(source.read().entries.find(item => item.updateId === 100), entry, "Late ACK cannot complete a revoked source");
+    if (!keepRouter) harness = RoutingFixture.createRouteHarness(routeOptions);
+    if (recoverCopy) {
+      // Supplied precondition: an interrupted retention attempt exists before replacement startup; no retired UI action grants it.
+      interruptCommit = true;
+      try { assert.throws(() => source.abandonPending({ journalBindingKey: binding, entry,
+        operatorAuthorityId: "telegram-owner:7", isCurrent: () => true }), /journal mutation failed/); }
+      finally { interruptCommit = false; }
+      assert.ok(source.inspectPendingRetention(entry));
+    }
+    reviewing = true;
+    worker.start({ cwd: "/repo" }); await worker.waitForDrain();
+    assert.equal(worker.getState().historicalClaimCount ?? 0, recoverCopy ? 0 : 1);
+    assert.equal(worker.getState().abandoningClaimCount ?? 0, recoverCopy ? 1 : 0);
+    assert.equal(forwards, 1, "Startup and stale queued chooser callbacks cannot forward again");
+    await click("reroutecancel:1", 99, 99);
+    assert.equal(copies, 0, "The stronger ordinary cancellation contract stays unavailable");
+    const priorSurfaceCount = surfaces.length;
+    for (const suffix of ["open", "nonce:choose:0", "nonce:confirm:0", "nonce:retry:0", "nonce:text", "nonce:list", "nonce:refresh", "nonce:more"]) {
+      await click(`reroutecancel:history:${suffix}`);
+      assert.match(harness.events.filter(value => value.startsWith("answer:")).at(-1)!, /no longer available/);
+      assert.deepEqual(source.read().entries.find(item => item.updateId === 100), entry);
+      assert.equal(copies, 0);
+      assert.equal(surfaces.length, priorSurfaceCount, "Retired callbacks cannot recreate the submenu");
+    }
+    if (recoverCopy) {
+      await click("reroutecancel:review:open");
+      assert.match(surfaces.at(-1)!.text, /previously accepted work may continue/);
+      await click(action("retry:0"));
+      assert.equal(copies, 1);
+      const retained = source.inspectPendingRetention(entry)!;
+      assert.deepEqual(JSON.parse(await readFile(retained.retainedPath, "utf8")).entry, entry);
+    }
+    assert.equal(source.read().entries.some(item => item.updateId === 100), !recoverCopy);
+    assert.deepEqual(recipientJournal.read(), acceptedRecipient, "Retired UI and protected recovery cannot change independently accepted custody");
+    assert.equal(completed.includes(100), false, "Source abandonment must never fabricate task completion");
+    assert.equal(executed.filter(id => id === 100).length, 1);
+    assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
+    assert.deepEqual(source.appendBatch([original]).duplicateUpdateIds, [100]);
+    if (recoverCopy) assert.ok(surfaces.some(surface => surface.id === 99 && surface.text.includes("⛔️ Routing cancelled.")), "Protected recovery retires the obsolete chooser");
+    await click("reroute:1:43", 99, 99); assert.equal(forwards, 1);
+    const recipientExecutions: number[] = [];
+    const recipient = Updates.createTelegramUpdateWorkerRuntime<string>({ journal: recipientJournal, hasAuthority: () => true,
+      executeUpdate(update) { recipientExecutions.push(update.update_id); return { kind: "complete" }; } });
+    try {
+      recipient.start("recipient-ctx"); await recipient.waitForDrain();
+      assert.deepEqual(recipientExecutions, [100], "Already accepted work still executes independently from source UI");
+    } finally { await recipient.stop(); }
+  } finally {
+    acknowledge(); await worker.stop(); await server.stop(); await rm(dir, { recursive: true, force: true });
+  }
+}, 15_000);
+
+for (const source of ["fresh", "adopted"] as const) {
+  test(`Generic follower delivery acknowledges repeated pending or completed input without re-execution (${source})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-completed-delivery-"));
+    const recipientBindingKey = "manual:recipient", sessionId = "session-b", updateId = 44;
+    const config = Config.createTelegramConfigStore({ agentDir: dir });
+    const bindingRuntime = Journal.createTelegramUpdateJournalBindingRuntime({
+      base: { getProfileName: () => "work", getBotToken: () => "fixture:completed-delivery", getBotId: () => 7,
+        withSourceSerialization: config.withSourceSerialization },
+      getRuntimeDir: () => Paths.resolveTelegramTempDir(dir),
+      getLeaderJournalPath: () => Paths.resolveTelegramSessionPollingJournalPath(sessionId, dir, "work"),
+      getFollowerJournalPath: (key, profile, id) => Paths.resolveTelegramSessionJournalPath(id!, key, dir, profile),
+      getActiveFollowerBindingKey: () => recipientBindingKey, getActiveFollowerSessionId: () => sessionId,
+      isFollowerRegistered: () => true,
+    });
+    // Registration/readiness are supplied preconditions; this witness does not drive the Pi session gateway.
+    const binding = bindingRuntime.resolveActive()!;
+    const message = { message_id: 12, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+      text: "completed-delivery fixture", pi_telegram_source_update_id: updateId };
+    const predecessor = source === "adopted" ? bindingRuntime.createRecipientResolver(recipientBindingKey, "session-a")()! : undefined;
+    // Production admission resolves the active recipient journal on each call; the adopted case starts in its predecessor.
+    let admissionJournal = predecessor?.journal ?? binding.journal;
+    const executed: number[] = [];
+    const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<Updates.TelegramUpdateFlow & Journal.TelegramJournaledUpdate, string>({
+      journal: binding.journal, getJournalBindingKey: () => binding.recoveryKey, hasAuthority: () => true,
+      isContextCurrent: ctx => ctx === "recipient-ctx",
+      async defaultHandle(update) { executed.push(update.update_id); },
+    });
+    const admissions: Array<ReturnType<typeof binding.journal.appendBatch>> = [];
+    const socketPath = Bus.getTelegramBusFollowerSocketPath("recipient", dir);
+    const receiver = BusFollower.createTelegramBusForwardedUpdateReceiverRuntime({
+      socketPath, instanceId: "recipient", getAuthSecret: () => "fixture-secret",
+      getRegistrationGeneration: () => "registration-b", getRecipientBindingKey: () => recipientBindingKey,
+      getContext: () => "recipient-ctx",
+      durableAdmission: BusFollower.createTelegramBusFollowerDurableAdmissionRuntime({
+        journal: { appendBatch(updates) {
+          const result = admissionJournal.appendBatch(updates); admissions.push(result); return result;
+        } }, signalWorker: () => worker.signal(),
+      }),
+    });
+    const delivery = Bus.createTelegramBusFollowerDeliveryIdentity({ kind: "leader.forwardMessage", recipientBindingKey, sourceUpdateId: updateId });
+    const send = async (requestId: string) => {
+      const ack = await Bus.sendTelegramBusLocalEnvelope({ socketPath, envelope: {
+        kind: "leader.forwardMessage", requestId, auth: "fixture-secret", recipientInstanceId: "recipient",
+        recipientRegistrationGeneration: "registration-b", delivery, message, sentAtMs: 1,
+      } });
+      assert.equal(ack?.kind, "bus.ack");
+      if (ack?.kind !== "bus.ack") throw new Error("missing fixture delivery ACK");
+      assert.equal(ack.ok, true, ack.message);
+      assert.deepEqual(ack.result, { deliveryId: delivery.deliveryId, sourceUpdateId: updateId });
+    };
+    try {
+      await receiver.start();
+      await send("initial-request");
+      if (predecessor) {
+        assert.deepEqual(bindingRuntime.adoptPredecessorPending({ recipientBindingKey,
+          predecessorSessionId: "session-a", successorSessionId: sessionId, isCurrent: () => true }),
+        { adoptedUpdateIds: [updateId], retainedUpdateIds: [] });
+        assert.ok(predecessor.journal.inspectAbandonedPending(updateId), "adoption privately commits away its predecessor");
+        assert.deepEqual(predecessor.journal.read().entries, []);
+        admissionJournal = binding.journal;
+      }
+      await send("pending-retry");
+      assert.deepEqual(binding.journal.read().entries.map(entry => [entry.updateId, entry.state]), [[updateId, "pending"]]);
+      assert.deepEqual(admissions.map(result => result.addedUpdateIds), [[updateId]], "a pending retry is acknowledged without another append");
+      assert.deepEqual(executed, [], "durable admission ACKs before the paused worker executes");
+      worker.start("recipient-ctx"); await worker.waitForDrain();
+      assert.deepEqual(executed, [updateId]);
+      assert.deepEqual(binding.journal.read().entries, [], "real worker completion removes recipient custody");
+      // A fresh RPC request carries the same delivery/source identity, bypassing only the transport request cache.
+      await send("completed-retry"); await worker.waitForDrain();
+      assert.equal(admissions.length, 1, "a completed retry is acknowledged from the bounded delivery window");
+      assert.deepEqual(executed, [updateId], "the handler does not run again after completion");
+      assert.deepEqual(binding.journal.read().entries, []);
+    } finally { await worker.stop(); await receiver.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Historical pending source alone cannot prove no follower acceptance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-historical-pending-"));
+  const socketPath = join(dir, "recipient.sock");
+  const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:historical-fixture" });
+  const sourcePath = join(dir, "source.json");
+  const sourceJournal = Journal.createTelegramUpdateJournalStore({ path: sourcePath, botIdentity });
+  const recipientJournal = Journal.createTelegramUpdateJournalStore({ path: join(dir, "recipient.json"), botIdentity });
+  const original = { update_id: 100, message: {
+    message_id: 9, message_thread_id: 11, chat: { id: 7, type: "private" },
+    from: { id: 7, is_bot: false }, text: "historical original",
+    reply_to_message: { message_id: 11, forum_topic_created: { name: "Fixture", icon_color: 0 } },
+  } };
+  sourceJournal.appendBatch([original]);
+  const beforeForward = structuredClone(sourceJournal.read());
+  let acknowledge!: () => void;
+  const acknowledgementGate = new Promise<void>((resolve) => { acknowledge = resolve; });
+  let admitted!: () => void;
+  const admittedGate = new Promise<void>((resolve) => { admitted = resolve; });
+  const durableAdmission = BusFollower.createTelegramBusFollowerDurableAdmissionRuntime<string>({
+    journal: recipientJournal, signalWorker: () => {},
+  });
+  const server = Bus.createTelegramBusLocalServer({
+    socketPath,
+    async handleEnvelope(envelope) {
+      if (envelope.kind !== "leader.forwardMessage") throw new Error("Unexpected fixture envelope");
+      const receipt = await durableAdmission.admit(envelope, "recipient-ctx");
+      admitted();
+      await acknowledgementGate;
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result: receipt };
+    },
+  });
+  const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder({
+    socketPath, createRequestId: () => "historical:1", timeoutMs: 10_000,
+  });
+  const worker = Updates.createTelegramUpdateWorkerRuntime<string>({
+    journal: sourceJournal, hasAuthority: () => true,
+    async executeUpdate(update) {
+      // Legacy selection/forwarding intent is not published in the source entry.
+      const settlement = await forwarder.forwardMessage({
+        message: { ...original.message, pi_telegram_source_update_id: update.update_id },
+        ownership: { instanceId: "recipient", ownerGeneration: "generation-1", recipientBindingKey: "manual:recipient" },
+        ctx: "source-ctx",
+      });
+      assert.equal(settlement.status, "accepted");
+      return { kind: "complete" };
+    },
+  });
+  try {
+    await server.start();
+    worker.start("source-ctx");
+    await Promise.race([admittedGate, worker.waitForDrain().then(() => {
+      assert.fail("Forwarding ended before the recipient admission gate");
+    })]);
+    assert.equal(recipientJournal.read().entries.length, 1, "Recipient already holds durable accepted input");
+    assert.deepEqual(sourceJournal.read(), beforeForward,
+      "Unforwarded and accepted-without-ACK histories have identical source journal evidence");
+    const stopping = worker.stop();
+    acknowledge();
+    await stopping;
+    const reopened = Journal.createTelegramUpdateJournalStore({ path: sourcePath, botIdentity }).read();
+    assert.deepEqual(reopened, beforeForward, "Revoked source generation cannot publish late completion");
+    const entry = reopened.entries[0]!;
+    assert.equal(entry.state, "pending");
+    assert.equal(entry.queueReceiptId, undefined);
+    assert.equal(entry.queueOwner, undefined);
+    assert.equal(entry.inputClaim, undefined);
+    assert.equal(entry.inputProvenance, undefined);
+    assert.equal(recipientJournal.read().entries.length, 1, "Recipient authority survives source shutdown");
+    const acceptedRecipient = structuredClone(recipientJournal.read());
+    const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey({ path: sourcePath, botIdentity });
+    const completed: number[] = [];
+    let carrier: unknown;
+    const recovery = Updates.createTelegramUpdateAdmissionWorkerRuntime<Updates.TelegramUpdateFlow & Journal.TelegramJournaledUpdate, string>({
+      journal: sourceJournal, getJournalBindingKey: () => journalBindingKey, hasAuthority: () => true,
+      shouldReviewHistoricalInput: candidate => candidate.updateId === original.update_id,
+      onUpdateCompleted: id => { completed.push(id); },
+      async defaultHandle(update) {
+        assert.equal(update.update_id, 101, "Historical input must not be delivered a second time");
+        carrier = update.callback_query;
+      },
+    });
+    try {
+      sourceJournal.appendBatch([{ update_id: 101, callback_query: { id: "owner-review", from: { id: 7, is_bot: false },
+        message: { message_id: 20, chat: { id: 7, type: "private" } } } }]);
+      recovery.start("recovery-ctx");
+      await recovery.waitForDrain();
+      const page = Updates.inspectTelegramHistoricalInputs(carrier, { journalBindingKey, isCurrent: () => true });
+      assert.equal(page?.sources.length, 1);
+      const result = page!.sources[0]!.retry({ operatorAuthorityId: "owner:7", isCurrent: () => true });
+      assert.ok(result);
+      assert.deepEqual(JSON.parse(await readFile(result.retainedPath, "utf8")).entry, entry);
+      assert.deepEqual(sourceJournal.read().entries, []);
+      assert.deepEqual(recipientJournal.read(), acceptedRecipient, "Source-only stopping does not revoke independently accepted recipient custody");
+      assert.deepEqual(completed, [101], "Stopping the original is not task completion");
+      assert.deepEqual(sourceJournal.appendBatch([original]).duplicateUpdateIds, [100]);
+      const recipientExecutions: number[] = [];
+      const recipient = Updates.createTelegramUpdateWorkerRuntime<string>({
+        journal: recipientJournal, hasAuthority: () => true,
+        executeUpdate(update) { recipientExecutions.push(update.update_id); return { kind: "complete" }; },
+      });
+      try {
+        recipient.start("recipient-ctx");
+        await recipient.waitForDrain();
+        assert.deepEqual(recipientExecutions, [100], "Already accepted recipient work can still execute independently");
+      } finally { await recipient.stop(); }
+    } finally { await recovery.stop(); }
+  } finally {
+    acknowledge();
+    await worker.stop();
+    await server.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 for (const scenario of [
@@ -875,7 +1274,7 @@ async function getRuntimeIntegrationDiagnostics(
   methods: Array<{ method: string; body?: Record<string, unknown> }>,
 ): Promise<string> {
   const agentDir = await ensureRuntimeAgentDir();
-  const runtimeDir = join(agentDir, "tmp", "telegram");
+  const runtimeDir = join(agentDir, "tmp", "pi-telegram");
   const readOptional = async (path: string) => {
     try {
       return await readFile(path, "utf8");
@@ -883,11 +1282,11 @@ async function getRuntimeIntegrationDiagnostics(
       return `<unavailable: ${error instanceof Error ? error.message : String(error)}>`;
     }
   };
-  const [state, logs, ownersText] = await Promise.all([
+  const [state, logs] = await Promise.all([
     readOptional(join(runtimeDir, "state.json")),
     readOptional(join(runtimeDir, "logs.jsonl")),
-    readOptional(join(runtimeDir, "owners.json")),
   ]);
+  const ownersText = await readRuntimeTelegramLocks().then(value => JSON.stringify(value), error => String(error));
   let owner: Record<string, unknown> | string = ownersText;
   try {
     const parsed = JSON.parse(ownersText) as Record<string, Record<string, unknown>>;
@@ -934,11 +1333,11 @@ async function createRuntimeTelegramConfigFixture() {
   return {
     write: async (config: Record<string, unknown>) => {
       await mkdir(agentDir, { recursive: true });
-      const telegramTempDir = join(agentDir, "tmp", "telegram");
+      const telegramTempDir = join(agentDir, "tmp", "pi-telegram");
       const tempEntries = await readdir(telegramTempDir).catch(() => []);
       await Promise.all(
         tempEntries
-          .filter((entry) => entry.startsWith("inbox"))
+          .filter((entry) => entry.startsWith("inbox") || entry === "sessions")
           .map((entry) =>
             rm(join(telegramTempDir, entry), {
               recursive: true,
@@ -978,44 +1377,74 @@ async function createRuntimeTelegramConfigFixture() {
   };
 }
 
+/** Fixture-only replacement of every profile's consolidated transport section; sibling sections stay intact. */
 async function writeRuntimeTelegramLocks(
   locks: Record<string, unknown>,
 ): Promise<void> {
   const agentDir = await ensureRuntimeAgentDir();
-  const telegramRuntimeDir = join(agentDir, "tmp", "telegram");
+  const telegramRuntimeDir = join(agentDir, "tmp", "pi-telegram");
   await mkdir(telegramRuntimeDir, { recursive: true });
-  await writeFile(
-    join(telegramRuntimeDir, "owners.json"),
-    JSON.stringify(locks, null, "\t") + "\n",
-    "utf8",
-  );
+  const path = join(telegramRuntimeDir, "state.json");
+  const state = Locks.readTelegramRuntimeState(path);
+  const profiles: Record<string, Record<string, unknown>> = {};
+  for (const [profile, sections] of Object.entries(state.profiles)) {
+    const { transport: _transport, ...rest } = sections as Record<string, unknown>;
+    if (Object.keys(rest).length) profiles[profile] = rest;
+  }
+  for (const [profile, transport] of Object.entries(locks)) profiles[profile] = { ...profiles[profile], transport };
+  await writeFile(path, JSON.stringify({ version: 2, profiles }, null, "\t") + "\n", { encoding: "utf8", mode: 0o600 });
+  await chmod(path, 0o600);
+}
+
+/** Fixture Workspace writer: a temporary exact transport owner publishes, then releases before the extension starts. */
+async function createRuntimeSeedWorkspaceStore(): Promise<{ threads: Threads.TelegramTopicTargetStore; release: () => Promise<void> }> {
+  const path = join(await ensureRuntimeAgentDir(), "tmp", "pi-telegram", "state.json");
+  const transports = await readRuntimeTelegramLocks();
+  const owner = Locks.createTelegramLockRuntime<{ cwd: string }>({ statePath: path, key: () => "default", pid: process.pid,
+    instanceId: "fixture-workspace-seed", runtimeGeneration: 1, isProcessAlive: () => true });
+  assert.equal(owner.acquire({ cwd: "/fixture-workspace-seed" }).ok, true);
+  let released = false;
+  const threads = Threads.createTelegramTopicTargetStore({ path, canPersist: () => !released && owner.owns(),
+    consolidated: {
+      captureAuthority() {
+        const epoch = released ? undefined : owner.getOwnedLeaderEpoch();
+        return epoch === undefined ? undefined : () => !released && owner.owns() && owner.getOwnedLeaderEpoch() === epoch;
+      },
+      publishIfOwned: owner.publishStateSectionIfOwned!,
+    } });
+  await threads.load();
+  // Restore the exact prior transport sections so the seed owner leaves no previous-leader evidence.
+  return { threads, async release() { if (!released) { released = true; owner.release(); await writeRuntimeTelegramLocks(transports); } } };
+}
+
+/** Read-only consolidated Workspace view for assertions; it can never publish. */
+function createRuntimeWorkspaceReader(path: string): Threads.TelegramTopicTargetStore {
+  return Threads.createTelegramTopicTargetStore({ path,
+    consolidated: { captureAuthority: () => undefined, publishIfOwned: () => ({ committed: false }) } });
+}
+
+async function readRuntimeTelegramLocks(): Promise<Record<string, Record<string, unknown>>> {
+  const state = Locks.readTelegramRuntimeState(join(await ensureRuntimeAgentDir(), "tmp", "pi-telegram", "state.json"));
+  return Object.fromEntries(Object.entries(state.profiles).filter(([, sections]) => sections.transport !== undefined)
+    .map(([profile, sections]) => [profile, sections.transport as Record<string, unknown>]));
 }
 
 async function stageRuntimeV02712Artifacts(): Promise<string | undefined> {
   const agentDir = await ensureRuntimeAgentDir();
-  const telegramRuntimeDir = join(agentDir, "tmp", "telegram");
+  const telegramRuntimeDir = join(agentDir, "tmp", "pi-telegram");
   await mkdir(telegramRuntimeDir, { recursive: true });
-  await writeFile(
-    join(telegramRuntimeDir, "state.json"),
-    `${JSON.stringify({
-      version: 1,
-      source: "snapshot",
-      writtenAtMs: 0,
-      bot: { threadMode: "enabled" },
-      identities: [],
-      reservations: [],
-      pendingProvisions: [],
-      pendingCleanups: [],
-      syncObservations: [],
-      threads: [],
-    })}\n`,
-    "utf8",
-  );
+  // Start from a clean consolidated state, as a fresh root after upgrading from `tmp/telegram`.
+  await rm(join(telegramRuntimeDir, "state.json"), { force: true });
+  const seed = await createRuntimeSeedWorkspaceStore();
+  seed.threads.setBotState({ threadMode: "enabled" });
+  await seed.threads.persist();
+  await seed.release();
   if (process.platform === "win32") return undefined;
   const busPath = Bus.resolveTelegramBusSocketPath(
-    Bus.getTelegramBusSocketPath(agentDir, process.platform),
+    Bus.getTelegramBusSocketPath(agentDir, process.platform, undefined, "consolidated"),
     process.platform,
   );
+  await mkdir(dirname(busPath), { recursive: true, mode: 0o700 });
   await rm(busPath, { force: true });
   await symlink(".pt-v02712-missing.sock", busPath);
   return busPath;
@@ -1450,7 +1879,7 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
     await writeRuntimeTelegramLocks({});
     const legacyBusPath = await stageRuntimeV02712Artifacts();
     const runtimeAgentPath = await ensureRuntimeAgentDir();
-    const journalPath = join(runtimeAgentPath, "tmp", "telegram", "inbox.json");
+    const journalPath = join(runtimeAgentPath, "tmp", "pi-telegram", "inbox.json");
     const journal = Journal.createTelegramUpdateJournalStore({
       path: journalPath,
       botIdentity: Journal.createTelegramUpdateJournalBotIdentity({
@@ -1505,9 +1934,8 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
     );
 
     const agentDir = await ensureRuntimeAgentDir();
-    const ownersAfterQuit = JSON.parse(
-      await readFile(join(agentDir, "tmp", "telegram", "owners.json"), "utf8"),
-    ) as Record<string, { pid?: number; cwd?: string }>;
+    void agentDir;
+    const ownersAfterQuit = await readRuntimeTelegramLocks() as Record<string, { pid?: number; cwd?: string }>;
     assert.equal(ownersAfterQuit.default?.pid, process.pid);
     assert.equal(ownersAfterQuit.default?.cwd, "/repo/graceful-leader");
 
@@ -1545,6 +1973,134 @@ test("v0.27.12 artifacts and graceful tab cleanup preserve same-directory auto-c
   }
 }, 60_000);
 
+for (const siblingTiming of ["none", "startup", "live", "retry"] as const) test(`Production startup spends previous-process Restore originals without delivery even after their Thread becomes bound (sibling=${siblingTiming})`, async () => {
+  const withSibling = siblingTiming !== "none", siblingUpdateId = siblingTiming === "live" ? 103 : 99;
+  const config = await createRuntimeTelegramConfigFixture();
+  const agentDir = await ensureRuntimeAgentDir();
+  const dir = join(agentDir, "tmp", "pi-telegram");
+  const dispatched: RuntimeHarnessMessage[] = [];
+  const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: content => dispatched.push(content) });
+  const ctx = createRuntimeExtensionContext({ cwd: "/repo/restore-held",
+    sessionManager: { getSessionId: () => "restore-held-session", getEntries: () => [] },
+    modelRegistry: { refresh() {}, getAvailable: () => [], isUsingOAuth: () => false },
+    getContextUsage: () => undefined });
+  const methods: string[] = [];
+  const messages: unknown[] = [];
+  let polls = 0, releaseLiveSibling: (() => void) | undefined;
+  const liveSiblingGate = new Promise<void>(resolve => { releaseLiveSibling = resolve; });
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    methods.push(method);
+    if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, has_topics_enabled: true });
+    if (method === "sendMessage") {
+      messages.push(JSON.parse(String(init?.body)));
+      return createRuntimeTelegramApiResponse({ message_id: 500 + messages.length });
+    }
+    if (method === "getUpdates") {
+      if (++polls === 1) return createRuntimeTelegramApiResponse([{ update_id: 102, message: { message_id: 102, date: 1,
+        chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Owner" },
+        message_thread_id: 42, text: "/start" } }]);
+      if (polls === 2 && siblingTiming === "live") {
+        // Wait for a normal command to finish: this source cannot belong to the worker's startup census.
+        await liveSiblingGate;
+        return createRuntimeTelegramApiResponse([{ update_id: siblingUpdateId, message: { message_id: siblingUpdateId, date: 1,
+          chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Owner" },
+          message_thread_id: 42, text: "/start" } },
+          { update_id: 104, message: { message_id: 104, date: 1, chat: { id: 77, type: "private" },
+            from: { id: 77, is_bot: false, first_name: "Owner" }, message_thread_id: 42, text: "/start" } }]);
+      }
+      return await new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) reject(new DOMException("stop", "AbortError"));
+        else init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError")), { once: true });
+      });
+    }
+    if (["deleteWebhook", "setMyCommands", "sendMessage", "editForumTopic", "sendChatAction"].includes(method)) {
+      return createRuntimeTelegramApiResponse(true);
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await config.write({ botToken: "123:abc", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } });
+    await writeRuntimeTelegramLocks({});
+    await stageRuntimeV02712Artifacts();
+    const seed = await createRuntimeSeedWorkspaceStore();
+    const threads = seed.threads;
+    const binding = { ...Threads.createTelegramWorkspaceBindingIdentity(ctx.cwd, 0, ctx.sessionManager.getSessionId())!,
+      slot: "A", threadName: "Atlas", target: { chatId: 77, threadId: 10 }, updatedAtMs: 1 };
+    const owner = { profileKey: `cwd:${ctx.cwd}`, slot: "A", threadName: "Atlas", instanceId: "former",
+      owner: { kind: "leader" as const, cwd: ctx.cwd, instanceId: "former" }, target: binding.target,
+      status: "active" as const, createdAtMs: 1, updatedAtMs: 1 };
+    threads.upsert(owner);
+    threads.upsertWorkspaceBinding(binding);
+    await threads.persist();
+    const journalOptions = { path: join(dir, "inbox.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:abc", botId: 123 }) };
+    const journal = Journal.createTelegramUpdateJournalStore(journalOptions);
+    journal.appendBatch([...(siblingTiming === "startup" || siblingTiming === "retry" ? [{ update_id: siblingUpdateId, message: { message_id: siblingUpdateId, date: 1,
+      chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Owner" },
+      message_thread_id: 42, text: siblingTiming === "retry" ? "/start" : "held temporary-tab sibling" } }] : []), { update_id: 100, message: { message_id: 100, date: 1,
+      chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Owner" },
+      message_thread_id: 42, text: "held Restore original" } }], 100);
+    if (siblingTiming === "retry") journal.markExecutionFailure({ updateId: siblingUpdateId, expectedAttemptCount: 0,
+      failedAtMs: 1, nextRetryAtMs: 2, failureClass: "fixture", summary: "interrupted sibling execution", disposition: "retry-wait" });
+    const resolve = Threads.createTelegramWorkspaceRestoreResolver({ agentDir, getProfileName: () => undefined,
+      getBotToken: () => "123:abc", threadStore: threads });
+    const store = resolve()!;
+    await threads.load();
+    const request = { operationId: "interrupted-restore", binding: threads.listWorkspaceBindings()[0]!,
+      owner: threads.list()[0]!, target: { chatId: 77, threadId: 42 },
+      source: { journalBindingKey: Journal.createTelegramUpdateJournalBindingKey(journalOptions), updateIds: [100] } };
+    if (withSibling) {
+      const temporaryAuthority = { executor: { instanceId: "former", leaderEpoch: "previous" }, operatorUserId: 77, isCurrent: () => true };
+      const entry = store.acknowledgeTemporaryThread(store.reserveTemporaryThread({ journalBindingKey: request.source.journalBindingKey, updateId: 100 }, "a".repeat(32), temporaryAuthority)!.entry,
+        { chatId: 77, threadId: 42 }, temporaryAuthority)!;
+      assert.ok(store.recordTemporaryThreadInput(entry, { journalBindingKey: request.source.journalBindingKey, updateIds: [siblingUpdateId] }, temporaryAuthority));
+    }
+    const relocated = await store.commit(request, { executor: { instanceId: "former", leaderEpoch: "previous" },
+      operatorUserId: 77, isCurrent: () => true });
+    assert.equal(relocated?.phase, "relocated", JSON.stringify({ request, intents: store.list(),
+      bindings: threads.listWorkspaceBindings(), records: threads.list() }));
+    await seed.release();
+    (await getRuntimeTelegramExtension())(pi);
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("telegram-connect")?.handler("", ctx);
+    try {
+      await waitForCondition(() => messages.some(message => JSON.stringify(message).includes("menu:model")), 10_000);
+    } catch (error) {
+      throw new Error(`${String(error)}\n${JSON.stringify({ methods, messages, dispatched })}\n${await readFile(join(dir, "logs.jsonl"), "utf8")}`);
+    }
+    if (siblingTiming === "live") {
+      releaseLiveSibling!();
+      await waitForCondition(() => messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2, 10_000);
+    }
+    assert.deepEqual(dispatched, []);
+    assert.doesNotMatch(JSON.stringify(messages), /Historical inputs|reroutecancel:history:/);
+    assert.equal(journal.read().entries.some(entry => entry.updateId === 100), false, "the new-world restart spends the previous Restore original");
+    assert.equal(journal.inspectAbandonedPending(100), undefined, "spending writes no private copy or tombstone");
+    if (withSibling) {
+      // A startup pending sibling is spent and retry-wait keeps its hold. A live arrival races forgetting: held while the
+      // previous temporary entry exists, then an ordinary command of the now-bound tab. Never a private cancellation.
+      const siblingState = journal.read().entries.find(entry => entry.updateId === siblingUpdateId)?.state;
+      if (siblingTiming === "live") assert.ok(siblingState === undefined || siblingState === "pending", String(siblingState));
+      else assert.equal(siblingState, siblingTiming === "startup" ? undefined : "retry-wait");
+      assert.equal(journal.inspectAbandonedPending(siblingUpdateId), undefined, "neither spending nor a hold is private cancellation");
+    }
+    // The new world forgets the previous Restore and temporary entry; the restored tab stays bound and is never deleted.
+    await waitForCondition(() => store.list().length === 0 && store.listTemporaryThreads().length === 0, 10_000);
+    if (siblingTiming === "live") assert.ok(messages.filter(message => JSON.stringify(message).includes("menu:model")).length >= 2);
+    await threads.load();
+    assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.target.threadId, 42);
+    assert.equal(threads.listWorkspaceBindings().find(value => value.bindingKey === binding.bindingKey)?.slot, "A");
+    assert.equal(methods.includes("createForumTopic"), false);
+    assert.equal(methods.includes("deleteForumTopic"), false);
+  } finally {
+    releaseLiveSibling?.();
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    await rm(join(dir, "state.json"), { force: true });
+    restoreFetch();
+    await config.restore();
+  }
+}, 20_000);
+
 test("Graceful preserved leader quit publishes inactivity and restores its intact Workspace", async () => {
   const config = await createRuntimeTelegramConfigFixture();
   const { handlers, commands, pi } = createRuntimePiHarness();
@@ -1572,9 +2128,9 @@ test("Graceful preserved leader quit publishes inactivity and restores its intac
     (await getRuntimeTelegramExtension())(pi);
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
-    const dir = join(await ensureRuntimeAgentDir(), "tmp", "telegram");
+    const dir = join(await ensureRuntimeAgentDir(), "tmp", "pi-telegram");
     await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
-    const saved = Threads.createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    const saved = createRuntimeWorkspaceReader(join(dir, "state.json"));
     await saved.load();
     assert.equal(saved.list().length, 0);
     const binding = saved.listWorkspaceBindings()[0]!;
@@ -1582,7 +2138,7 @@ test("Graceful preserved leader quit publishes inactivity and restores its intac
     assert.equal(binding.target.threadId, 42);
     assert.equal(typeof binding.inactiveSinceMs, "number");
     assert.equal(saved.listSyncObservations().some((entry) => entry.syncStatus === "deleted"), false);
-    const owners = JSON.parse(await readFile(join(dir, "owners.json"), "utf8"));
+    const owners = await readRuntimeTelegramLocks();
     assert.equal(owners.default?.pid, process.pid);
     assert.equal(owners.default?.cwd, ctx.cwd);
     assert.equal(methods.includes("deleteForumTopic"), false);
@@ -1673,14 +2229,16 @@ test("Bare connect followed immediately by resume starts the destination through
         threads: { automaticCleanup: false } });
       await writeRuntimeTelegramLocks({});
       await stageRuntimeV02712Artifacts();
-      const path = join(await ensureRuntimeAgentDir(), "tmp", "telegram", "state.json");
-      const store = Threads.createTelegramTopicTargetStore({ path });
-      await store.load();
+      const path = join(await ensureRuntimeAgentDir(), "tmp", "pi-telegram", "state.json");
+      const seed = await createRuntimeSeedWorkspaceStore();
+      const store = seed.threads;
       store.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity(cwd, 0, sourceManager.getSessionId())!,
         slot: "A", threadName: "Atlas", target: { chatId: 77, threadId: 41 }, updatedAtMs: 1 });
       if (remembered) store.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity(cwd, 0, "destination")!,
         slot: "B", threadName: "Birch", target: { chatId: 77, threadId: 42 }, updatedAtMs: 1 });
       await store.persist();
+      await seed.release();
+      void path;
       const extension = await getRuntimeTelegramExtension();
       extension(source.pi);
       await source.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
@@ -2310,6 +2868,487 @@ test("Leader transport coalesces matching direct and follower chat actions", asy
   assert.deepEqual(await Promise.all([direct, follower]), [true, true]);
 });
 
+for (const drift of ["none", "context", "generation", "epoch", "owner", "profile", "path", "canonical"] as const) {
+  test(`Native section owners compose Restore, nonleader admission and queued projection (${drift})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pt-section-owners-")), path = Paths.resolveTelegramStatePath(dir);
+    const scope = { path, profile: "default" }, ctx = { cwd: "/section-owner" };
+    const sessions = Lifecycle.createTelegramSessionContextStore<typeof ctx>();
+    sessions.set(ctx);
+    const lock = Locks.createTelegramLockRuntime<typeof ctx>({ statePath: path, key: () => scope.profile,
+      pid: 10, instanceId: "section-owner", runtimeGeneration: 1, isProcessAlive: () => true });
+    const captureAuthority = Locks.createTelegramOwnedStateAuthorityCapture(lock, sessions);
+    const open = () => Threads.createTelegramTopicTargetStore({ path: () => scope.path, telegramProfile: () => scope.profile,
+      consolidated: { captureAuthority, publishIfOwned: lock.publishStateSectionIfOwned! }, getNowMs: () => 1000 });
+    const namedLock = Locks.createTelegramLockRuntime<typeof ctx>({ statePath: path, key: () => "work",
+      pid: 20, instanceId: "named-owner", runtimeGeneration: 1, isProcessAlive: () => true });
+    const namedSessions = Lifecycle.createTelegramSessionContextStore<typeof ctx>();
+    namedSessions.set(ctx);
+    const named = Threads.createTelegramTopicTargetStore({ path, telegramProfile: "work", getNowMs: () => 1000,
+      consolidated: { captureAuthority: Locks.createTelegramOwnedStateAuthorityCapture(namedLock, namedSessions),
+        publishIfOwned: namedLock.publishStateSectionIfOwned! } });
+    const processBirthId = Bus.getTelegramProcessBirthIdentity(process.pid, "section-admission");
+    assert.ok(processBirthId);
+    const ledger = (profile: string) => WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path, stateProfile: profile,
+      profileKey: WorkspaceAdmission.createTelegramWorkspaceAdmissionProfileKey({ profileName: profile, botToken: `section-${profile}` }),
+      owner: { processId: process.pid, processBirthId }, getProcessLiveness: () => "alive", getNowMs: () => 1000 });
+    try {
+      assert.equal(lock.acquire(ctx).ok, true);
+      assert.equal(namedLock.acquire(ctx).ok, true);
+      await named.load();
+      named.setBotState({ threadMode: "disabled" });
+      await named.persist();
+      named.setStatusSnapshot({ runtime: { pollingActive: false }, diagnostics: { pendingDispatch: true } });
+      await named.persistStatus();
+      const namedAdmission = ledger("work");
+      assert.equal(namedAdmission.acquireAdmission({ operationId: "named-busy", operationKind: "send", scope: { kind: "profile" } }).kind, "acquired");
+      const store = open();
+      await store.load();
+      const target = { chatId: 7, threadId: 10 };
+      store.upsert({ profileKey: "cwd:/section-owner", owner: { kind: "leader", cwd: ctx.cwd, instanceId: "old" },
+        instanceId: "old", target, status: "active", slot: "A", threadName: "Atlas", createdAtMs: 1, updatedAtMs: 1 });
+      store.upsertWorkspaceBinding({ ...Threads.createTelegramWorkspaceBindingIdentity(ctx.cwd, 0, "session")!,
+        target, slot: "A", threadName: "Atlas", journalBindingKeys: [], journalBindingsComplete: true, journalSources: [], updatedAtMs: 1 });
+      await store.persist();
+      await store.load();
+      const admission = ledger("default"), lease = admission.acquireAdmission({ operationId: "nonleader-busy",
+        operationKind: "send", scope: { kind: "target", target } });
+      assert.equal(lease.kind, "acquired");
+      if (lease.kind !== "acquired") return;
+      assert.notEqual(lease.lease.owner.processId, (Locks.readTelegramRuntimeState(path).profiles.default!.transport as { pid: number }).pid);
+      const view = store.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64), getNowMs: () => 1000 });
+      const auth = { executor: { instanceId: "section-owner", leaderEpoch: String(lock.getOwnedLeaderEpoch()!) },
+        operatorUserId: 7, isCurrent: captureAuthority()! };
+      const request = { operationId: "section-restore", binding: store.listWorkspaceBindings()[0]!,
+        owner: store.list()[0]!, target: { chatId: 7, threadId: 42 }, source: { journalBindingKey: "source", updateIds: [500] } };
+      assert.equal(Threads.isTelegramWorkspaceRestoreRequest(request), true, JSON.stringify(request));
+      const relocated = await view.commit(request, auth);
+      assert.ok(relocated);
+      const recipient = { kind: "leader" as const, instanceId: "old", sessionId: "session", generation: "registration" };
+      const issued = view.issueRecipient(relocated, recipient, auth)!;
+      assert.equal(issued.issued, true);
+      let registrations = 0;
+      store.commitWorkspaceRestoreRegistration({ target: { chatId: 7, threadId: 42 },
+        bindingKey: relocated.request.binding.bindingKey, slot: "A" }, () => { registrations++; });
+      assert.equal(registrations, 1, "Registration observes the existing Workspace frame without nesting a shared transaction");
+      const stable = Locks.readTelegramRuntimeState(path);
+      const canonicalRestore = Threads.parseTelegramWorkspaceStateSection(stable.profiles.default!.workspace, "default")!.workspaceRestore;
+      const epoch = lock.getOwnedLeaderEpoch();
+      store.setBotState({ threadMode: "enabled" });
+      store.setStatusSnapshot({ runtime: { pollingActive: true }, diagnostics: { pendingDispatch: false,
+        recentRuntimeEvents: [{ at: 1, category: "fixture", message: "logged separately" }] } });
+      if (drift === "canonical") {
+        const competing = open();
+        await competing.load();
+        competing.setBotState({ lastReconcileAction: "concurrent-section-change" });
+        await competing.persist();
+      }
+      // Both production owner ports capture before their independent queue awaits.
+      const workspaceWrite = store.persist(), runtimeWrite = store.persistStatus();
+      const workspaceResult = workspaceWrite.then(() => undefined, error => error as Error);
+      if (drift === "context") sessions.set({ cwd: ctx.cwd });
+      if (drift === "generation") { sessions.clear(ctx); sessions.set(ctx); }
+      if (drift === "epoch") { lock.release(); assert.equal(lock.acquire(ctx).ok, true); assert.notEqual(lock.getOwnedLeaderEpoch(), epoch); }
+      if (drift === "owner") {
+        const replacement = Locks.createTelegramLockRuntime({ statePath: path, pid: 30, instanceId: "replacement", isProcessAlive: () => true });
+        const predecessor = lock.getState();
+        assert.equal(predecessor.kind, "active-here");
+        if (predecessor.kind !== "active-here") return;
+        assert.equal(replacement.acquire({ cwd: "/replacement" }, { force: true, expectedOwner: predecessor.lock }).ok, true);
+      }
+      if (drift === "profile") scope.profile = "work";
+      if (drift === "path") scope.path = join(dir, "wrong-state.json");
+      const beforeFlush = Locks.readTelegramRuntimeState(path);
+      const workspaceError = await workspaceResult;
+      await runtimeWrite;
+      if (drift === "none") assert.equal(workspaceError, undefined);
+      else assert.match(String(workspaceError), drift === "canonical" ? /canonical snapshot changed/ : /captured publication authority/);
+      const after = Locks.readTelegramRuntimeState(path);
+      assert.deepEqual(after.profiles.work, stable.profiles.work, "Actual named-profile owners remain untouched");
+      for (const section of ["transport", "admission"] as const) assert.deepEqual(after.profiles.default?.[section], beforeFlush.profiles.default?.[section]);
+      const workspace = Threads.parseTelegramWorkspaceStateSection(after.profiles.default!.workspace, "default")!;
+      assert.deepEqual(workspace.workspaceRestore, canonicalRestore, "Issued Restore facts are not rolled back by sibling publication");
+      assert.equal(workspace.workspaceBindings?.[0]?.target.threadId, 42);
+      assert.deepEqual(workspace.workspaceBindings?.[0]?.journalBindingKeys, []);
+      assert.deepEqual(workspace.workspaceBindings?.[0]?.journalSources, []);
+      assert.equal(workspace.workspaceBindings?.[0]?.journalBindingsComplete, true);
+      if (drift === "none") assert.equal(workspace.bot.threadMode, "enabled");
+      else assert.deepEqual(after.profiles.default!.workspace, beforeFlush.profiles.default!.workspace, "Refused Workspace writes preserve the full canonical section");
+      if (drift === "none" || drift === "canonical") {
+        assert.equal((after.profiles.default!.runtime as { runtime: { pollingActive: boolean } }).runtime.pollingActive, true);
+        assert.equal((after.profiles.default!.runtime as { diagnostics: { recentRuntimeEvents?: unknown } }).diagnostics.recentRuntimeEvents, undefined);
+      } else assert.deepEqual(after.profiles.default, beforeFlush.profiles.default, "Revoked grants publish neither queued section");
+      if (drift === "canonical") assert.equal(workspace.bot.lastReconcileAction, "concurrent-section-change");
+      assert.equal(fs.existsSync(join(dir, "wrong-state.json")), false);
+      const beforeRelease = Locks.readTelegramRuntimeState(path);
+      assert.equal(admission.releaseAdmission(lease.lease), true, "Nonleader process/birth authority survives transport/session changes");
+      const released = Locks.readTelegramRuntimeState(path);
+      for (const section of ["transport", "workspace", "runtime"] as const) assert.deepEqual(released.profiles.default?.[section], beforeRelease.profiles.default?.[section]);
+      assert.deepEqual(released.profiles.work, stable.profiles.work);
+      assert.equal(namedAdmission.read().leases.length, 1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const profile of [undefined, "work"] as const) for (const boundary of ["review-reopen", "authority-race", "session-context", "session-generation"] as const) {
+  const interrupted = boundary !== "review-reopen";
+  test(`Fresh production root uses shared files and ignores released storage (${profile ?? "default"}, ${boundary})`, async () => {
+    const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-fresh-"))), directory = Paths.resolveTelegramTempDir(agentDir);
+    const oldDir = join(agentDir, "tmp", "telegram"), oldFiles = {
+      "owners.json": "{}\n", "state.json": "{\"version\":999,\"sentinel\":\"released-workspace\"}\n",
+      "inbox.json": "{\"version\":999,\"sentinel\":\"never-replay\"}\n", "logs.jsonl": "released log bytes\n",
+    };
+    await mkdir(oldDir, { recursive: true });
+    for (const [name, bytes] of Object.entries(oldFiles)) await writeFile(join(oldDir, name), bytes, { mode: 0o600 });
+    const bot = { botToken: "123:fresh-root", botId: 123, allowedUserId: 77, threads: { automaticCleanup: false } };
+    await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ ...bot, profiles: { work: bot }, assistant: { activity: "quiet", timeInjection: "hidden" } }), { mode: 0o600 });
+    const methods: string[] = [], dispatched: unknown[] = [];
+    const { handlers, commands, tools, pi } = createRuntimePiHarness({ sendUserMessage: message => { dispatched.push(message); } });
+    const modelRegistry = { refresh() {}, getAvailable: () => [], isUsingOAuth: () => false };
+    const ctx = createRuntimeExtensionContext({ cwd: "/fresh-root", modelRegistry,
+      getContextUsage: () => undefined }), followerCtx = createRuntimeExtensionContext({ cwd: "/fresh-follower" });
+    const follower = createRuntimePiHarness({ sendUserMessage: message => { dispatched.push(message); } });
+    let followerStarted = false, nextThread = 42, channelSends = 0, polls = 0, reviewUpdateId = 100;
+    let releaseReview: (() => void) | undefined;
+    const reviewAnswers: string[] = [];
+    let resumed: ReturnType<typeof createRuntimePiHarness> | undefined;
+    let holdCreation = false, releaseCreation: (() => void) | undefined;
+    let followerConnect: Promise<void> | undefined, sessionStart: Promise<unknown> | undefined;
+    let activeFollowerCtx = followerCtx;
+    let replacementOwner: ReturnType<typeof Locks.createTelegramLockRuntime> | undefined;
+    const resumedCtx = createRuntimeExtensionContext({ cwd: ctx.cwd, modelRegistry, getContextUsage: () => undefined,
+      sessionManager: { ...ctx.sessionManager, getSessionFile: () => `/sessions/${ctx.sessionManager.getSessionId()}.jsonl` } });
+    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input); methods.push(method);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot", has_topics_enabled: true });
+      if (method === "getChat") return createRuntimeTelegramApiResponse({ id: -100123, type: "channel", username: "fixture_channel" });
+      if (method === "sendRichMessage" && parseJsonRequestBody(init)?.chat_id === -100123) {
+        channelSends++;
+        if ((parseJsonRequestBody(init)?.rich_message as { markdown: string }).markdown === "Unknown outcome") throw new Error("isolated lost channel ACK");
+        return createRuntimeTelegramApiResponse({ message_id: 91, chat: { id: -100123, type: "channel" } });
+      }
+      if (method === "createForumTopic") {
+        const threadId = nextThread++;
+        if (holdCreation) await new Promise<void>(resolve => { releaseCreation = resolve; });
+        return createRuntimeTelegramApiResponse({ message_thread_id: threadId, name: "Fresh" });
+      }
+      if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+      if (method === "getUpdates") return await new Promise<Response>((resolve, reject) => {
+        releaseReview = () => resolve(createRuntimeTelegramApiResponse([{ update_id: reviewUpdateId++, callback_query: {
+          id: `cleanup-placement-review-${reviewUpdateId}`, from: { id: 77, is_bot: false }, data: "settings:review:inactive-threads",
+          message: { message_id: 300, message_thread_id: 42, chat: { id: 77, type: "private" } },
+        } }]));
+        const abort = () => reject(new DOMException("stop", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (method === "answerCallbackQuery") {
+        reviewAnswers.push(String(parseJsonRequestBody(init)?.text ?? ""));
+        return createRuntimeTelegramApiResponse(true);
+      }
+      if (["deleteWebhook", "setMyCommands", "sendMessage", "sendRichMessage", "editMessageText", "editForumTopic", "sendChatAction"].includes(method)) return createRuntimeTelegramApiResponse(true);
+      throw new Error(`Unexpected fresh-root API method: ${method}`);
+    });
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      assert.equal(fs.existsSync(directory), false);
+      const seedOwner = Locks.createTelegramLockRuntime<{ cwd: string }>({ statePath: Paths.resolveTelegramStatePath(agentDir),
+        key: () => profile ?? "default", pid: process.pid, instanceId: "cleanup-placement-seed", runtimeGeneration: 1 });
+      assert.equal(seedOwner.acquire({ cwd: "/cleanup-placement-seed" }).ok, true);
+      const seed = Threads.createTelegramTopicTargetStore({ path: Paths.resolveTelegramStatePath(agentDir), telegramProfile: profile,
+        consolidated: { captureAuthority() {
+          const epoch = seedOwner.getOwnedLeaderEpoch();
+          return epoch === undefined ? undefined : () => seedOwner.owns() && seedOwner.getOwnedLeaderEpoch() === epoch;
+        }, publishIfOwned: seedOwner.publishStateSectionIfOwned! } });
+      await seed.load();
+      const inactiveBinding = { ...Threads.createTelegramWorkspaceBindingIdentity("/inactive-cleanup", 0, "inactive-cleanup")!,
+        slot: "Z", threadName: "Zenith", target: { chatId: 77, threadId: 90 }, inactiveSinceMs: 1, updatedAtMs: 2,
+        journalBindingKeys: [], journalBindingsComplete: true as const, journalSources: [] };
+      seed.upsertWorkspaceBinding(inactiveBinding);
+      await seed.persist();
+      seedOwner.release();
+      extension(pi);
+      await handlers.get("session_start")?.({}, ctx);
+      await commands.get("telegram-connect")!.handler(profile ?? "", ctx);
+      await waitForCondition(() => !!releaseReview);
+      const initialPollerCount = methods.filter(method => method === "getUpdates").length;
+      const rootFiles = (await readdir(directory, { withFileTypes: true })).filter(entry => !entry.isDirectory()).map(entry => entry.name).sort();
+      assert.deepEqual(rootFiles, ["logs.jsonl", "state.json"], "IPC/staging/rotation never create another root file");
+      const state = Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)), sections = state.profiles[profile ?? "default"]!;
+      assert.ok(sections.transport && sections.workspace && sections.admission);
+      const workspace = Threads.parseTelegramWorkspaceStateSection(sections.workspace, profile ?? "default")!;
+      assert.ok(workspace.threads.some(record => record.target.threadId === 42));
+      const logical = Bus.getTelegramBusSocketPath(agentDir, process.platform, profile, "consolidated"), endpoint = Bus.resolveTelegramBusSocketPath(logical);
+      if (process.platform !== "win32") {
+        assert.equal(dirname(endpoint), Paths.resolveTelegramRuntimeDir(agentDir));
+        const target = await readlink(endpoint);
+        assert.equal(dirname(target), ".", "Native publication has a colocated relative private listener");
+        assert.equal(fs.lstatSync(join(dirname(endpoint), target)).isSocket(), true);
+      }
+      const channelTool = tools.get("telegram_message")!;
+      await channelTool.execute("fresh-root-channel", { text: "Retained channel post", chat_id: -100123, channel: true });
+      const service = Paths.resolveTelegramServiceJournalStorage("channel-posts", agentDir, profile ?? "default");
+      assert.equal(fs.existsSync(service.path), true);
+      const logPath = Paths.resolveTelegramRuntimeLogPath(agentDir);
+      await writeFile(logPath, JSON.stringify({ kind: "event", at: 1, category: "fixture", profile: profile ?? "default", message: "x".repeat(5 * 1024 * 1024) }) + "\n", { mode: 0o600 });
+      await assert.rejects(channelTool.execute("fresh-root-unknown", { text: "Unknown outcome", chat_id: -100123, channel: true }), /channel publication failed/u);
+      const previousLog = Paths.resolveTelegramPreviousSharedRuntimeLogPath(agentDir);
+      await waitForAsyncCondition(async () => fs.existsSync(previousLog));
+      assert.equal((await readFile(previousLog, "utf8")).includes('"category":"fixture"'), true);
+      assert.equal(fs.existsSync(join(directory, "logs._prev.jsonl")), false);
+      assert.equal(fs.existsSync(join(directory, "channel-posts.json")), false);
+      const serviceBeforeRace = await readFile(service.path);
+      const creationsBefore = methods.filter(method => method === "createForumTopic").length;
+      holdCreation = interrupted;
+      if (interrupted) {
+        const siblingOwner = Locks.createTelegramLockRuntime({ statePath: Paths.resolveTelegramStatePath(agentDir),
+          key: () => profile ? "default" : "work", instanceId: "production-race-sibling" });
+        assert.equal(siblingOwner.acquire({ cwd: "/sibling-profile" }).ok, true);
+        const sibling = Threads.createTelegramTopicTargetStore({ path: Paths.resolveTelegramStatePath(agentDir),
+          telegramProfile: profile ? undefined : "work", consolidated: {
+            captureAuthority: () => siblingOwner.owns,
+            publishIfOwned: siblingOwner.publishStateSectionIfOwned!,
+          } });
+        try { await sibling.load(); sibling.setBotState({ threadMode: "disabled" }); await sibling.persist(); }
+        finally { siblingOwner.release(); }
+      }
+      extension(follower.pi);
+      followerStarted = true;
+      followerConnect = (async () => {
+        await follower.handlers.get("session_start")?.({}, followerCtx);
+        await follower.commands.get("telegram-connect")!.handler(profile ?? "", followerCtx);
+      })();
+      if (interrupted) {
+        // Supersede captured authority while native follower registration holds admission across an API await.
+        try { await waitForCondition(() => !!releaseCreation); }
+        catch (error) { throw new Error(`${String(error)}\n${JSON.stringify({ methods })}\n${await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")}`); }
+        const statePath = Paths.resolveTelegramStatePath(agentDir), stateBeforeRevocation = Locks.readTelegramRuntimeState(statePath);
+        const held = stateBeforeRevocation.profiles[profile ?? "default"]!;
+        assert.ok((held.admission as { leases: unknown[] }).leases.length > 0, "Production admission spans the actual creation await");
+        assert.equal(Object.keys(stateBeforeRevocation.profiles).length, 2, "The preservation assertion has a real sibling-profile section");
+        if (boundary !== "authority-race") {
+          // The follower's captured attempt, not the leader's independent session, owns local readiness.
+          activeFollowerCtx = boundary === "session-generation" ? followerCtx : createRuntimeExtensionContext({
+            cwd: followerCtx.cwd, sessionManager: { ...followerCtx.sessionManager },
+          });
+          sessionStart = follower.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, activeFollowerCtx);
+          await sessionStart;
+          releaseCreation!();
+          await followerConnect;
+          const after = Locks.readTelegramRuntimeState(statePath);
+          const retained = Threads.parseTelegramWorkspaceStateSection(after.profiles[profile ?? "default"]!.workspace, profile ?? "default")!;
+          const remoteBinding = retained.workspaceBindings?.find(binding => binding.cwd === followerCtx.cwd);
+          assert.ok(remoteBinding, "The independently current leader retains acknowledged remote creation; local refusal is not rollback");
+          assert.equal(remoteBinding.sessionId, followerCtx.sessionManager.getSessionId());
+          assert.equal(remoteBinding.target.threadId, 43);
+          assert.equal(remoteBinding.slot, "B");
+          assert.deepEqual(retained.workspaceBindings?.filter(binding => binding.cwd !== followerCtx.cwd), workspace.workspaceBindings);
+          assert.ok(remoteBinding.journalSources?.length);
+          for (const source of remoteBinding.journalSources!) assert.equal(fs.existsSync(Paths.resolveTelegramSessionJournalPath(
+            source.sessionId, source.recipientBindingKey, agentDir, profile)), false,
+            "Stale creation ACK leaves the recipient family absent");
+          const sendsBeforeRefusal = methods.length;
+          await assert.rejects(follower.tools.get("telegram_message")!.execute("stale-registration", { text: "Must not send" }),
+            /requires this Pi instance to own \/telegram-connect or be registered/u);
+          assert.equal(methods.length, sendsBeforeRefusal, "Refused local authority issues no Telegram API call");
+          assert.deepEqual((after.profiles[profile ?? "default"]!.admission as { leases: unknown[] }).leases, []);
+          for (const [key, value] of Object.entries(stateBeforeRevocation.profiles)) {
+            if (key !== (profile ?? "default")) assert.deepEqual(after.profiles[key], value);
+          }
+          assert.equal(methods.filter(method => method === "createForumTopic").length, creationsBefore + 1);
+          assert.deepEqual(await readFile(service.path), serviceBeforeRace);
+          assert.deepEqual(dispatched, []);
+          assert.equal(methods.includes("deleteForumTopic"), false);
+          for (const [name, bytes] of Object.entries(oldFiles)) assert.equal(await readFile(join(oldDir, name), "utf8"), bytes);
+          await follower.commands.get("telegram-connect")!.handler(profile ?? "", activeFollowerCtx);
+          await follower.tools.get("telegram_message")!.execute("fresh-registration", { text: "Fresh attempt only" });
+          assert.equal(methods.filter(method => method === "createForumTopic").length, creationsBefore + 1,
+            "Fresh local registration reuses the acknowledged remote binding without repeating creation");
+          const freshState = Locks.readTelegramRuntimeState(statePath);
+          const fresh = Threads.parseTelegramWorkspaceStateSection(freshState.profiles[profile ?? "default"]!.workspace, profile ?? "default")!;
+          assert.deepEqual(fresh.workspaceBindings?.find(binding => binding.cwd === followerCtx.cwd)?.target, remoteBinding.target);
+          assert.equal(fresh.workspaceBindings?.find(binding => binding.cwd === followerCtx.cwd)?.slot, remoteBinding.slot);
+          for (const [key, value] of Object.entries(stateBeforeRevocation.profiles)) {
+            if (key !== (profile ?? "default")) assert.deepEqual(freshState.profiles[key], value);
+          }
+          assert.deepEqual(await readFile(service.path), serviceBeforeRace);
+          assert.deepEqual((freshState.profiles[profile ?? "default"]!.admission as { leases: unknown[] }).leases, []);
+          assert.deepEqual(dispatched, []);
+          await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, activeFollowerCtx);
+          followerStarted = false;
+          return;
+        }
+        replacementOwner = Locks.createTelegramLockRuntime({ statePath, key: () => profile ?? "default",
+          instanceId: "production-race-successor" });
+        const oldOwner = replacementOwner.getState();
+        assert.equal(oldOwner.kind, "active-here", "The native fixture shares this OS process, not the runtime owner identity");
+        if (oldOwner.kind !== "active-here") throw new Error("Missing production owner");
+        assert.equal(replacementOwner.acquire({ cwd: ctx.cwd }, { force: true, expectedOwner: oldOwner.lock }).ok, true);
+        assert.notEqual(replacementOwner.getOwnedLeaderEpoch(), oldOwner.lock.leaderEpoch);
+        const sentinel = { runtime: { pollingActive: false }, diagnostics: { phase: "successor-only" } };
+        assert.equal(replacementOwner.publishStateSectionIfOwned!("runtime", () => ({ value: sentinel, result: true }),
+          { isCurrent: replacementOwner.owns }).committed, true);
+        const successorTransport = Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]!.transport;
+        releaseCreation!();
+        await followerConnect;
+        await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+        await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
+        followerStarted = false;
+        const afterRace = Locks.readTelegramRuntimeState(statePath);
+        assert.deepEqual(afterRace.profiles[profile ?? "default"]!.workspace, held.workspace,
+          "Late creation ACK cannot publish an owner/binding under the revoked production leader");
+        assert.deepEqual(afterRace.profiles[profile ?? "default"]!.runtime, sentinel,
+          "Late diagnostics and teardown cannot overwrite the successor runtime section");
+        assert.deepEqual(afterRace.profiles[profile ?? "default"]!.transport, successorTransport);
+        assert.deepEqual((afterRace.profiles[profile ?? "default"]!.admission as { leases: unknown[] }).leases, [],
+          "Process/birth-owned admission releases after transport ownership changes");
+        for (const [key, value] of Object.entries(stateBeforeRevocation.profiles)) {
+          if (key !== (profile ?? "default")) assert.deepEqual(afterRace.profiles[key], value);
+        }
+        assert.equal(methods.filter(method => method === "createForumTopic").length, creationsBefore + 1);
+        assert.deepEqual(await readFile(service.path), serviceBeforeRace);
+        assert.deepEqual(dispatched, []);
+        assert.equal(methods.includes("deleteForumTopic"), false);
+        for (const [name, bytes] of Object.entries(oldFiles)) assert.equal(await readFile(join(oldDir, name), "utf8"), bytes);
+        return;
+      }
+      await followerConnect;
+      await waitForAsyncCondition(async () => {
+        const raw = Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)).profiles[profile ?? "default"]?.workspace;
+        return Threads.parseTelegramWorkspaceStateSection(raw, profile ?? "default")?.threads.some(record => record.owner?.kind === "manual-follower") === true;
+      });
+      assert.equal(methods.filter(method => method === "getUpdates").length, initialPollerCount, "The follower joins the native leader, never starts a second poller");
+      const joinedWorkspace = Threads.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)).profiles[profile ?? "default"]!.workspace, profile ?? "default")!;
+      const joinedFollower = joinedWorkspace.threads.find(record => record.owner?.kind === "manual-follower")!;
+      assert.ok(joinedFollower.instanceId);
+      const followerEndpoint = Bus.resolveTelegramBusSocketPath(Bus.getTelegramBusFollowerSocketPath(joinedFollower.instanceId, agentDir, process.platform, profile, "consolidated"));
+      if (process.platform !== "win32") {
+        assert.equal(dirname(followerEndpoint), Paths.resolveTelegramRuntimeDir(agentDir));
+        const target = await readlink(followerEndpoint);
+        assert.equal(dirname(target), ".");
+        assert.equal(fs.lstatSync(join(dirname(followerEndpoint), target)).isSocket(), true);
+      }
+      assert.deepEqual((await readdir(directory, { withFileTypes: true })).filter(entry => !entry.isDirectory()).map(entry => entry.name).sort(), ["logs.jsonl", "state.json"]);
+      const cleanupStorage = Paths.resolveTelegramServiceJournalStorage("thread-cleanup", agentDir, profile ?? "default");
+      assert.equal(fs.existsSync(cleanupStorage.path), false);
+      assert.ok(releaseReview);
+      releaseReview();
+      try {
+        await waitForAsyncCondition(async () => fs.existsSync(cleanupStorage.path) && reviewAnswers.includes("Review prepared. No tabs were deleted."));
+      } catch (error) {
+        throw new Error(`${String(error)}\n${JSON.stringify({ reviewAnswers, methods })}\n${await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8")}`);
+      }
+      const cleanupOptions = { ...cleanupStorage, profileName: profile ?? "default",
+        tokenSha256: Journal.createTelegramUpdateJournalBotIdentity({ botToken: bot.botToken }).tokenSha256 };
+      const cleanup = ThreadCleanupManager.createTelegramThreadCleanupWorkStore(cleanupOptions);
+      const work = cleanup.list();
+      assert.equal(work.length, 1);
+      assert.equal(work[0]?.entries.length, 1);
+      assert.equal(work[0]?.entries[0]?.bindingKey, inactiveBinding.bindingKey);
+      assert.equal(work[0]?.entries[0]?.state, "prepared");
+      assert.equal(work[0]?.entries[0]?.issuedAtMs, undefined);
+      assert.deepEqual(work[0]?.entries[0]?.target, inactiveBinding.target);
+      const pollingPath = (Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)).profiles[profile ?? "default"]!.transport as { journalPath: string }).journalPath;
+      const pollingJournal = Journal.createTelegramUpdateJournalStore({ path: pollingPath, profileName: profile ?? "default",
+        botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: bot.botToken, botId: bot.botId }) });
+      await waitForCondition(() => pollingJournal.read().acceptedThroughUpdateId === 100 && pollingJournal.read().entries.length === 0);
+      assert.equal(dirname(service.path), dirname(cleanupStorage.path));
+      assert.deepEqual((await readdir(join(directory, "journals"))).sort(), [basename(service.path), basename(cleanupStorage.path)].sort());
+      assert.equal((await readdir(Paths.resolveTelegramRuntimeDir(agentDir))).some(name => name.endsWith(".tmp")), false);
+      const cleanupBeforeRestart = await readFile(cleanupStorage.path);
+      await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, followerCtx);
+      followerStarted = false;
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+      const serviceBeforeRestart = await readFile(service.path);
+      const workspaceBeforeRestart = Threads.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)).profiles[profile ?? "default"]!.workspace, profile ?? "default")!;
+      const pollerCount = methods.filter(method => method === "getUpdates").length;
+      resumed = createRuntimePiHarness();
+      extension(resumed.pi);
+      await resumed.handlers.get("session_start")?.({ type: "session_start", reason: "resume" }, resumedCtx);
+      await resumed.commands.get("telegram-connect")!.handler(profile ?? "", resumedCtx);
+      await waitForCondition(() => methods.filter(method => method === "getUpdates").length > pollerCount);
+      const resumedTool = resumed.tools.get("telegram_message")!;
+      await resumedTool.execute("fresh-root-channel", { text: "Retained channel post", chat_id: -100123, channel: true });
+      await assert.rejects(resumedTool.execute("fresh-root-unknown", { text: "Unknown outcome", chat_id: -100123, channel: true }), /channel publication failed/u);
+      assert.equal(channelSends, 2, "Success and unknown issuance survive a replacement instance without resending either");
+      assert.deepEqual(await readFile(service.path), serviceBeforeRestart);
+      assert.deepEqual(await readFile(cleanupStorage.path), cleanupBeforeRestart);
+      assert.deepEqual(ThreadCleanupManager.createTelegramThreadCleanupWorkStore(cleanupOptions).list(), work);
+      assert.ok(releaseReview);
+      releaseReview();
+      await waitForCondition(() => reviewAnswers.filter(answer => answer === "Review prepared. No tabs were deleted.").length === 2 &&
+        pollingJournal.read().acceptedThroughUpdateId === 101 && pollingJournal.read().entries.length === 0);
+      assert.deepEqual(await readFile(cleanupStorage.path), cleanupBeforeRestart, "Repeated production review reuses the same work set without issuance or rewriting");
+      assert.deepEqual(ThreadCleanupManager.createTelegramThreadCleanupWorkStore(cleanupOptions).list(), work);
+      const workspaceAfterRestart = Threads.parseTelegramWorkspaceStateSection(Locks.readTelegramRuntimeState(Paths.resolveTelegramStatePath(agentDir)).profiles[profile ?? "default"]!.workspace, profile ?? "default")!;
+      assert.ok(workspaceBeforeRestart.workspaceBindings?.length);
+      const retainedInactive = workspaceAfterRestart.workspaceBindings?.find(value => value.bindingKey === inactiveBinding.bindingKey);
+      assert.deepEqual(retainedInactive?.journalBindingKeys, []);
+      assert.equal(retainedInactive?.journalBindingsComplete, true);
+      assert.deepEqual(retainedInactive?.journalSources, []);
+      assert.equal(retainedInactive?.inactiveSinceMs, 1);
+      for (const binding of workspaceBeforeRestart.workspaceBindings ?? []) assert.ok(workspaceAfterRestart.workspaceBindings?.some(current => current.bindingKey === binding.bindingKey && current.target.threadId === binding.target.threadId));
+      assert.deepEqual((await readdir(directory, { withFileTypes: true })).filter(entry => !entry.isDirectory()).map(entry => entry.name).sort(), ["logs.jsonl", "state.json"]);
+      assert.deepEqual(dispatched, [], "Released inbox is never parsed, imported or replayed");
+      assert.equal(methods.includes("deleteForumTopic"), false);
+      for (const [name, bytes] of Object.entries(oldFiles)) assert.equal(await readFile(join(oldDir, name), "utf8"), bytes);
+      assert.deepEqual((await readdir(oldDir)).sort(), Object.keys(oldFiles).sort());
+    } finally {
+      releaseCreation?.();
+      await sessionStart?.catch(() => {});
+      await followerConnect?.catch(() => {});
+      if (followerStarted) await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, activeFollowerCtx);
+      if (resumed) await resumed.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, resumedCtx);
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+      replacementOwner?.release();
+      restoreFetch();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  }, 15000);
+}
+
+for (const damage of ["malformed-json", "invalid-workspace"] as const) {
+  test(`Production connect resets damaged shared runtime state and becomes leader (${damage})`, async () => {
+    const extension = await getRuntimeTelegramExtension(), previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-reset-")));
+    const statePath = Paths.resolveTelegramStatePath(agentDir);
+    await mkdir(dirname(statePath), { recursive: true });
+    await writeFile(statePath, damage === "malformed-json" ? "{ damaged"
+      : JSON.stringify({ version: 2, profiles: { default: { workspace: { version: 99 } } } }), { mode: 0o600 });
+    await writeFile(join(agentDir, "telegram.json"), JSON.stringify({ botToken: "123:reset-root", botId: 123, allowedUserId: 77 }), { mode: 0o600 });
+    const { handlers, commands, pi } = createRuntimePiHarness();
+    const ctx = createRuntimeExtensionContext({ cwd: "/reset-root" });
+    let polls = 0;
+    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input);
+      if (method === "getMe") return createRuntimeTelegramApiResponse({ id: 123, username: "fixture_bot" });
+      if (method === "getUpdates" && ++polls === 1) return createRuntimeTelegramApiResponse([]);
+      if (method === "getUpdates") return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("stop", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      return createRuntimeTelegramApiResponse(true);
+    });
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      extension(pi);
+      await handlers.get("session_start")?.({}, ctx);
+      await commands.get("telegram-connect")!.handler("", ctx);
+      await waitForCondition(() => polls >= 2);
+      const state = Locks.readTelegramRuntimeState(statePath);
+      assert.ok(state.profiles.default?.transport, "the connecting instance owns the fresh envelope");
+      assert.equal(JSON.stringify(state).includes("damaged") || JSON.stringify(state).includes('"version":99'), false);
+      const logs = await readFile(Paths.resolveTelegramRuntimeLogPath(agentDir), "utf8");
+      assert.match(logs, /state-reset/u, "the reset leaves one diagnostic event");
+    } finally {
+      await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+      restoreFetch();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  }, 15000);
+}
+
 test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
@@ -2819,6 +3858,193 @@ strictFileTest(`Deferred media enqueue keeps custody behind its execution fence 
 });
 }
 
+for (const scenario of ["acknowledged", "lost-registration-reply"] as const) {
+strictFileTest(`Telegram new gateway composes follower suspension, session registration and predecessor pending adoption (${scenario})`, async () => {
+  let replyLost = false;
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-new-session-custody-")));
+  const contexts = Lifecycle.createTelegramSessionContextStore<ExtensionContext>();
+  const references = Journal.createTelegramUpdateJournalReferenceRegistry({ maxActive: 1 });
+  let sessionId = "session-a", sequence = 0, mayExecute = false, replacementStarted = false;
+  const ctx = { cwd: "/fixture", sessionManager: { getSessionId: () => sessionId }, ui: { notify() {} } } as unknown as ExtensionContext;
+  const registrationState = BusFollower.createTelegramBusFollowerRegistrationState();
+  const registry = Bus.createTelegramBusFollowerRegistry();
+  const config = Config.createTelegramConfigStore({ agentDir: dir });
+  const recipientKey = "manual:same-process";
+  const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture-new",
+    capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
+  const leaderPath = join(dir, "leader.sock"), followerPath = join(dir, "follower.sock");
+  const lock = { busSocketPath: leaderPath, busSecret: "fixture" };
+  const enteredPreparation = Promise.withResolvers<void>(), finishPreparation = Promise.withResolvers<void>();
+  const replacementDone = Promise.withResolvers<void>();
+  const failures: unknown[] = [], executions: { id: number; session: string }[] = [];
+  const adoptions: (Journal.TelegramSessionPendingAdoptionResult | undefined)[] = [];
+  const journals = Journal.createTelegramUpdateJournalBindingRuntime({
+    base: { getProfileName: () => "work", getBotToken: () => "123:fixture-new-custody", getBotId: () => 7,
+      withSourceSerialization: config.withSourceSerialization },
+    getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
+    getFollowerJournalPath: (key, profileName, sid) => Paths.resolveTelegramSessionJournalPath(sid!, key, dir, profileName),
+    getActiveFollowerBindingKey: () => recipientKey,
+    getActiveFollowerSessionId: () => registrationState.getSessionId(sessionId), isFollowerRegistered: registrationState.isRegistered,
+  });
+  const oldSource = journals.createRecipientResolver(recipientKey, "session-a")()!;
+  oldSource.journal.appendBatch([{ update_id: 1, message: { text: "old pending custody" } }]);
+  let invoke!: Parameters<Commands.TelegramSessionActionRuntimeDeps["registerCommand"]>[1]["handler"];
+  const action = Commands.createTelegramSessionActionRuntime({
+    registerCommand(_name, options) { invoke = options.handler; },
+    async sendUserMessage(text) {
+      replacementStarted = true;
+      try {
+        assert.equal(typeof text, "string");
+        if (typeof text !== "string") throw new Error("Expected the typed internal command");
+        await invoke(text.split(" ")[1]!, { ...ctx, async newSession() {
+          assert.equal(oldSource.journal.read().entries.some(entry => entry.updateId === 2), false, "Gateway follows exact source completion");
+          await hooks.onSessionShutdown({ type: "session_shutdown", reason: "new" }, ctx);
+          assert.equal(registrationState.isRegistered(), false);
+          assert.ok(BusFollower.getTelegramFollowerSessionHandoff());
+          assert.equal(workers.getState()?.phase, "stopped");
+          assert.deepEqual(references.list(), [], "Old worker reference ends before successor preparation");
+          sessionId = "session-b";
+          await hooks.onSessionStart({ type: "session_start", reason: "new" }, ctx);
+          return { cancelled: false };
+        } } as Parameters<typeof invoke>[1]);
+        replacementDone.resolve();
+      } catch (error) { replacementDone.reject(error); }
+    },
+    notifyResult: async (_target, result) => { failures.push(result); }, recordRuntimeEvent: (_category, error) => { failures.push(error); },
+  });
+  action.register();
+  let currentWorker: Updates.TelegramUpdateWorkerRuntime<ExtensionContext> | undefined;
+  const workers = Updates.createTelegramUpdateAdmissionLifecycleRuntime<ExtensionContext>({
+    resolveBinding: journals.resolveFollower,
+    prepareBinding() { adoptions.push(journals.prepareActiveFollowerSuccession(() => registrationState.isRegistered())); },
+    acquireSourceReference: binding => references.acquire({ referenceClass: "follower-lifecycle", recoveryKey: binding.recoveryKey }),
+    createWorker(journal, binding) {
+      const capturedSession = sessionId;
+      currentWorker = Updates.createTelegramUpdateWorkerRuntime({ journal, getJournalBindingKey: () => binding.recoveryKey,
+        hasAuthority: () => mayExecute && registrationState.isRegistered(),
+        shouldHoldPendingInput: entry => capturedSession === "session-a" && entry.updateId === 1,
+        shouldReviewHistoricalInput: entry => capturedSession === "session-a" && entry.updateId === 1,
+        async executeUpdate(update) {
+          executions.push({ id: update.update_id, session: capturedSession });
+          if ((update.message as { text?: string } | undefined)?.text === "/new") assert.ok(action.scheduleAfterUpdate(update.update_id, { chatId: 7, threadId: 42, messageId: 2 }));
+          return { kind: "complete" };
+        },
+        onUpdateCompleted: id => action.onUpdateCompleted(id),
+      });
+      return currentWorker;
+    },
+  });
+  const baseLeaderHandler = BusLeader.createTelegramBusLeaderEnvelopeHandler({ authSecret: "fixture", protocolIdentity: protocol,
+    followerRegistry: registry, provisionFollowerTarget: () => ({ chatId: 7, threadId: 42, slot: "A" }) });
+  // The leader commits the successor registration, but the follower never observes its reply.
+  async function leaderHandler(envelope: Bus.TelegramBusEnvelope) {
+    const response = await baseLeaderHandler(envelope);
+    if (scenario === "lost-registration-reply" && !replyLost && envelope.kind === "follower.register" &&
+        envelope.registration.sessionId === "session-b") {
+      replyLost = true;
+      throw new Error("fixture lost registration reply");
+    }
+    return response;
+  }
+  const leader = Bus.createTelegramBusLocalServer({ socketPath: leaderPath,
+    handleEnvelope: leaderHandler });
+  const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    recordRuntimeEvent: () => {}, receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => contexts.get(),
+      getRecipientBindingKey: () => recipientKey,
+      durableAdmission: BusFollower.createTelegramBusFollowerDurableAdmissionRuntime({ journal: workers, signalWorker: workers.signal }) },
+    recovery: { getLeaderState: () => ({ kind: "inactive" }), setLifecyclePhase() {}, updateStatus() {}, promoteToLeader: async () => false },
+    registration: { protocolIdentity: protocol, getFollowerBusSocketPath: () => followerPath, getProfileKey: () => recipientKey,
+      createRequestId: () => `new:${++sequence}`, getSessionId: () => sessionId, getSessionGeneration: contexts.getGeneration,
+      isContextActive: contexts.isCurrent, async onRegistered(current) {
+        if (sessionId === "session-b") { enteredPreparation.resolve(); await finishPreparation.promise; }
+        await workers.onTransportChanged(current);
+      } },
+  });
+  const hooks = Lifecycle.createTelegramBridgeSessionLifecycleAssembly({ contextStore: contexts,
+    queue: { getCurrentModel: () => undefined, loadConfig: async () => {}, setQueuedItems() {}, setCurrentModel() {}, setPendingModelSwitch() {},
+      syncCounters() {}, syncFlags() {}, bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
+      unbindDeferredDispatchContext() {}, discardQueuedItems() {}, clearModelMenuState() {}, getActiveTurnChatId: () => undefined,
+      clearPreview: async () => {}, clearActiveTurn() {}, clearAbort() {} },
+    follower: { instanceId: "fixture-follower", registrationState, registrationRuntime: assembly.registration,
+      getLeaderState: () => ({ kind: "active-elsewhere", lock }), updateStatus() {}, recordRuntimeEvent(_category: string, error: unknown) {
+        if (error instanceof Error) failures.push(error);
+      }, async suspendPolling() { assembly.registration.stop(); await assembly.receiver.stop(); } },
+    services: { resumeGroupedInput() {}, suspendGroupedInput() {}, delivery: { onSessionStart: async () => {}, onSessionShutdown: async () => {} },
+      polling: { onSessionStart: workers.onSessionStart }, inboundWorker: { onSessionShutdown: workers.onSessionShutdown },
+      capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} } },
+  } as unknown as Parameters<typeof Lifecycle.createTelegramBridgeSessionLifecycleAssembly>[0]);
+  const send = (id: number, text: string, generation: string) => Bus.sendTelegramBusLocalEnvelope({ socketPath: followerPath, timeoutMs: 1000,
+    envelope: { kind: "leader.forwardMessage", requestId: `delivery:${++sequence}`, auth: "fixture", recipientInstanceId: "fixture-follower",
+      recipientRegistrationGeneration: generation, delivery: Bus.createTelegramBusFollowerDeliveryIdentity({ kind: "leader.forwardMessage", recipientBindingKey: recipientKey, sourceUpdateId: id }),
+      message: { message_id: id, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text, pi_telegram_source_update_id: id }, sentAtMs: 1 } });
+  try {
+    BusFollower.setTelegramFollowerSessionHandoff(undefined);
+    await leader.start(); await hooks.onSessionStart({ type: "session_start", reason: "startup" }, ctx);
+    assert.ok(await assembly.registration.registerWithLeader(ctx, lock));
+    const oldGeneration = registrationState.getGeneration()!;
+    let successorGeneration: string, oldPending: ReturnType<typeof oldSource.journal.read>;
+    mayExecute = true;
+    const ack = await send(2, "/new", oldGeneration);
+    assert.equal(ack?.kind === "bus.ack" && ack.ok, true);
+    if (scenario === "lost-registration-reply") {
+      finishPreparation.resolve();
+      await replacementDone.promise;
+      assert.equal(replyLost, true);
+      assert.equal(registry.get("fixture-follower")?.sessionId, "session-b", "Leader committed the successor");
+      assert.equal(registrationState.isRegistered(), false);
+      assert.equal(assembly.getReadySessionId(), undefined);
+      assert.deepEqual(adoptions, [undefined], "No adoption without an observed successor registration");
+      assert.deepEqual(oldSource.journal.read().entries.map(entry => entry.updateId), [1]);
+      assert.deepEqual(executions, [{ id: 2, session: "session-a" }]);
+      assert.ok(failures.length > 0 && failures.every(failure => /Telegram bus handler failed/.test(String(failure))),
+        `The lost reply is reported as itself, not a protocol mismatch: ${failures.map(String).join("; ")}`);
+      failures.length = 0;
+      oldPending = oldSource.journal.read();
+      const handoff = BusFollower.getTelegramFollowerSessionHandoff()!;
+      assert.ok(handoff, "Session handoff stays available for retry");
+      assert.ok(await assembly.registration.registerWithLeader(ctx, lock,
+        { target: handoff.target, previousInstanceId: handoff.instanceId }));
+      BusFollower.setTelegramFollowerSessionHandoff(undefined);
+      successorGeneration = registrationState.getGeneration()!;
+    } else {
+    await Promise.race([enteredPreparation.promise, replacementDone.promise.then(() => { throw new Error(`Replacement ended before preparation: ${failures.map(String).join("; ")}`); })]);
+    successorGeneration = registrationState.getGeneration()!;
+    assert.notEqual(successorGeneration, oldGeneration);
+    assert.equal(registry.get("fixture-follower")?.sessionId, "session-b");
+    assert.equal(assembly.getReadySessionId(), undefined);
+    oldPending = oldSource.journal.read();
+    const refused = await send(1, "successor before preparation", successorGeneration);
+    assert.equal(refused?.kind === "bus.ack" && refused.ok, false);
+    assert.deepEqual(oldSource.journal.read(), oldPending);
+    finishPreparation.resolve(); await replacementDone.promise;
+    }
+    assert.deepEqual(failures, []);
+    assert.equal(assembly.getReadySessionId(), "session-b");
+    assert.equal(BusFollower.getTelegramFollowerSessionHandoff(), undefined);
+    assert.equal(journals.getActiveRecoveryKey(), workers.getJournalBindingKey());
+    assert.notEqual(journals.getActiveRecoveryKey(), oldSource.recoveryKey);
+    assert.deepEqual(references.list(), [{ referenceClass: "follower-lifecycle", recoveryKey: journals.getActiveRecoveryKey() }]);
+    const late = await send(3, "stale predecessor delivery", oldGeneration);
+    assert.equal(late?.kind === "bus.ack" && late.ok, false);
+    assert.deepEqual(adoptions, [undefined, { adoptedUpdateIds: [1], retainedUpdateIds: [] }],
+      "Startup records the first session; /new adopts its unclaimed pending input before the successor worker exists");
+    assert.equal(oldPending.entries[0]?.updateId, 1);
+    assert.deepEqual(oldSource.journal.read().entries, [], "Predecessor keeps only the committed adoption tombstone");
+    assert.equal(journals.inspectSourceAbandonment(oldSource.recoveryKey, 1)?.operatorAuthorityId,
+      `${Journal.TELEGRAM_SESSION_ADOPTION_AUTHORITY_PREFIX}session-b`);
+    const next = await send(4, "successor after preparation", successorGeneration);
+    assert.equal(next?.kind === "bus.ack" && next.ok, true);
+    await currentWorker!.waitForDrain();
+    assert.deepEqual(executions, [{ id: 2, session: "session-a" }, { id: 1, session: "session-b" }, { id: 4, session: "session-b" }]);
+    assert.deepEqual(journals.resolveActive()!.journal.read().entries, []);
+  } finally {
+    finishPreparation.resolve(); if (replacementStarted) await replacementDone.promise.catch(() => {});
+    assembly.registration.stop(); await assembly.receiver.stop(); await workers.onSessionShutdown(); await leader.stop();
+    BusFollower.setTelegramFollowerSessionHandoff(undefined); await rm(dir, { recursive: true, force: true });
+  }
+});
+}
+
 for (const outcome of ["ready", "context-replaced", "preparation-failed", "context-refresh", "same-context-refresh", "refresh-failed"] as const) {
 strictFileTest(`Follower registration fences native binding readiness (${outcome})`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-registration-readiness-"));
@@ -2870,9 +4096,6 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
         journal: blockedLifecycle, signalWorker: () => blockedLifecycle.signal(),
       }),
     },
-    targetReplacement: { topicTargetStore: { load: async () => {}, list: () => [], markStaleByTarget: () => false,
-      upsert: record => record, persist: async () => {} }, getManualFollowerProfileKey: () => "fixture:recipient",
-      manualFollowerOwnerId: "fixture", getSyncState: () => ({}), setSyncState: () => {}, updateStatus: () => {} },
     recovery: { getLeaderState: () => ({ kind: "inactive" }), setLifecyclePhase: () => {},
       updateStatus: () => {}, promoteToLeader: async () => false },
     registration: { protocolIdentity: protocol, getFollowerBusSocketPath: () => followerPath,
@@ -4594,7 +5817,7 @@ test("Replacement process discards dead session-owned queue authority", async ()
 test("Extension startup preserves queued authority owned by another process", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const agentDir = await ensureRuntimeAgentDir();
-  const journalPath = join(agentDir, "tmp", "telegram", "inbox.json");
+  const journalPath = join(agentDir, "tmp", "pi-telegram", "inbox.json");
   const journal = Journal.createTelegramUpdateJournalStore({
     path: journalPath,
     botIdentity: Journal.createTelegramUpdateJournalBotIdentity({
@@ -4928,7 +6151,7 @@ test("Extension runtime fences queued final and preview after polling ownership 
     assert.deepEqual(sentBodies, []);
     assert.deepEqual(editedTexts, []);
     assert.deepEqual(
-      Locks.readLocks(join(await ensureRuntimeAgentDir(), "tmp", "telegram", "owners.json")).default,
+      (await readRuntimeTelegramLocks()).default,
       { pid: process.pid + 1_000_000, cwd: "/tmp/other-pi-instance" },
     );
     releasePolling?.();
@@ -5132,12 +6355,9 @@ test(`Extension runtime preserves accepted work and fences delivery after ${loss
       getRuntimeHarnessMessageText(sentMessages[0] as RuntimeHarnessMessage),
       /^\[telegram\] first accepted$/,
     );
-    const journalPath = join(
-      await ensureRuntimeAgentDir(),
-      "tmp",
-      "telegram",
-      "inbox.json",
-    );
+    // The transport section names the polling journal hosted by the leading session.
+    const journalPath = Locks.readTelegramLockJournalPath((await readRuntimeTelegramLocks()).default)!;
+    assert.match(journalPath, /sessions[\\/][^\\/]+[\\/]inbox\.json$/u);
     const runtimeJournal = Journal.createTelegramUpdateJournalStore({
       path: journalPath,
       botIdentity: Journal.createTelegramUpdateJournalBotIdentity({
@@ -5161,7 +6381,8 @@ test(`Extension runtime preserves accepted work and fences delivery after ${loss
       releaseConflicts();
       await waitForCondition(() => !getActiveTools().includes("telegram_message"), 30_000);
       assert.equal(getUpdatesCalls, 11);
-      assert.equal(Locks.readLocks(join(await ensureRuntimeAgentDir(), "tmp", "telegram", "owners.json")).default, undefined);
+      assert.equal(Locks.parseTelegramLockEntry((await readRuntimeTelegramLocks()).default), undefined, "Released: no owner remains");
+      assert.equal(Locks.readTelegramLockJournalPath((await readRuntimeTelegramLocks()).default), journalPath, "The pointer keeps polling custody");
       assert.ok(runtimeJournal.read().entries.some((entry) => entry.updateId === 2 && entry.state === "queued"));
     }
     await handlers.get("agent_end")?.(
@@ -6184,6 +7405,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     const finalBody = sendBodies.find((body) =>
       getRuntimeTelegramApiText(body) === "follow-up answer"
     );
+    assert.equal(dispatchBody?.parse_mode, "HTML");
     assert.deepEqual(dispatchBody?.reply_parameters, {
       message_id: 11,
       allow_sending_without_reply: true,
@@ -6902,6 +8124,65 @@ test("Extension runtime keeps queued turns blocked until compaction settles", as
     await telegramConfig.restore();
   }
 });
+
+for (const outcome of ["completed", "failed", "cancelled", "shutdown"] as const) {
+  test(`Extension runtime retains ${outcome} compaction notice authority after observer timeout`, async (t) => {
+    const telegramConfig = await createRuntimeTelegramConfigFixture();
+    const notices: string[] = [];
+    let expireObserver: (() => void) | undefined;
+    const originalSetTimeout = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (...args: Parameters<typeof setTimeout>) => {
+      const timer = originalSetTimeout(...args);
+      if (args[1] === 300_000) expireObserver = () => { clearTimeout(timer); args[0](); };
+      return timer;
+    });
+    const { handlers, commands, pi } = createRuntimePiHarness();
+    const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+      const method = getRuntimeTelegramApiMethod(input);
+      if (method === "deleteWebhook" || method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
+      if (method === "getUpdates") throw new DOMException("stop", "AbortError");
+      if (method === "sendMessage" || method === "sendRichMessage") {
+        notices.push(getRuntimeTelegramApiText(parseJsonRequestBody(init)));
+        return createRuntimeTelegramApiResponse({ message_id: 100 + notices.length });
+      }
+      throw new Error(`Unexpected Telegram API method: ${method}`);
+    });
+    const ctx = createRuntimeExtensionContext({ cwd: "/repo/compaction-timeout" });
+    try {
+      await telegramConfig.write({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0 });
+      await writeRuntimeTelegramLocks({});
+      (await getRuntimeTelegramExtension())(pi);
+      await handlers.get("session_start")?.({}, ctx);
+      await commands.get("telegram-connect")?.handler("", ctx);
+      await handlers.get("session_before_compact")?.({ signal: new AbortController().signal }, ctx);
+      await waitForCondition(() => notices.length === 1);
+      assert.ok(expireObserver);
+      expireObserver();
+      assert.deepEqual(notices, ["**🗜 Compaction started.**"], "Timeout is not a Pi terminal result");
+      if (outcome === "shutdown") await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+      if (outcome === "completed" || outcome === "shutdown") {
+        await handlers.get("session_compact")?.({}, ctx);
+        await handlers.get("session_compact")?.({}, ctx);
+      } else {
+        const event = { aborted: outcome === "cancelled", reason: "threshold", willRetry: false, fromExtension: false };
+        await handlers.get("session_compact_failed")?.(event, ctx);
+        await handlers.get("session_compact_failed")?.(event, ctx);
+      }
+      if (outcome !== "shutdown") await waitForCondition(() => notices.length === 2);
+      await flushMicrotasks(30);
+      assert.deepEqual(notices, ["**🗜 Compaction started.**", ...(outcome === "shutdown" ? [] : [
+        outcome === "completed" ? "**✅ Compaction completed.**" :
+          outcome === "cancelled" ? "**⚠️ Compaction cancelled.**" : "**⚠️ Compaction failed.**",
+      ])]);
+    } finally {
+      expireObserver?.();
+      await commands.get("telegram-disconnect")?.handler("", ctx);
+      await handlers.get("session_shutdown")?.({}, ctx);
+      restoreFetch();
+      await telegramConfig.restore();
+    }
+  });
+}
 
 test("Extension runtime compaction notices cannot overtake a pending local final delivery", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();

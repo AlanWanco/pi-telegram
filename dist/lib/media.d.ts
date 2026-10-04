@@ -61,9 +61,16 @@ export interface TelegramReplyToMessage {
 }
 export interface TelegramSticker {
     file_id: string;
+    is_video?: boolean;
+    is_animated?: boolean;
 }
 export interface TelegramMediaMessage {
     message_id: number;
+    chat?: {
+        id: number;
+        type?: string;
+        username?: string;
+    };
     from?: TelegramMessageUser;
     forward_origin?: TelegramMessageForwardOrigin;
     forward_from?: TelegramMessageUser;
@@ -125,9 +132,29 @@ export interface TelegramMediaGroupControllerOptions {
     clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 export type TelegramAttachmentKind = "photo" | "document" | "video" | "audio" | "voice" | "animation" | "sticker";
+/** Where an inbound attachment came from; the download layer turns it into a scoped file name. */
+export interface TelegramAttachmentSource {
+    kind: string;
+    messageId: number;
+    index?: number;
+    /** Sender-chosen file name, kept as a trailing readable segment. */
+    userFileName?: string;
+    chat?: {
+        id: number;
+        type?: string;
+        username?: string;
+    };
+    /** Explicit source scope, e.g. a Guest Mode peer whose message IDs are not the bot chat's. */
+    scope?: string;
+}
 export interface TelegramFileInfo {
     file_id: string;
     fileName: string;
+    /** Present only when the sender chose the name. */
+    userFileName?: string;
+    /** Position inside a rich message. */
+    index?: number;
+    source?: TelegramAttachmentSource;
     mimeType?: string;
     kind: TelegramAttachmentKind;
     isImage: boolean;
@@ -147,20 +174,16 @@ export interface DownloadedTelegramMessageFile {
     kind?: TelegramAttachmentKind;
 }
 export interface DownloadTelegramMessageFilesDeps {
-    downloadFile: (fileId: string, fileName: string) => Promise<string>;
+    downloadFile: (fileId: string, fileName: string, source?: TelegramAttachmentSource) => Promise<string>;
 }
-export declare function guessExtensionFromMime(mimeType: string | undefined, fallback: string): string;
 export declare function guessMediaType(path: string): string | undefined;
 export declare function extractTelegramMessageText(message: TelegramMediaMessage): string;
 export declare function extractTelegramForwardContextText(message: TelegramMediaMessage, allowedUserId?: number): string;
-export declare function extractTelegramReplyContextText(message: TelegramMediaMessage): string;
 export declare function buildTelegramReplyContextBlock(message: TelegramMediaMessage, replyFiles?: Pick<DownloadedTelegramFile, "path">[], replyOutputs?: readonly string[]): string;
-export declare function appendTelegramReplyContext(text: string, replyContext: string): string;
 export declare function extractTelegramMessagePromptText(message: TelegramMediaMessage): string;
 export declare function extractTelegramMessagesText(messages: TelegramMediaMessage[]): string;
 export declare function extractTelegramMessagesPromptText(messages: TelegramMediaMessage[]): string;
 export declare function extractFirstTelegramMessageText(messages: TelegramMediaMessage[]): string;
-export declare function hasTelegramMessagePromptContent(message: TelegramMediaMessage): boolean;
 export declare function hasTelegramMessagesPromptContent(messages: TelegramMediaMessage[]): boolean;
 export declare function collectTelegramMessageIds(messages: TelegramMediaMessage[]): number[];
 export declare function getTelegramMediaGroupKey(message: TelegramMediaGroupMessage): string | undefined;

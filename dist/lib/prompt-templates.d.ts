@@ -12,7 +12,6 @@ export interface TelegramPromptTemplateCommand {
 export type TelegramPromptTemplateReader = (path: string) => string;
 export declare function parsePromptTemplateArgs(argsString: string): string[];
 export declare function substitutePromptTemplateArgs(content: string, args: readonly string[]): string;
-export declare function isTelegramPromptTemplateCommandName(name: string): boolean;
 export declare function mapPiPromptTemplateNameToTelegramCommandName(name: string): string | undefined;
 export interface TelegramPromptTemplateCommandGetterDeps {
     getCommands: () => readonly PiSlashCommandInfo[];

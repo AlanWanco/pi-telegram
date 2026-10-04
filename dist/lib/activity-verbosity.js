@@ -4,18 +4,16 @@
  * Owns persistent bounded thinking and tool disclosures; excludes activity normalization, assistant answer rendering, and transport authority policy
  */
 import { escapeHtml, renderTelegramInlineMarkdownHtml, } from "./rendering.js";
-export const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
-export const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
+import { areTelegramTargetsEqual as targetEquals } from "./target.js";
+const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
+const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
-export const TELEGRAM_REASONING_MESSAGE_MAX_FRAMES = 24;
+const TELEGRAM_REASONING_MESSAGE_MAX_FRAMES = 24;
 export const TELEGRAM_REASONING_BUFFER_MAX_CHARS = 1_200;
 // Match native answer drafts: accumulate the opening frame for one full
 // interval, then publish at most one updated frame per interval.
-export const TELEGRAM_REASONING_MIN_INTERVAL_MS = 2_000;
+const TELEGRAM_REASONING_MIN_INTERVAL_MS = 2_000;
 export const TELEGRAM_TOOL_UPDATE_MAX_ENTRIES = 4;
-function targetEquals(left, right) {
-    return left.chatId === right.chatId && left.threadId === right.threadId;
-}
 function redactActivityText(text) {
     return text
         .replace(/\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED_BOT_TOKEN]")
