@@ -4978,9 +4978,15 @@ async function runAllCommandScenario(scenario: AllCommandScenario): Promise<void
   }, scenario.includes("-follower") ? "follower" : "leader");
 }
 
+// Restore and queued-receipt proofs require strict no-follow journal handles; without them (Windows) Restore fails closed.
+const strictJournalUnsupported = !constants.O_NOFOLLOW || !constants.O_NONBLOCK;
+const strictAllCommandScenario = (scenario: string): boolean =>
+  scenario.startsWith("restore") || scenario === "forward-sibling-follower-ipc-worker" || scenario === "forward-prompt-then-cancel";
+
 for (const scenarios of Object.values(ALL_COMMAND_SCENARIOS)) {
   for (const scenario of scenarios) {
-    test(`An All command opens one source-bound temporary Thread and keeps its original (${scenario})`, () => runAllCommandScenario(scenario));
+    test(`An All command opens one source-bound temporary Thread and keeps its original (${scenario})`,
+      { skip: strictJournalUnsupported && strictAllCommandScenario(scenario) }, () => runAllCommandScenario(scenario));
   }
 }
 
@@ -6354,7 +6360,7 @@ for (const scenario of ["completion", "partial", "missing", "foreign", "unreadab
   "authority-ended", "late-read-missing", "recipient-changed", "cleanup-unknown", "cleanup-recipient-changed", "already-issued",
   "publication-before", "publication-after", ...(role === "leader" ? ["same-instance", "foreign-session", "other-cwd", "old-target", "owner-missing", "owner-scope", "canonical-changed"] as const : ["heartbeat"] as const),
   ...(sourceKind === "queued" ? ["admission-only", "no-admission", "multi-receipt"] as const : [])] as const) {
-  test(`Cold Restore scoped ACK continuation never replays source or recipient effects (${role}, ${scenario}, ${sourceKind})`, async () => {
+  test(`Cold Restore scoped ACK continuation never replays source or recipient effects (${role}, ${scenario}, ${sourceKind})`, { skip: strictJournalUnsupported }, async () => {
     await fixture(async ({ store, threads, request, path, auth }) => {
       const config = createTelegramConfigStore({ agentDir: dirname(path) });
       const queueIdentity = { instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:queued-recovery`, sessionGeneration: 1 };
@@ -6576,7 +6582,7 @@ for (const role of ["leader", "follower"] as const) {
       ? ["normal", "lost-ack", "registration-change", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", "registry-recovery", "registry-disk-regression", ...journalProtectionCases, ...sessionReferenceCases, ...cleanupWakeCases, ...recipientWakeCases, ...forwardProofCases, ...warmCleanupCases, ...warmDisposalCases, "warm-cleanup-registration"]
       : ["normal", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", ...leaderBoundaryFaults, ...journalProtectionCases, ...cleanupWakeCases, ...queuedProofCases, ...warmCleanupCases, ...warmDisposalCases]) {
     test(`Restore button uses durable relocation at full capacity (${role}, lost reply: ${lostReply}, delivery: ${delivery})`, {
-      skip: sessionReferenceCases.includes(delivery) && (!constants.O_NOFOLLOW || !constants.O_NONBLOCK),
+      skip: strictJournalUnsupported,
     }, async () => {
       await withTopicStore(async (threadStore, path) => {
         const instanceId = role === "leader" ? "leader-a" : "follower-a";

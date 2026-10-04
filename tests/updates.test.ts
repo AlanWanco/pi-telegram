@@ -6655,6 +6655,36 @@ for (const scenario of ["immediate", "mixed", "late", "lost-ack", "no-result", "
   });
 }
 
+test("Ordinary queue receipts publish where strict journal source access is unavailable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-queued-nonstrict-binding-"));
+  const config = createTelegramConfigStore({ agentDir: dir });
+  // Windows has no no-follow handles; readiness must still come from the ordinary journal instead of refusing every prompt.
+  const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
+    getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), withSourceSerialization: config.withSourceSerialization,
+    strictSourceAccess: false });
+  const binding = resolve()!, journal = binding.journal;
+  journal.appendBatch([{ update_id: 1, message: { message_id: 1, chat: { id: 7, type: "private" }, text: "original" } }]);
+  const identity = { instanceId: "fixture-local", processId: 42, processBirthId: "fixture-birth", sessionGeneration: 1 };
+  const receipt = { receiptId: "nonstrict", queueKind: "prompt" as const, sourceUpdateIds: [1], journalBindingKey: binding.recoveryKey };
+  let carrier: unknown, published = 0;
+  const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+    journal, getJournalBindingKey: () => binding.recoveryKey, getQueueOwnerIdentity: () => identity, hasAuthority: () => true,
+    async defaultHandle(update) { carrier = update.message; reportTelegramUpdateDeferred(carrier); },
+    async beforeQueueReceiptPublished(actual, owner) {
+      assert.equal(journal.inspectQueuedReceipt!({ queueKind: actual.queueKind, receiptId: actual.receiptId,
+        sourceUpdateIds: [...actual.sourceUpdateIds], queueOwner: owner })?.receipt.receiptId, "nonstrict");
+    },
+    onQueueReceiptCommitted() { published++; },
+  });
+  try {
+    worker.start(TEST_CONTEXT); await worker.waitForDrain();
+    reportTelegramQueueAdmission([carrier], [receipt]);
+    await new Promise<void>(resolve => setImmediate(resolve)); await worker.waitForDrain();
+    assert.equal(published, 1);
+    assert.equal(worker.isQueueReceiptCommitted(receipt), true);
+  } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
 for (const scenario of ["exact", "foreign-binding", "read-only", "completed-after", "corrupt-after"] as const) {
   test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-queued-native-binding-"));

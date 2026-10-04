@@ -756,6 +756,8 @@ export interface TelegramUpdateJournalRuntimeBindingResolverDeps {
     withSourceSerialization?: TelegramUpdateJournalStoreOptions["withSourceSerialization"];
     getWorkspaceAdmission?: () => Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "releaseAdmission"> | undefined;
     onRecovery?: (event: TelegramUpdateJournalRecoveryEvent) => void;
+    /** Strict no-follow source handles; defaults to platform support (absent on Windows). */
+    strictSourceAccess?: boolean;
 }
 export declare function createTelegramUpdateJournalRuntimeBindingResolver(deps: TelegramUpdateJournalRuntimeBindingResolverDeps): () => TelegramUpdateJournalRuntimeBinding | undefined;
 export type TelegramUpdateJournalReferenceClass = "leader-lifecycle" | "follower-lifecycle" | "polling-cursor" | "polling-bootstrap" | "workspace-retirement" | "operator-disposition";

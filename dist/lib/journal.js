@@ -1837,8 +1837,15 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(deps) {
             ...(deps.withSourceSerialization ? { withSourceSerialization: deps.withSourceSerialization } : {}),
             ...(deps.onRecovery ? { onRecovery: deps.onRecovery } : {}) };
         const journal = createTelegramUpdateJournalStore(options);
-        // Scoped completion and receipt observation use strict private handles; ordinary recovery stays unchanged.
-        const completionJournal = deps.withSourceSerialization ? createTelegramUpdateJournalStore({ ...options, sourceAccess }) : undefined;
+        // Scoped completion and receipt observation use strict private handles where the platform provides no-follow
+        // evidence; elsewhere (Windows) the same capabilities read through the ordinary journal so queue receipts still work.
+        const strict = deps.strictSourceAccess ?? Boolean(constants.O_NOFOLLOW && constants.O_NONBLOCK);
+        const completionJournal = deps.withSourceSerialization
+            ? createTelegramUpdateJournalStore({ ...options, ...(strict ? { sourceAccess } : {}) }) : undefined;
+        // Queue receipt readiness gates every ordinary prompt; without strict handles it uses the ordinary journal read.
+        const observeQueuedReceipt = (expected) => strict
+            ? completionJournal.inspectQueuedReceipt(expected)
+            : inspectJournalQueuedReceipt(journal.read(), { ...expected, queueOwner: validateQueuedReceiptObservation(expected, path) }, path);
         return {
             runtimeKey: JSON.stringify({
                 path,
@@ -1864,11 +1871,11 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(deps) {
                 },
                 completeQueuedExact(receipts, completions) { return completionJournal.completeQueuedExact(receipts, completions); },
                 inspectSourceCompletion(expected) { return completionJournal.inspectSourceCompletion(expected); },
-                inspectQueuedReceipt(expected) { return completionJournal.inspectQueuedReceipt(expected); },
+                inspectQueuedReceipt: observeQueuedReceipt,
                 isQueueReceiptCurrent(receipt, owner) {
                     if (receipt.journalBindingKey !== createTelegramUpdateJournalBindingKey({ path, profileName, botIdentity }))
                         return false;
-                    return completionJournal.inspectQueuedReceipt({ queueKind: receipt.queueKind, receiptId: receipt.receiptId,
+                    return observeQueuedReceipt({ queueKind: receipt.queueKind, receiptId: receipt.receiptId,
                         sourceUpdateIds: [...receipt.sourceUpdateIds], queueOwner: { ...owner } }) !== undefined;
                 },
             } : journal,
