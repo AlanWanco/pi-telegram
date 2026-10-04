@@ -74,11 +74,41 @@ function createTelegramSessionRestartThreadCleanupHandler(deps) {
 }
 export function createTelegramThreadDisconnectAssembly(deps) {
     return {
-        disconnect: createTelegramManualThreadDisconnectHandler({
-            ...deps,
-            workspaceOperationKind: "workspace.disconnect-thread",
-            stopPolling: deps.stopPolling,
-        }),
+        async disconnect() {
+            const captured = deps.captureStopPolling?.();
+            const stop = captured?.stop ?? deps.stopPolling;
+            let stopAttempted = false;
+            const disconnect = createTelegramManualThreadDisconnectHandler({
+                ...deps,
+                workspaceOperationKind: "workspace.disconnect-thread",
+                isDisconnectCurrent: captured?.isCurrent ?? deps.isDisconnectCurrent,
+                stopPolling() {
+                    stopAttempted = true;
+                    return stop();
+                },
+            });
+            try {
+                return await disconnect();
+            }
+            catch (error) {
+                // Never retry a stop whose teardown/release outcome may already have committed.
+                if (stopAttempted) {
+                    deps.recordRuntimeEvent("connection", error, { phase: "disconnect-stop" });
+                    throw error;
+                }
+                deps.recordRuntimeEvent("connection", error, { phase: "disconnect-cleanup" });
+                let stopped;
+                try {
+                    stopped = await stop();
+                }
+                catch (stopError) {
+                    deps.recordRuntimeEvent("connection", stopError, { phase: "disconnect-stop" });
+                    throw stopError;
+                }
+                const separator = /[.!?]$/u.test(stopped) ? " " : ". ";
+                return `${stopped}${separator}Thread cleanup was not confirmed. Check /telegram-status --debug.`;
+            }
+        },
         cleanupForSessionRestart: createTelegramSessionRestartThreadCleanupHandler({
             ...deps,
             suspendPolling: deps.suspendPolling,
@@ -86,7 +116,12 @@ export function createTelegramThreadDisconnectAssembly(deps) {
     };
 }
 export function createTelegramManualThreadDisconnectHandler(deps) {
+    const assertCurrent = () => {
+        if (deps.isDisconnectCurrent?.() === false)
+            throw new Error("Telegram disconnect was superseded by a new connection.");
+    };
     const operation = async () => {
+        assertCurrent();
         const currentRecord = deps.getCurrentThreadRecord();
         let cleanupPending = false;
         if (currentRecord?.target.threadId) {
@@ -98,6 +133,7 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
             if (isManualFollower && !ownsLeader) {
                 if (deps.disconnectFollowerThread) {
                     const disconnected = await deps.disconnectFollowerThread();
+                    assertCurrent();
                     if (!disconnected) {
                         throw new Error("Telegram follower thread deletion requires a live leader registration.");
                     }
@@ -122,6 +158,7 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
                 const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
                 deps.topicTargetStore.upsertPendingCleanup(intent);
                 await deps.topicTargetStore.persist();
+                assertCurrent();
                 const cleanupPlan = ThreadReconciler.planThreadReconciliation({
                     nowMs: (deps.getNowMs ?? Date.now)(),
                     currentLeaderEpoch: leaderEpoch,
@@ -131,20 +168,25 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
                 const cleanup = await ThreadReconciler.applyThreadReconciliationPlan(cleanupPlan, {
                     isCleanupTargetProtected,
                     callApi(method, body) {
+                        assertCurrent();
                         return deps.callApi(method, body);
                     },
                     markStaleByTarget(targetToMark, syncStatus, lastSyncError) {
+                        assertCurrent();
                         return deps.topicTargetStore.markStaleByTarget(targetToMark, syncStatus, lastSyncError);
                     },
                     removeCleanupIntentById(id) {
+                        assertCurrent();
                         return deps.topicTargetStore.removePendingCleanup(id);
                     },
                     persist() {
+                        assertCurrent();
                         return deps.topicTargetStore.persist();
                     },
                     getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
                     recordRuntimeEvent: deps.recordRuntimeEvent,
                 });
+                assertCurrent();
                 if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) {
                     return "Thread disconnect superseded by a new binding.";
                 }
@@ -160,6 +202,7 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
                 action: "manual-disconnect",
             }));
         }
+        assertCurrent();
         const stopped = await deps.stopPolling();
         return cleanupPending
             ? `${stopped} Telegram thread cleanup remains pending for the next leader.`

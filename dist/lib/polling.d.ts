@@ -28,6 +28,8 @@ export declare class TelegramPersistentGetUpdatesConflictError extends Error {
     readonly count: number;
     constructor(count: number);
 }
+/** Exponential backoff for non-conflict polling/admission failures. */
+export declare function getTelegramPollingRetryDelayMs(consecutiveFailures: number): number;
 export declare class TelegramGetUpdatesTimeoutError extends Error {
     readonly timeoutMs: number;
     constructor(timeoutMs: number);

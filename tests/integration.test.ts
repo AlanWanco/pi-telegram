@@ -419,6 +419,16 @@ for (const role of ["leader", "follower"] as const) {
       const resume = { reason: "resume", cwd: "/repo", sessionFile: "/sessions/destination.jsonl" };
       const shutdown = { reason: "resume", cwd: "/repo", targetSessionFile: resume.sessionFile, connected: false };
       const dir = await mkdtemp(join(tmpdir(), "pi-connection-resume-"));
+      const backgroundSettled = Promise.withResolvers<void>();
+      let followerProvisioned = false;
+      const keepAlive = setInterval(() => {}, 1000);
+      const runWorkspaceOperation: NonNullable<BusLeader.TelegramBusFollowerTargetProvisionerDeps["runWorkspaceOperation"]> = (input, operation) => {
+        const run = Promise.resolve().then(operation);
+        if (input.operationKind === "workspace.reconcile-follower-provision") {
+          void run.then(() => backgroundSettled.resolve(), (error) => backgroundSettled.reject(error));
+        }
+        return run;
+      };
       try {
         const store = Threads.createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
         const sourceBinding = { ...Threads.createTelegramWorkspaceBindingIdentity("/repo", 0, "source")!,
@@ -460,7 +470,10 @@ for (const role of ["leader", "follower"] as const) {
             assert.equal(current, ctx);
             try {
               const ports = { getAllowedUserId: () => 7, topicTargetStore: store, callApi,
-                recordEvent() {}, recordRuntimeEvent() {}, getNowMs: () => 1000 };
+                runWorkspaceOperation, recordEvent() {},
+                recordRuntimeEvent(_category: string, error: unknown) {
+                  if (error instanceof Error) failures.push(error);
+                }, getNowMs: () => 1000 };
               const result = role === "leader"
                 ? await Sync.ensureTelegramLeaderThreadBinding({ ...ports, instanceId: "77:2",
                     cwd: current.cwd, sessionId: current.sessionManager.getSessionId(),
@@ -469,6 +482,7 @@ for (const role of ["leader", "follower"] as const) {
                     getSyncState: () => ({}), setSyncState() {} })({ instanceId: "77:2",
                     profileKey: "manual:new", cwd: current.cwd,
                     sessionId: current.sessionManager.getSessionId(), connectedAtMs: 1000 });
+              followerProvisioned = role === "follower" && Boolean(result);
               assert.ok(result);
               const target = "target" in result ? result.target : result;
               assert.equal(target.chatId, 7);
@@ -488,10 +502,19 @@ for (const role of ["leader", "follower"] as const) {
         assert.ok(launch);
         launch();
         await completed;
+        if (followerProvisioned) await backgroundSettled.promise;
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(starts, 1);
         assert.deepEqual(failures, []);
-      } finally { await rm(dir, { recursive: true, force: true }); }
+      } finally {
+        try {
+          // Provisioning returns before its real background publisher; join it before deleting storage.
+          if (followerProvisioned) await backgroundSettled.promise;
+        } finally {
+          clearInterval(keepAlive);
+          await rm(dir, { recursive: true, force: true });
+        }
+      }
     });
   }
 }

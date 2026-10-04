@@ -29,6 +29,7 @@ import {
   cutOverTelegramPollingCursor,
   getLatestTelegramUpdateId,
   getTelegramGetUpdatesRequestBudgetMs,
+  getTelegramPollingRetryDelayMs,
   isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
   runTelegramPollLoop,
@@ -1579,7 +1580,7 @@ test("Poll loop cancels stalled getUpdates at its owner-derived budget", async (
       statusMessages.push("unexpected reset");
     },
     sleep: async (ms, signal) => {
-      assert.equal(ms, 3_000);
+      assert.equal(ms, 1_000);
       assert.equal(signal, controller.signal);
       controller.abort();
     },
@@ -1690,7 +1691,7 @@ test("Poll loop runner ignores stale-context status failures while retrying", as
     },
   });
   await runPollLoop("ctx", new AbortController().signal);
-  assert.deepEqual(events, ["status:network down", "sleep:3000", "status:ok"]);
+  assert.deepEqual(events, ["status:network down", "sleep:1000", "status:ok"]);
   assert.deepEqual(runtimeEvents, [
     "polling:network down:loop",
     "polling:stale ctx:status-update",
@@ -2050,8 +2051,96 @@ test("Poll loop reports retryable errors and sleeps before retrying", async () =
   });
   assert.deepEqual(statusMessages, [
     "error:network down",
-    "sleep:3000",
+    "sleep:1000",
     "reset",
   ]);
   assert.deepEqual(runtimeEvents, ["polling:network down:loop"]);
+});
+
+test("Poll loop caps retry delay but recovers after a prolonged outage without reconnect", async () => {
+  const sleeps: number[] = [];
+  const responses: number[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config: { botToken: "123:abc" },
+    ...NOOP_JOURNAL_ADMISSION,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls++;
+      if (calls <= 12) throw new Error("network down");
+      if (calls === 13) return [];
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    onErrorStatus: () => {},
+    onStatusReset: () => {},
+    onSuccessfulResponse: (count) => { responses.push(count); },
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  assert.equal(calls, 14);
+  assert.deepEqual(sleeps, [1_000, 2_000, 4_000, 8_000, 16_000, ...Array(7).fill(30_000)]);
+  assert.deepEqual(responses, [0], "The existing poller must recover without a new start");
+});
+
+test("Poll loop resets backoff after successful durable admission", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const sleeps: number[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config,
+    ...NOOP_JOURNAL_ADMISSION,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      if (calls === 1 || calls === 3) throw new Error("network down");
+      if (calls === 2) return [];
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    onErrorStatus: () => {},
+    onStatusReset: () => {},
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  assert.deepEqual(sleeps, [1_000, 1_000]);
+});
+
+test("Polling retry delay saturates and never becomes non-finite", () => {
+  assert.equal(getTelegramPollingRetryDelayMs(1), 1_000);
+  assert.equal(getTelegramPollingRetryDelayMs(5), 16_000);
+  assert.equal(getTelegramPollingRetryDelayMs(6), 30_000);
+  assert.equal(getTelegramPollingRetryDelayMs(1_000), 30_000);
+});
+
+test("Successful HTTP responses do not reset backoff while durable admission fails", async () => {
+  const sleeps: number[] = [];
+  let calls = 0;
+  let admissions = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config: { botToken: "123:abc" },
+    ...NOOP_JOURNAL_ADMISSION,
+    appendUpdateBatch: () => {
+      admissions++;
+      if (admissions <= 2) throw new Error("journal unavailable");
+    },
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls++;
+      if (calls === 5) throw new DOMException("stop", "AbortError");
+      return [{ update_id: calls + 1 }];
+    },
+    persistConfig: async () => {},
+    onErrorStatus: () => {},
+    onStatusReset: () => {},
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  assert.equal(admissions, 4);
+  assert.deepEqual(sleeps, [1_000, 2_000]);
 });
