@@ -12,6 +12,10 @@ import type {
   TelegramWorkspaceThreadBinding,
 } from "./threads.ts";
 import type { TelegramApiCallOptions } from "./telegram-api.ts";
+import {
+  formatTelegramWorkspaceSlotDisplayLabel,
+  isTelegramWorkspaceSlotId,
+} from "./workspace-slots.ts";
 
 function labelText(value: string): string {
   return value.replace(/\s+/gu, " ").trim();
@@ -110,8 +114,11 @@ export function resolveTelegramWorkspaceDisplayNames(
     liveDirectoryCounts.set(binding.cwd, (liveDirectoryCounts.get(binding.cwd) ?? 0) + 1);
   }
   const bases = new Map<string, string>();
+  const peerSlots = bindings.flatMap((binding) => binding.slot ? [binding.slot] : []);
   for (const binding of bindings) {
-    const slot = binding.slot && /^[A-Z]$/u.test(binding.slot) ? binding.slot : undefined;
+    const slot = binding.slot && isTelegramWorkspaceSlotId(binding.slot)
+      ? formatTelegramWorkspaceSlotDisplayLabel(binding.slot, peerSlots)
+      : undefined;
     const manualName = binding.manualThreadName
       ? labelText(binding.manualThreadName)
       : undefined;
@@ -156,12 +163,13 @@ export function resolveTelegramWorkspaceDisplayNames(
         labels.delete(binding.bindingKey);
         continue;
       }
-      if (!binding.slot || !/^[A-Z]$/u.test(binding.slot)) {
+      if (!binding.slot || !isTelegramWorkspaceSlotId(binding.slot)) {
         labels.delete(binding.bindingKey);
         continue;
       }
+      const slotLabel = formatTelegramWorkspaceSlotDisplayLabel(binding.slot, peerSlots);
       labels.set(binding.bindingKey, boundedLabel(bases.get(binding.bindingKey)!,
-        mode === "directory-title" ? ` ${binding.slot}` : `_${binding.slot.toLowerCase()}`));
+        mode === "directory-title" ? ` ${slotLabel}` : `_${slotLabel.toLowerCase()}`));
     }
   }
   const counts = new Map<string, number>();

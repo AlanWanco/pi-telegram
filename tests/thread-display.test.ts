@@ -51,6 +51,24 @@ test("New directory modes share deterministic Unicode-aware tokenization and suf
   ).values()], ["Api PRD Server A", "Api PRD Server C"]);
 });
 
+test("Hash-slot display labels extend only enough to distinguish colliding prefixes", () => {
+  const first = `HABCDEF1${"0".repeat(57)}`;
+  const second = `HABCDEF1${"2"}${"0".repeat(56)}`;
+  const peers = [
+    { bindingKey: "hash-one", cwd: "/repo/shared", slot: first, threadName: "Anchor" },
+    { bindingKey: "hash-two", cwd: "/repo/shared", slot: second, threadName: "Briar" },
+  ];
+  const labels = [...resolveTelegramWorkspaceDisplayNames(peers, "letters").values()];
+  assert.notEqual(labels[0], labels[1]);
+  assert.equal(labels[0]?.length, 10);
+  assert.equal(labels[1]?.length, 10);
+  const directoryLabels = [...resolveTelegramWorkspaceDisplayNames(
+    peers, "directory-title", new Set(["hash-one", "hash-two"]),
+  ).values()];
+  assert.ok(directoryLabels.every((label) => label.length < 20));
+  assert.notEqual(directoryLabels[0], directoryLabels[1]);
+});
+
 test("Manual names override every automatic display mode", () => {
   const overridden = { ...bindings[0], manualThreadName: "Navigator" };
   assert.equal(resolveTelegramWorkspaceDisplayNames(

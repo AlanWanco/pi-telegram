@@ -2016,7 +2016,14 @@ test("Admission startup cannot resurrect a stopped or unauthorized poller after 
   }
 });
 
-test("Poll loop reports retryable errors and sleeps before retrying", async () => {
+test("Polling retry backoff starts at one second and caps at thirty seconds", () => {
+  assert.equal(getTelegramPollingRetryDelayMs(1), 1_000);
+  assert.equal(getTelegramPollingRetryDelayMs(2), 2_000);
+  assert.equal(getTelegramPollingRetryDelayMs(3), 4_000);
+  assert.equal(getTelegramPollingRetryDelayMs(20), 30_000);
+});
+
+test("Poll loop reports retryable errors and exponentially backs off before retrying", async () => {
   const config = { botToken: "123:abc", lastUpdateId: 1 };
   const statusMessages: string[] = [];
   const runtimeEvents: string[] = [];
@@ -2029,9 +2036,7 @@ test("Poll loop reports retryable errors and sleeps before retrying", async () =
     deleteWebhook: async () => {},
     getUpdates: async () => {
       calls += 1;
-      if (calls === 1) {
-        throw new Error("network down");
-      }
+      if (calls <= 2) throw new Error("network down");
       throw new DOMException("stop", "AbortError");
     },
     persistConfig: async () => {},
@@ -2053,8 +2058,14 @@ test("Poll loop reports retryable errors and sleeps before retrying", async () =
     "error:network down",
     "sleep:1000",
     "reset",
+    "error:network down",
+    "sleep:2000",
+    "reset",
   ]);
-  assert.deepEqual(runtimeEvents, ["polling:network down:loop"]);
+  assert.deepEqual(runtimeEvents, [
+    "polling:network down:loop",
+    "polling:network down:loop",
+  ]);
 });
 
 test("Poll loop caps retry delay but recovers after a prolonged outage without reconnect", async () => {

@@ -28,7 +28,7 @@ export function formatTelegramConnectionFailure(error: unknown): string {
     return "Telegram state version unsupported. Use a compatible runtime.";
   }
   if (/follower registration failed|active in another Pi instance/i.test(message)) {
-    return "Telegram leader is active but unavailable. Check /telegram-status --debug.";
+    return "Telegram leader is active; follower registration failed. Check /telegram-status --debug.";
   }
   if (/unfinished Thread creation does not match/i.test(message)) {
     return "Telegram Thread creation is unresolved. Check /telegram-status --debug.";

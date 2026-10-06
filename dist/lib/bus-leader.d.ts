@@ -59,6 +59,8 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
     shouldForceFreshUnnamed?: () => boolean;
     getRequestedThreadName?: () => string | undefined;
     resolveInitialWorkspaceDisplayTitle?: (binding: Threads.TelegramWorkspaceDisplayBinding) => string | undefined;
+    allowHashSlots?: boolean;
+    getAllowHashSlots?: () => boolean;
     topicTargetStore: Threads.TelegramTopicTargetStore;
     callApi: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     getCurrentLeaderEpoch?: () => number | string | undefined;
@@ -86,6 +88,9 @@ export interface TelegramBusFollowerTargetProvisionerDeps {
     onProvisioningStart?: () => void;
     onProvisioningEnd?: () => void;
     resolveInitialWorkspaceDisplayTitle?: (binding: Threads.TelegramWorkspaceDisplayBinding) => string | undefined;
+    isFollowerProcessAlive?: (pid: number) => boolean;
+    getFollowerByTarget?: (target: TelegramTarget) => TelegramBusFollowerView | undefined;
+    getCanAssignHashSlots?: () => boolean;
     runWorkspaceOperation?: TelegramBusWorkspaceAdmissionRunner;
     getNowMs?: () => number;
     recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void;

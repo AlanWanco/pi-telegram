@@ -55,6 +55,7 @@ import type { TelegramThreadDisplayMode } from "./config.ts";
 import { isProcessAlive } from "./locks.ts";
 import { isWireRecord as isRecord } from "./wire.ts";
 import { resolveAgentDir } from "./paths.ts";
+import { isTelegramWorkspaceSlotId } from "./workspace-slots.ts";
 import {
   normalizeTelegramSessionReplacementIntent,
   type TelegramSessionReplacementIntent,
@@ -245,6 +246,8 @@ export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT =
   "directory-display-format-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS =
+  "hashed-workspace-slots-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT =
   "workspace-follower-auto-connect-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT =
@@ -2834,7 +2837,7 @@ function parseRegistration(
     registration.profileKey = value.profileKey;
   if (typeof value.threadName === "string")
     registration.threadName = value.threadName;
-  if (typeof value.slot === "string" && /^[A-Z]$/.test(value.slot)) {
+  if (isTelegramWorkspaceSlotId(value.slot)) {
     registration.slot = value.slot;
   }
   if (typeof value.cwd === "string") registration.cwd = value.cwd;

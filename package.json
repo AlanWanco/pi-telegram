@@ -17,11 +17,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/llblab/pi-telegram.git"
+    "url": "https://github.com/AlanWanco/pi-telegram.git"
   },
-  "homepage": "https://github.com/llblab/pi-telegram",
+  "homepage": "https://github.com/AlanWanco/pi-telegram",
   "bugs": {
-    "url": "https://github.com/llblab/pi-telegram/issues"
+    "url": "https://github.com/AlanWanco/pi-telegram/issues"
   },
   "engines": {
     "node": ">=22.19.0"

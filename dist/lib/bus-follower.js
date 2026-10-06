@@ -12,6 +12,7 @@ import * as WorkspaceIdentity from "./workspace-identity.js";
 import { isWireRecord as isRecord } from "./wire.js";
 import { parseTelegramUpdateJournalQueueOwner } from "./journal.js";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
+import { isTelegramWorkspaceSlotId } from "./workspace-slots.js";
 import { isTelegramApiMethodRetrySafe, TelegramApiCommitUnknownError, TelegramApiStaleTargetError, } from "./telegram-api.js";
 import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, } from "./bus.js";
 import { getTelegramBusTransportRetryPolicy, TELEGRAM_BUS_REGISTRATION_RETRY, } from "./bus-transport.js";
@@ -754,7 +755,7 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
             : undefined,
         getEligibleElectionSlots: () => [...eligibleElectionSlots],
         setEligibleElectionSlots: (slots) => {
-            eligibleElectionSlots = Array.from(new Set(slots.filter((slot) => /^[A-Z]$/.test(slot)))).sort();
+            eligibleElectionSlots = Array.from(new Set(slots.filter(isTelegramWorkspaceSlotId))).sort();
         },
         setRegistered: (next, nextTarget, metadata) => {
             const retainedDisplayTitle = next && registered &&

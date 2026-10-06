@@ -7,7 +7,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { areTelegramTargetsEqual as sameTarget } from "./target.js";
 import { getTelegramApiErrorRequestTarget, isTelegramApiRequestRejected, } from "./telegram-api.js";
-import { planTelegramWorkspaceSlotAllocation, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
+import { isTelegramWorkspaceSlotId, planTelegramWorkspaceSlotAllocation, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 import { createTelegramWorkspaceAdmissionOperationId, isTelegramWorkspaceRetirementFence, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
 export function createTelegramWorkspaceOperationGate() {
     let tail = Promise.resolve();
@@ -636,7 +636,7 @@ export async function executeTelegramWorkspaceRetirement(input) {
             input.isCurrent?.() !== false;
         if (!isCurrent())
             return { kind: "retained", reason: "authority-changed" };
-        if (!input.intent.binding.slot || !/^[A-Z]$/u.test(input.intent.binding.slot)) {
+        if (!isTelegramWorkspaceSlotId(input.intent.binding.slot)) {
             return { kind: "retained", reason: "stale-intent" };
         }
         const owner = input.admission.getOwner();

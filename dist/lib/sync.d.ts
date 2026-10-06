@@ -26,6 +26,7 @@ export interface TelegramLeaderThreadSyncDeps {
     instanceId: string;
     cwd?: string;
     sessionId?: string;
+    allowHashSlots?: boolean;
     telegramProfile?: string;
     forceFreshUnnamed?: boolean;
     requestedThreadName?: string;
@@ -122,7 +123,7 @@ export declare function createTelegramThreadDisconnectAssembly<TSyncState extend
 export declare function createTelegramManualThreadDisconnectHandler<TSyncState extends TelegramSyncState>(deps: TelegramManualThreadDisconnectDeps<TSyncState>): () => Promise<string>;
 export declare function createTelegramLeaderHealthRuntime<TSyncState extends TelegramSyncState>(deps: TelegramLeaderHealthRuntimeDeps<TSyncState>): TelegramLeaderHealthRuntime;
 export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
-    topicTargetStore: Pick<TelegramTopicTargetStore, "load" | "markStaleByTarget" | "persist"> & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget">>;
+    topicTargetStore: Pick<TelegramTopicTargetStore, "load" | "markStaleByTarget" | "persist"> & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget" | "list">>;
     getSyncState: () => TSyncState;
     setSyncState: (state: TSyncState) => void;
     recordEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;

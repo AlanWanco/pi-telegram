@@ -2294,7 +2294,8 @@ test("Bare connect followed immediately by resume starts the destination through
       }
       const binding = store.getWorkspaceBinding(cwd, "a", "destination")!;
       assert.equal(binding.target.threadId, remembered ? 42 : 43);
-      assert.equal(binding.slot, "B");
+      if (remembered) assert.equal(binding.slot, "B");
+      else assert.match(binding.slot ?? "", /^H[0-9A-F]{64}$/u);
       assert.equal(store.getWorkspaceBinding(cwd, "a", sourceManager.getSessionId())?.target.threadId, 41);
       assert.equal(methods.filter((method) => method === "createForumTopic").length, remembered ? 0 : 1);
       assert.equal(notices.some((text) => /stale|failed/i.test(text)), false, notices.join("\n"));
@@ -3175,7 +3176,7 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
           assert.ok(remoteBinding, "The independently current leader retains acknowledged remote creation; local refusal is not rollback");
           assert.equal(remoteBinding.sessionId, followerCtx.sessionManager.getSessionId());
           assert.equal(remoteBinding.target.threadId, 43);
-          assert.equal(remoteBinding.slot, "B");
+          assert.match(remoteBinding.slot ?? "", /^H[0-9A-F]{64}$/u);
           assert.deepEqual(retained.workspaceBindings?.filter(binding => binding.cwd !== followerCtx.cwd), workspace.workspaceBindings);
           assert.ok(remoteBinding.journalSources?.length);
           for (const source of remoteBinding.journalSources!) assert.equal(fs.existsSync(Paths.resolveTelegramSessionJournalPath(

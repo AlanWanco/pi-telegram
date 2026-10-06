@@ -427,7 +427,7 @@ export interface TelegramTopicTargetStore {
     /** Discard process-local projections and reload owner-published state. */
     refresh?: () => Promise<void>;
     persist: () => Promise<void>;
-    invalidateTarget: (target: TelegramTarget, isCurrent: () => boolean, lastSyncError: string) => Promise<boolean>;
+    invalidateTarget: (target: TelegramTarget, isCurrent: () => boolean, lastSyncError: string, syncStatus?: "closed" | "deleted") => Promise<boolean>;
     /** Caller proves owner detachment; this does not assert Telegram Thread absence. */
     detachTargetOwner: (expected: TelegramTopicTargetRecord, isCurrent: () => boolean) => Promise<boolean>;
     /** Caller holds Workspace admission; publication uses this store's exact transport-owner fence. */
@@ -515,7 +515,13 @@ export interface TelegramTopicTargetStore {
     claimWorkspaceIdentity: (cwd: string, instanceId: string, previousInstanceId?: string, options?: {
         existingBindingOnly?: boolean;
         sessionId?: string;
+        allowHashSlots?: boolean;
         onCapacityUnavailable?: () => void;
+        onClaimUnavailable?: (reason: string, details?: {
+            instanceSlot?: string;
+            slot?: string;
+            ownerInstanceId?: string;
+        }) => void;
     }) => TelegramWorkspaceBindingIdentity | undefined;
     releaseWorkspaceClaim: (instanceId: string) => boolean;
     upsertWorkspaceBinding: (binding: TelegramWorkspaceThreadBinding, claimInstanceId?: string) => TelegramWorkspaceThreadBinding | undefined;

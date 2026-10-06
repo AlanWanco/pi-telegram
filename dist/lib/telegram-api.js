@@ -286,6 +286,22 @@ export function isTelegramStaleTargetHttpError(error) {
         return false;
     return /^Telegram API \w+ failed: HTTP 400: Bad Request: (message thread not found|thread not found|topic not found|topic deleted|topic closed|thread closed|forum topic closed|message thread closed|topic_id_invalid|topic_closed)$/i.test(error.message);
 }
+/** A confirmed-absence result is stronger than a closed-topic result. */
+export function isTelegramTopicTargetConfirmedAbsentError(error) {
+    if (!(error instanceof Error))
+        return false;
+    const status = "status" in error && typeof error.status === "number"
+        ? error.status
+        : undefined;
+    if (status !== undefined && status !== 400)
+        return false;
+    const message = error.message.toLowerCase();
+    return message.includes("topic_id_invalid") ||
+        message.includes("message thread not found") ||
+        message.includes("thread not found") ||
+        message.includes("topic not found") ||
+        message.includes("topic deleted");
+}
 /** Only a parsed Telegram rejection of this method proves a request had no effect. */
 export function isTelegramApiRequestRejected(error, method) {
     return error instanceof TelegramApiHttpError && error.rejectedRequestMethod !== undefined &&
@@ -402,7 +418,8 @@ async function publishTelegramDownload(partPath, targetPath, signal) {
         catch (error) {
             const code = error?.code;
             // Windows may briefly deny replacement while another publisher/scanner holds the file.
-            if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES") || attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS)
+            if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES") ||
+                attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS)
                 throw error;
             await sleepTelegramRetry(50 * 2 ** attempt, signal);
         }

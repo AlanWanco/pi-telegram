@@ -24,6 +24,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+  TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
   type TelegramBusFollowerView,
 } from "../lib/bus.ts";
@@ -52,6 +53,7 @@ import {
   TelegramApiCommitUnknownError,
   TelegramApiStaleTargetError,
 } from "../lib/telegram-api.ts";
+import { createTelegramWorkspaceHashSlotId } from "../lib/workspace-slots.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
   runWithTelegramWorkspaceAdmissionsAsync,
@@ -1581,6 +1583,328 @@ test("Bus leader follower target provisioner creates thread and announces connec
       [{ sessionId: "session-a", recipientBindingKey: "manual:follower-a" }]);
     assert.deepEqual(store.getWorkspaceBinding("/repo", "a", "session-a")?.journalBindingKeys, [],
       "Fresh session registration records its session journal, not a fictional flat recipient source");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Hash-capable follower provisioning continues after all legacy letters are occupied", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-hashed-workspace-slot-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 2000 });
+  for (const [index, slot] of Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+    const identity = createTelegramWorkspaceBindingIdentity(`/occupied/${index}`)!;
+    store.upsertWorkspaceBinding({ ...identity,
+      target: { chatId: 7, threadId: 1000 + index }, slot, updatedAtMs: index + 1 });
+  }
+  await store.persist();
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "hash-test",
+    capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS] });
+  const calls: string[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    getCurrentLeaderEpoch: () => "epoch-hash",
+    isFollowerProcessAlive: () => false,
+    getFollowerByTarget: () => undefined,
+    getCanAssignHashSlots: () => true,
+    async callApi<TResponse>(method: string) {
+      calls.push(method);
+      if (method === "createForumTopic") return { message_thread_id: 2000 } as TResponse;
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent() {},
+    getNowMs: () => 2000,
+  });
+  try {
+    const result = await provision({
+      instanceId: "hash-follower",
+      profileKey: "manual:hash-follower",
+      cwd: "/hash-workspace",
+      sessionId: "session-hash",
+      protocol,
+      connectedAtMs: 2000,
+    });
+    assert.equal(result?.threadId, 2000);
+    assert.match(result?.slot ?? "", /^H[0-9A-F]{64}$/u);
+    assert.equal(store.getWorkspaceBinding("/hash-workspace", "a", "session-hash")?.slot, result?.slot);
+    assert.equal(calls[0], "createForumTopic");
+    assert.equal(calls.filter((method) => method === "createForumTopic").length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Reopening restores the oldest same-session Thread despite a later ambiguous creation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-same-session-reclaim-"));
+  const path = join(dir, "state.json");
+  const seed = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+  const originalTarget = { chatId: 7, threadId: 18086 };
+  const duplicateTarget = { chatId: 7, threadId: 19029 };
+  const originalIdentity = createTelegramWorkspaceBindingIdentity("/repo", 1, "session-a")!;
+  const duplicateIdentity = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+  seed.upsertWorkspaceBinding({
+    ...originalIdentity,
+    target: originalTarget,
+    slot: "L",
+    threadName: "Lagoon",
+    updatedAtMs: 100,
+  });
+  seed.upsertWorkspaceBinding({
+    ...duplicateIdentity,
+    target: duplicateTarget,
+    slot: "Y",
+    threadName: "Yogi",
+    updatedAtMs: 200,
+  });
+  for (const [instanceId, target, slot, ownerId] of [
+    ["123:1000", originalTarget, "L", "old-original"],
+    ["124:1000", duplicateTarget, "Y", "old-duplicate"],
+  ] as const) {
+    seed.upsert({
+      profileKey: `manual:${ownerId}`,
+      owner: { kind: "manual-follower", instanceId: ownerId },
+      target,
+      status: "active",
+      createdAtMs: 100,
+      updatedAtMs: 200,
+      instanceId,
+      slot,
+      threadName: slot === "L" ? "Lagoon" : "Yogi",
+    });
+  }
+  seed.upsertPendingProvision({
+    id: "ambiguous-duplicate",
+    owner: "manual-follower",
+    instanceId: "124:1000",
+    profileKey: "manual:old-duplicate",
+    workspaceBindingKey: duplicateIdentity.bindingKey,
+    slot: "Y",
+    status: "ambiguous",
+    startedAtMs: 200,
+  });
+  await seed.persist();
+
+  const store = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+  await store.load();
+  const calls: Array<{ method: string; threadId: unknown }> = [];
+  const phases: string[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    getCurrentLeaderEpoch: () => "epoch-1",
+    isFollowerProcessAlive: () => false,
+    getFollowerByTarget: () => undefined,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, threadId: body.message_thread_id });
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent(_category, _error, details) {
+      if (typeof details?.phase === "string") phases.push(details.phase);
+    },
+    getNowMs: () => 2000,
+  });
+
+  try {
+    assert.deepEqual(await provision({
+      instanceId: "456:2000",
+      profileKey: "manual:reopened",
+      cwd: "/repo",
+      sessionId: "session-a",
+      target: duplicateTarget,
+      connectedAtMs: 2000,
+    }), { chatId: 7, threadId: 18086, slot: "L", threadName: "Lagoon" });
+    assert.deepEqual(calls, [{ method: "sendMessage", threadId: 18086 }]);
+    assert.deepEqual(store.list().map(record => [record.instanceId, record.target.threadId, record.slot]), [
+      ["456:2000", 18086, "L"],
+    ]);
+    assert.equal(store.getWorkspaceBinding("/repo", "b", "session-a")?.inactiveSinceMs, undefined);
+    assert.equal(store.getWorkspaceBinding("/repo", "b", "session-a")?.target.threadId, 18086);
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.target.threadId, 19029);
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.inactiveSinceMs, 2000);
+    assert.equal(store.listPendingProvisions().length, 1, "ambiguous creation evidence remains protective");
+    assert.equal(store.listPendingProvisions()[0]?.slot, "Y");
+    assert.equal(phases.filter(phase => phase === "follower-workspace-owner-detached").length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Follower without the hash-slot capability cannot claim a hash Workspace ID", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-hash-slot-compatibility-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 2000 });
+  const identity = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+  const slot = createTelegramWorkspaceHashSlotId(identity.bindingKey)!;
+  const target = { chatId: 7, threadId: 18086 };
+  store.upsertWorkspaceBinding({ ...identity, target, slot, threadName: "Lagoon", updatedAtMs: 100 });
+  await store.persist();
+  const calls: string[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    getCurrentLeaderEpoch: () => "epoch-hash",
+    isFollowerProcessAlive: () => false,
+    getFollowerByTarget: () => undefined,
+    getCanAssignHashSlots: () => true,
+    async callApi<TResponse>(method: string) {
+      calls.push(method);
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent() {},
+  });
+
+  try {
+    await assert.rejects(provision({
+      instanceId: "legacy-follower",
+      profileKey: "manual:legacy-follower",
+      cwd: "/repo",
+      sessionId: "session-a",
+      target,
+      protocol: TEST_BUS_PROTOCOL_IDENTITY,
+      connectedAtMs: 2000,
+    }), /hashed Workspace slots/);
+    assert.deepEqual(calls, []);
+    const claim = store.claimWorkspaceIdentity("/repo", "after-refusal", undefined, {
+      existingBindingOnly: true,
+      sessionId: "session-a",
+      allowHashSlots: true,
+    });
+    assert.equal(claim?.slot, slot, "the failed old peer releases its transient claim");
+    store.releaseWorkspaceClaim("after-refusal");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Live same-session owner blocks reconnect without allocating another slot", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-same-session-live-owner-"));
+  const path = join(dir, "state.json");
+  const store = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+  const target = { chatId: 7, threadId: 18086 };
+  const identity = createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!;
+  store.upsertWorkspaceBinding({ ...identity, target, slot: "L", threadName: "Lagoon", updatedAtMs: 100 });
+  store.upsert({
+    profileKey: "manual:old-owner",
+    owner: { kind: "manual-follower", instanceId: "old-owner" },
+    target,
+    status: "active",
+    createdAtMs: 100,
+    updatedAtMs: 100,
+    instanceId: "123:1000",
+    slot: "L",
+    threadName: "Lagoon",
+  });
+  await store.persist();
+  const calls: string[] = [];
+  const claimFailures: Array<{ phase?: unknown; reason?: unknown }> = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    getCurrentLeaderEpoch: () => "epoch-1",
+    isFollowerProcessAlive: () => true,
+    getFollowerByTarget: () => undefined,
+    async callApi<TResponse>(method: string) {
+      calls.push(method);
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent(_category, _error, details) {
+      if (details?.phase === "follower-register-workspace-claim-refused") {
+        claimFailures.push({ phase: details.phase, reason: details.reason });
+      }
+    },
+  });
+
+  try {
+    await assert.rejects(provision({
+      instanceId: "456:2000",
+      cwd: "/repo",
+      sessionId: "session-a",
+      connectedAtMs: 2000,
+    }), /Workspace identity is already claimed/);
+    assert.deepEqual(claimFailures, [{ phase: "follower-register-workspace-claim-refused", reason: "live-owner" }]);
+    assert.equal(store.listWorkspaceBindings().length, 1);
+    assert.equal(store.getWorkspaceBinding("/repo", "b", "session-a"), undefined);
+    assert.deepEqual(calls, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A live duplicate-session follower prevents partial reclamation of the original binding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-live-session-duplicate-"));
+  const path = join(dir, "state.json");
+  const seed = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+  const originalTarget = { chatId: 7, threadId: 18086 };
+  const duplicateTarget = { chatId: 7, threadId: 19029 };
+  for (const [ordinal, target, slot, name, instanceId, ownerId] of [
+    [0, originalTarget, "L", "Lagoon", "123:1000", "old-original"],
+    [1, duplicateTarget, "Y", "Yogi", "124:1000", "live-duplicate"],
+  ] as const) {
+    seed.upsertWorkspaceBinding({
+      ...createTelegramWorkspaceBindingIdentity("/repo", ordinal, "session-a")!,
+      target,
+      slot,
+      threadName: name,
+      updatedAtMs: ordinal + 1,
+    });
+    seed.upsert({
+      profileKey: `manual:${ownerId}`,
+      owner: { kind: "manual-follower", instanceId: ownerId },
+      target,
+      status: "active",
+      createdAtMs: 1,
+      updatedAtMs: ordinal + 1,
+      instanceId,
+      slot,
+      threadName: name,
+    });
+  }
+  await seed.persist();
+  const before = readFileSync(path, "utf8");
+  const store = createTelegramTopicTargetStore({ path, getNowMs: () => 2000 });
+  await store.load();
+  const liveFollower: TelegramBusFollowerView = {
+    instanceId: "124:1000",
+    pid: 124,
+    target: duplicateTarget,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const calls: string[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    getCurrentLeaderEpoch: () => "epoch-1",
+    isFollowerProcessAlive: pid => pid === 124,
+    getFollowerByTarget: target => target.threadId === 19029 ? liveFollower : undefined,
+    async callApi<TResponse>(method: string) {
+      calls.push(method);
+      return { ok: true } as TResponse;
+    },
+    getSyncState: () => ({}),
+    setSyncState: () => undefined,
+    recordRuntimeEvent() {},
+  });
+
+  try {
+    await assert.rejects(provision({
+      instanceId: "456:2000",
+      cwd: "/repo",
+      sessionId: "session-a",
+      connectedAtMs: 2000,
+    }), /live or unverifiable follower registration/);
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.equal(store.list().length, 2);
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session-a")?.inactiveSinceMs, undefined);
+    assert.deepEqual(calls, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -5940,11 +6264,11 @@ test("Admitted replacement provisioning cancels an old observation before live r
   }
 });
 
-test("Preservation observation capacity is bounded by A-Z and overflow stays non-destructive", async (t) => {
+test("Preservation observation capacity remains bounded beyond letter-slot growth", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-preserve-capacity-"));
   const registry = createTelegramBusFollowerRegistry();
-  for (let index = 0; index < 27; index++) registry.register({
+  for (let index = 0; index < 257; index++) registry.register({
     instanceId: `f${index}`, profileKey: `owner${index}`, pid: 4000 + index,
     target: { chatId: 7, threadId: 100 + index }, connectedAtMs: 0, registrationGeneration: `g${index}`,
   });
@@ -5965,14 +6289,14 @@ test("Preservation observation capacity is bounded by A-Z and overflow stays non
   try {
     await runtime.startPolling("ctx");
     t.mock.timers.tick(1000);
-    await waitForCondition(() => probes === 27);
+    await waitForCondition(() => probes === 257);
     assert.equal(overflow, 1);
     assert.equal(preserved.length, 0);
     await new Promise((resolve) => setImmediate(resolve));
     alive = false;
     t.mock.timers.tick(1000);
-    await waitForCondition(() => preserved.length === 26);
-    assert.equal(preserved.includes("f26"), false);
+    await waitForCondition(() => preserved.length === 256);
+    assert.equal(preserved.includes("f256"), false);
     assert.deepEqual(registry.list(), []);
   } finally {
     await runtime.stopPolling();

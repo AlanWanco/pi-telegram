@@ -930,6 +930,7 @@ test("Command helpers move pi polling ownership after confirmation", async () =>
     },
     hasBotToken: () => true,
     startPolling: async (_ctx, options) => {
+      assert.equal(options?.forceFreshLeaderThread, undefined, "Reconnect should reuse the retained leader binding.");
       events.push(options?.force ? "start-force" : "start");
       return options?.force
         ? { ok: true, message: "connected" }

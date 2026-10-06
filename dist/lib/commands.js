@@ -362,7 +362,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
                         }
                     }
                 };
-                let result = await startWithRecovery({ forceFreshLeaderThread: true });
+                let result = await startWithRecovery({});
                 if (!isCurrent())
                     return;
                 if (result && !result.ok && result.canTakeover) {
@@ -374,7 +374,7 @@ export function registerTelegramBridgeCommands(pi, deps) {
                         deps.updateStatus(ctx);
                         return;
                     }
-                    result = await startWithRecovery({ force: true, forceFreshLeaderThread: true });
+                    result = await startWithRecovery({ force: true });
                     if (!isCurrent())
                         return;
                 }

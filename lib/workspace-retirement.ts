@@ -29,6 +29,7 @@ import type {
   TelegramWorkspaceThreadBinding,
 } from "./threads.ts";
 import {
+  isTelegramWorkspaceSlotId,
   planTelegramWorkspaceSlotAllocation,
   TelegramWorkspaceSlotUnavailableError,
   type TelegramWorkspaceSlotOccupancy,
@@ -1005,7 +1006,7 @@ export async function executeTelegramWorkspaceRetirement(input: {
       input.getProfileKey() === input.intent.profileKey &&
       input.isCurrent?.() !== false;
     if (!isCurrent()) return { kind: "retained", reason: "authority-changed" };
-    if (!input.intent.binding.slot || !/^[A-Z]$/u.test(input.intent.binding.slot)) {
+    if (!isTelegramWorkspaceSlotId(input.intent.binding.slot)) {
       return { kind: "retained", reason: "stale-intent" };
     }
     const owner = input.admission.getOwner();

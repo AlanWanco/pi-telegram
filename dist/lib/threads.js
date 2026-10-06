@@ -20,7 +20,7 @@ export { createTelegramWorkspaceBindingIdentity, createTelegramWorkspaceDirector
 import { withTelegramFileTransaction, readTelegramRuntimeState, } from "./locks.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
 import { createTelegramRuntimeProjectionStore } from "./status.js";
-import { planTelegramWorkspaceSlotAllocation, TELEGRAM_WORKSPACE_SLOTS, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
+import { createTelegramWorkspaceHashSlotId, isTelegramWorkspaceSlotId, planTelegramWorkspaceSlotAllocation, TELEGRAM_WORKSPACE_SLOTS, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 import { resolveAgentDir, resolveTelegramProfileTempFilePath, } from "./paths.js";
 const TELEGRAM_THREAD_RESERVATION_TTL_MS = 15 * 60 * 1000;
 function getNextMonotonicSlot(records, reservations, pendingProvisions, nowMs, lastSlot) {
@@ -436,7 +436,7 @@ function normalizeIdentityRecord(value) {
         if (threadName)
             identity.threadName = threadName;
     }
-    if (typeof record.slot === "string" && /^[A-Z]$/.test(record.slot)) {
+    if (isTelegramWorkspaceSlotId(record.slot)) {
         identity.slot = record.slot;
     }
     return identity.threadName || identity.slot ? identity : undefined;
@@ -517,7 +517,7 @@ function normalizeWorkspaceBindingRecord(value) {
     const manualThreadName = typeof record.manualThreadName === "string"
         ? normalizeTelegramTopicTargetThreadName(record.manualThreadName)
         : undefined;
-    const slot = typeof record.slot === "string" && /^[A-Z]$/u.test(record.slot)
+    const slot = isTelegramWorkspaceSlotId(record.slot)
         ? record.slot
         : undefined;
     const journalBindingKeys = Array.isArray(record.journalBindingKeys) &&
@@ -830,7 +830,7 @@ function normalizeTelegramWorkspaceRelocationRequest(value) {
     const owner = normalizeRecord(request.owner);
     const target = request.target;
     if (typeof request.operationId !== "string" || !request.operationId ||
-        !binding?.sessionId || !binding.slot || !/^[A-Z]$/.test(binding.slot) || binding.inactiveSinceMs !== undefined ||
+        !binding?.sessionId || !isTelegramWorkspaceSlotId(binding.slot) || binding.inactiveSinceMs !== undefined ||
         !owner || owner.status !== "active" || !owner.instanceId || owner.slot !== binding.slot ||
         !["leader", "manual-follower"].includes(owner.owner?.kind ?? "") ||
         (owner.owner?.kind === "leader" &&
@@ -1365,9 +1365,9 @@ function parseFollowerRecoveryHints(value) {
                 ? { threadId: targetRecord.threadId }
                 : {}),
         };
-        const slot = typeof targetRecord.slot === "string" && /^[A-Z]$/.test(targetRecord.slot)
+        const slot = isTelegramWorkspaceSlotId(targetRecord.slot)
             ? targetRecord.slot
-            : typeof record.slot === "string" && /^[A-Z]$/.test(record.slot)
+            : isTelegramWorkspaceSlotId(record.slot)
                 ? record.slot
                 : undefined;
         const threadName = typeof targetRecord.threadName === "string"
@@ -1431,7 +1431,8 @@ export function createTelegramTopicTargetStore(options) {
         try {
             const slots = options.getExternalReservedSlots?.() ?? [];
             if (!Array.isArray(slots) ||
-                slots.some((slot) => typeof slot !== "string" || !/^[A-Z]$/u.test(slot))) {
+                slots.some((slot) => typeof slot !== "string" ||
+                    slot !== slot.toUpperCase() || !isTelegramWorkspaceSlotId(slot))) {
                 return undefined;
             }
             return Array.from(new Set(slots));
@@ -1883,7 +1884,7 @@ export function createTelegramTopicTargetStore(options) {
                     .filter((value) => targetMatches(value.target, binding.target));
                 const sourceOwners = currentRecords.filter((value) => targetMatches(value.target, binding.target));
                 if ((workspaceRestore?.operations ?? []).some((operation) => workspaceRestoresConflict(operation.request, transition.restore.operations.at(-1).request)) ||
-                    !binding.sessionId || !binding.slot || !/^[A-Z]$/.test(binding.slot) ||
+                    !binding.sessionId || !isTelegramWorkspaceSlotId(binding.slot) ||
                     binding.inactiveSinceMs !== undefined || owner.status !== "active" ||
                     !owner.instanceId || owner.slot !== binding.slot ||
                     !["leader", "manual-follower"].includes(owner.owner?.kind ?? "") ||
@@ -1968,7 +1969,7 @@ export function createTelegramTopicTargetStore(options) {
                     return false;
                 if (transition.kind === "detach") {
                     const bindings = file.workspaceBindings.filter((binding) => targetMatches(binding.target, record.target));
-                    if (bindings.length !== 1 || !/^[A-Z]$/.test(record.slot ?? "") ||
+                    if (bindings.length !== 1 || !isTelegramWorkspaceSlotId(record.slot) ||
                         bindings[0].slot !== record.slot)
                         return false;
                 }
@@ -1996,16 +1997,18 @@ export function createTelegramTopicTargetStore(options) {
                 }
                 else {
                     file.threads = file.threads.filter((candidate) => candidate !== record);
-                    for (const binding of file.workspaceBindings) {
-                        if (targetMatches(binding.target, transition.target) && binding.inactiveSinceMs === undefined) {
-                            binding.inactiveSinceMs = nowMs;
+                    if (transition.kind === "detach" || transition.syncStatus === "deleted") {
+                        for (const binding of file.workspaceBindings) {
+                            if (targetMatches(binding.target, transition.target) && binding.inactiveSinceMs === undefined) {
+                                binding.inactiveSinceMs = nowMs;
+                            }
                         }
                     }
                     if (transition.kind === "invalidate") {
                         file.syncObservations = file.syncObservations.filter((observation) => !targetMatches(observation.target, record.target));
                         file.syncObservations.push({
                             target: { ...record.target },
-                            syncStatus: "deleted",
+                            syncStatus: transition.syncStatus,
                             observedAtMs: nowMs,
                             ...(record.instanceId ? { instanceId: record.instanceId } : {}),
                             ...(record.slot ? { slot: record.slot } : {}),
@@ -2189,8 +2192,8 @@ export function createTelegramTopicTargetStore(options) {
             if (workspaceIO && !committed)
                 throw new Error("Workspace snapshot lost captured publication authority.");
         },
-        invalidateTarget(target, isCurrent, lastSyncError) {
-            return persistSnapshot({ kind: "invalidate", target, isCurrent, lastSyncError });
+        invalidateTarget(target, isCurrent, lastSyncError, syncStatus = "deleted") {
+            return persistSnapshot({ kind: "invalidate", target, isCurrent, lastSyncError, syncStatus });
         },
         detachTargetOwner(expected, isCurrent) {
             const owner = normalizeRecord(expected);
@@ -3464,7 +3467,8 @@ export function createTelegramTopicTargetStore(options) {
                 ...Array.from(records.values()).filter(isCurrentThreadRecord).map((record) => record.slot),
                 ...reservations.filter((reservation) => reservation.expiresAtMs === undefined || reservation.expiresAtMs > nowMs).map((reservation) => reservation.slot),
                 ...pendingProvisions.filter((provision) => isPendingProvisionLiveOrTargeted(provision, nowMs)).map((provision) => provision.slot),
-            ].filter((slot) => !!slot && /^[A-Z]$/u.test(slot))
+            ].filter((slot) => typeof slot === "string" &&
+                isTelegramWorkspaceSlotId(slot.toUpperCase()))
                 .map((slot) => slot.toLowerCase());
             const externalReservedSlots = captureExternalReservedSlots();
             const reservedSlots = externalReservedSlots
@@ -3532,16 +3536,23 @@ export function createTelegramTopicTargetStore(options) {
             return binding ? cloneWorkspaceBinding(binding) : undefined;
         },
         claimWorkspaceIdentity(cwd, instanceId, previousInstanceId, options) {
-            if (workspaceRetirementCommitInFlight)
+            if (workspaceRetirementCommitInFlight) {
+                options?.onClaimUnavailable?.("retirement-commit");
                 return undefined;
+            }
             const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
             const normalizedSessionId = options?.sessionId === undefined
                 ? undefined
                 : normalizeTelegramSessionId(options.sessionId);
             if (!normalizedCwd || !instanceId ||
-                (options?.sessionId !== undefined && !normalizedSessionId) ||
-                hasWorkspaceRetirementConflict({ cwd: normalizedCwd }))
+                (options?.sessionId !== undefined && !normalizedSessionId)) {
+                options?.onClaimUnavailable?.("invalid-identity");
                 return undefined;
+            }
+            if (hasWorkspaceRetirementConflict({ cwd: normalizedCwd })) {
+                options?.onClaimUnavailable?.("retirement-fence");
+                return undefined;
+            }
             let replacementPreviousInstanceId;
             const replacement = sessionReplacement;
             if (replacement?.continuity === "workspace-thread" && normalizedSessionId &&
@@ -3578,6 +3589,7 @@ export function createTelegramTopicTargetStore(options) {
             const externalReservedSlots = captureExternalReservedSlots();
             if (!externalReservedSlots) {
                 options?.onCapacityUnavailable?.();
+                options?.onClaimUnavailable?.("external-reservations-unavailable");
                 return undefined;
             }
             const externalReservedSlotKeys = externalReservedSlots.map((slot) => slot.toLowerCase());
@@ -3588,16 +3600,29 @@ export function createTelegramTopicTargetStore(options) {
                     claim.identity.sessionId !== normalizedSessionId ||
                     !claim.identity.slot ||
                     externalReservedSlotKeys.includes(claim.identity.slot.toLowerCase())) {
+                    options?.onClaimUnavailable?.("existing-claim-mismatch", {
+                        instanceSlot: claim.identity.instanceSlot,
+                        slot: claim.identity.slot,
+                        ownerInstanceId: claim.instanceId,
+                    });
                     return undefined;
                 }
                 if (options?.existingBindingOnly &&
-                    !workspaceBindings.has(getWorkspaceBindingMapKey(claim.identity)))
+                    !workspaceBindings.has(getWorkspaceBindingMapKey(claim.identity))) {
+                    options?.onClaimUnavailable?.("restore-binding-missing", {
+                        instanceSlot: claim.identity.instanceSlot,
+                        slot: claim.identity.slot,
+                        ownerInstanceId: claim.instanceId,
+                    });
                     return undefined;
+                }
                 return { ...claim.identity };
             }
             const workspaceKey = resolveWorkspaceKey(normalizedCwd);
-            if (!workspaceKey)
+            if (!workspaceKey) {
+                options?.onClaimUnavailable?.("workspace-key-unavailable");
                 return undefined;
+            }
             let legacyRecord = normalizedSessionId
                 ? undefined
                 : findLegacyWorkspaceMigrationRecord(normalizedCwd, instanceId, previousInstanceId);
@@ -3614,8 +3639,14 @@ export function createTelegramTopicTargetStore(options) {
                     if (existingClaim.instanceId === instanceId) {
                         return { ...existingClaim.identity };
                     }
-                    if (existingClaim.instanceId !== effectivePreviousInstanceId)
+                    if (existingClaim.instanceId !== effectivePreviousInstanceId) {
+                        options?.onClaimUnavailable?.("transient-claim", {
+                            instanceSlot: identity.instanceSlot,
+                            slot: existingClaim.identity.slot,
+                            ownerInstanceId: existingClaim.instanceId,
+                        });
                         return undefined;
+                    }
                     workspaceClaims.set(mapKey, {
                         identity: existingClaim.identity,
                         instanceId,
@@ -3629,6 +3660,11 @@ export function createTelegramTopicTargetStore(options) {
                 if (liveRecord &&
                     liveRecord.instanceId !== instanceId &&
                     liveRecord.instanceId !== effectivePreviousInstanceId) {
+                    options?.onClaimUnavailable?.("live-owner", {
+                        instanceSlot: identity.instanceSlot,
+                        slot: liveRecord.slot,
+                        ownerInstanceId: liveRecord.instanceId,
+                    });
                     return undefined;
                 }
                 const retainedTarget = binding?.target ?? legacyRecord?.target;
@@ -3652,31 +3688,76 @@ export function createTelegramTopicTargetStore(options) {
                     ...externalReservedSlots,
                 ].filter((slot) => !!slot).map((slot) => slot.toLowerCase());
                 const retainedSlotKey = retainedSlot?.toLowerCase();
-                if (retainedSlotKey && reservedSlots.includes(retainedSlotKey))
+                if (retainedSlotKey && reservedSlots.includes(retainedSlotKey)) {
+                    options?.onClaimUnavailable?.("retained-slot-reserved", {
+                        instanceSlot: identity.instanceSlot,
+                        slot: retainedSlot,
+                    });
                     return undefined;
+                }
                 const retainedSlotConflicts = !!retainedSlotKey &&
                     otherBindings.some((other) => other.slot === retainedSlotKey);
-                let slot = retainedSlotConflicts
-                    ? Array.from(TELEGRAM_WORKSPACE_SLOTS).find((candidate) => !reservedSlots.includes(candidate) &&
-                        !otherBindings.some((other) => other.slot === candidate))?.toUpperCase()
-                    : retainedSlot;
-                if (!slot) {
-                    const allocation = planTelegramWorkspaceSlotAllocation({
-                        bindings: otherBindings,
-                        reservedSlots,
-                        nowMs,
-                    });
-                    if (allocation.kind === "blocked" && allocation.reason === "invalid-state") {
-                        return undefined;
-                    }
-                    if (allocation.kind !== "free") {
-                        capacityUnavailable = true;
-                        return undefined;
-                    }
-                    slot = allocation.slot.toUpperCase();
+                let slot;
+                if (retainedSlot && !retainedSlotConflicts) {
+                    slot = retainedSlot;
                 }
-                if (!slot || !/^[A-Z]$/u.test(slot))
+                else if (options?.allowHashSlots &&
+                    otherBindings.every((other) => isTelegramWorkspaceSlotId(other.slot.toUpperCase())) &&
+                    reservedSlots.every((slot) => isTelegramWorkspaceSlotId(slot.toUpperCase()))) {
+                    // New Workspace identities use a stable local hash, not a profile-wide
+                    // scarce letter. Retained legacy letters stay stable until their target
+                    // is replaced or retired.
+                    slot = createTelegramWorkspaceHashSlotId(identity.bindingKey, [
+                        ...otherBindings.map((other) => other.slot),
+                        ...reservedSlots,
+                    ]);
+                    if (!slot) {
+                        capacityUnavailable = true;
+                        options?.onClaimUnavailable?.("hash-slot-collision", {
+                            instanceSlot: identity.instanceSlot,
+                            slot: retainedSlot,
+                        });
+                        return undefined;
+                    }
+                }
+                else {
+                    if (retainedSlotConflicts) {
+                        slot = Array.from(TELEGRAM_WORKSPACE_SLOTS).find((candidate) => !reservedSlots.includes(candidate) &&
+                            !otherBindings.some((other) => other.slot === candidate))?.toUpperCase();
+                    }
+                    if (!slot) {
+                        const allocation = planTelegramWorkspaceSlotAllocation({
+                            bindings: otherBindings,
+                            reservedSlots,
+                            nowMs,
+                        });
+                        if (allocation.kind === "free") {
+                            slot = allocation.slot.toUpperCase();
+                        }
+                        else if (allocation.kind === "blocked" && allocation.reason === "invalid-state") {
+                            options?.onClaimUnavailable?.("invalid-slot-state", {
+                                instanceSlot: identity.instanceSlot,
+                                slot: retainedSlot,
+                            });
+                            return undefined;
+                        }
+                        else {
+                            capacityUnavailable = true;
+                            options?.onClaimUnavailable?.("no-free-letter", {
+                                instanceSlot: identity.instanceSlot,
+                                slot: retainedSlot,
+                            });
+                            return undefined;
+                        }
+                    }
+                }
+                if (!slot || !isTelegramWorkspaceSlotId(slot)) {
+                    options?.onClaimUnavailable?.("invalid-slot", {
+                        instanceSlot: identity.instanceSlot,
+                        slot,
+                    });
                     return undefined;
+                }
                 const claimedIdentity = { ...identity, slot };
                 workspaceClaims.set(mapKey, {
                     identity: claimedIdentity,
@@ -3684,6 +3765,29 @@ export function createTelegramTopicTargetStore(options) {
                 });
                 return { ...claimedIdentity };
             };
+            const sessionBindings = normalizedSessionId
+                ? Array.from(workspaceBindings.values())
+                    .filter((binding) => binding.cwd === normalizedCwd &&
+                    binding.sessionId === normalizedSessionId)
+                    .sort((left, right) => left.updatedAtMs - right.updatedAtMs ||
+                    left.instanceSlot.length - right.instanceSlot.length ||
+                    left.instanceSlot.localeCompare(right.instanceSlot))
+                : [];
+            if (sessionBindings.length > 0) {
+                // A session has one durable Workspace identity. If that exact binding is
+                // still owned or otherwise blocked, fail closed instead of allocating a
+                // second instanceSlot and leaking another global letter.
+                const binding = sessionBindings[0];
+                return claimIdentity({
+                    cwd: binding.cwd,
+                    workspaceKey: binding.workspaceKey,
+                    ...(binding.sessionId && binding.sessionKey
+                        ? { sessionId: binding.sessionId, sessionKey: binding.sessionKey }
+                        : {}),
+                    instanceSlot: binding.instanceSlot,
+                    bindingKey: binding.bindingKey,
+                });
+            }
             if (options?.existingBindingOnly) {
                 const candidates = Array.from(workspaceBindings.values())
                     .filter((binding) => binding.cwd === normalizedCwd &&
@@ -3703,8 +3807,10 @@ export function createTelegramTopicTargetStore(options) {
                     if (claimed)
                         return claimed;
                 }
-                if (!legacyRecord)
+                if (!legacyRecord) {
+                    options?.onClaimUnavailable?.("restore-binding-missing");
                     return undefined;
+                }
             }
             if (targetBinding) {
                 const claimed = claimIdentity({
@@ -4026,7 +4132,7 @@ export function createTelegramTopicTargetStore(options) {
                 .filter((record) => {
                 if (record.instanceId)
                     return false;
-                if (!record.slot || !/^[A-Z]$/u.test(record.slot))
+                if (!isTelegramWorkspaceSlotId(record.slot))
                     return false;
                 if (record.slot === "A")
                     return false;
@@ -4857,7 +4963,9 @@ export function isTelegramTopicTargetStaleError(error) {
         message.includes("topic not found") ||
         message.includes("topic deleted") ||
         message.includes("topic closed") ||
+        message.includes("topic_closed") ||
         message.includes("thread closed") ||
+        message.includes("thread_closed") ||
         message.includes("forum topic closed") ||
         message.includes("message thread closed"));
 }

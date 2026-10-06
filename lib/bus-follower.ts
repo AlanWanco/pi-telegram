@@ -24,6 +24,7 @@ import type {
   TelegramQueueHandoffStageResult,
 } from "./queue.ts";
 import type { TelegramTarget } from "./target.ts";
+import { isTelegramWorkspaceSlotId } from "./workspace-slots.ts";
 import {
   isTelegramApiMethodRetrySafe,
   TelegramApiCommitUnknownError,
@@ -1349,7 +1350,7 @@ export function createTelegramBusFollowerRegistrationState(
     getEligibleElectionSlots: () => [...eligibleElectionSlots],
     setEligibleElectionSlots: (slots) => {
       eligibleElectionSlots = Array.from(
-        new Set(slots.filter((slot) => /^[A-Z]$/.test(slot))),
+        new Set(slots.filter(isTelegramWorkspaceSlotId)),
       ).sort();
     },
     setRegistered: (next, nextTarget, metadata) => {

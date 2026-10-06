@@ -218,7 +218,7 @@ test("Connection notices name known causes and one recovery action without raw d
     ["Telegram Workspace slot reservation is unavailable.", "No Telegram slot available. Check /telegram-status --debug."],
     [{ code: "incompatible-protocol" }, "Telegram instances are incompatible. Update them together."],
     ["Unsupported journal version 42", "Telegram state version unsupported. Use a compatible runtime."],
-    ["Telegram bridge is active in another Pi instance (private path); follower registration failed: secret", "Telegram leader is active but unavailable. Check /telegram-status --debug."],
+    ["Telegram bridge is active in another Pi instance (private path); follower registration failed: secret", "Telegram leader is active; follower registration failed. Check /telegram-status --debug."],
     ["Telegram unfinished Thread creation does not match this session binding.", "Telegram Thread creation is unresolved. Check /telegram-status --debug."],
     [new Error("stale ctx: use withSession; raw token secret"), "Telegram connection failed. Check /telegram-status --debug."],
     [null, "Telegram connection failed. Check /telegram-status --debug."],

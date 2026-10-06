@@ -600,7 +600,7 @@ export function registerTelegramBridgeCommands(
             }
           }
         };
-        let result = await startWithRecovery({ forceFreshLeaderThread: true });
+        let result = await startWithRecovery({});
         if (!isCurrent()) return;
         if (result && !result.ok && result.canTakeover) {
           const confirmed = await ctx.ui.confirm(
@@ -613,7 +613,7 @@ export function registerTelegramBridgeCommands(
             deps.updateStatus(ctx);
             return;
           }
-          result = await startWithRecovery({ force: true, forceFreshLeaderThread: true });
+          result = await startWithRecovery({ force: true });
           if (!isCurrent()) return;
         }
         if (result && !result.ok) {

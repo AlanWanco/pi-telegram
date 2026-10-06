@@ -6,6 +6,10 @@
  */
 
 import { areTelegramTargetsEqual as sameTarget, type TelegramTarget } from "./target.ts";
+import {
+  getTelegramWorkspaceSlotDisplayLabel,
+  getTelegramWorkspaceSlotPaletteLetter,
+} from "./workspace-slots.ts";
 
 export const TELEGRAM_THREAD_NAME_DIALOG_TTL_MS = 5 * 60_000;
 
@@ -235,8 +239,11 @@ export function chooseTelegramThreadName(input: {
   getRandom?: () => number;
   occupied?: readonly string[];
 }): string | undefined {
-  if (!input.slot || !/^[A-Z]$/.test(input.slot)) return undefined;
-  const names = TELEGRAM_THREAD_NAME_PALETTE[input.slot];
+  const paletteSlot = input.slot
+    ? getTelegramWorkspaceSlotPaletteLetter(input.slot)
+    : undefined;
+  if (!paletteSlot) return undefined;
+  const names = TELEGRAM_THREAD_NAME_PALETTE[paletteSlot];
   if (!names || names.length === 0) return undefined;
   const occupied = new Set(
     (input.occupied ?? []).map((name) => getTelegramTopicIdentityName(name)),
@@ -344,7 +351,7 @@ function applyTopicNameTemplate(
     .replaceAll("{threadName}", threadName)
     .replaceAll("{profileKey}", request.profileKey)
     .replaceAll("{instanceId}", request.instanceId);
-  if (slot) result = result.replaceAll("{slot}", slot);
+  if (slot) result = result.replaceAll("{slot}", getTelegramWorkspaceSlotDisplayLabel(slot));
   return result;
 }
 
@@ -356,7 +363,7 @@ export function getTelegramTopicName(
   const name = applyTopicNameTemplate(template, request, slot)
     .replace(/\s+/g, " ")
     .trim();
-  return (name || slot || "Pi").slice(0, 128);
+  return (name || (slot ? getTelegramWorkspaceSlotDisplayLabel(slot) : undefined) || "Pi").slice(0, 128);
 }
 
 export function getTelegramTopicTitleForThreadName(

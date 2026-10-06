@@ -4,7 +4,12 @@
  * Owns pure contracts for deciding when local Telegram mirror state should be refreshed without querying Telegram on every action
  */
 
-import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.ts";
+import { isDeepStrictEqual } from "node:util";
+import {
+  getTelegramApiErrorRequestTarget,
+  isTelegramStaleTargetHttpError,
+  isTelegramTopicTargetConfirmedAbsentError,
+} from "./telegram-api.ts";
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.ts";
@@ -48,6 +53,7 @@ export interface TelegramLeaderThreadSyncDeps {
   instanceId: string;
   cwd?: string;
   sessionId?: string;
+  allowHashSlots?: boolean;
   telegramProfile?: string;
   forceFreshUnnamed?: boolean;
   requestedThreadName?: string;
@@ -539,7 +545,7 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
   topicTargetStore: Pick<
     TelegramTopicTargetStore,
     "load" | "markStaleByTarget" | "persist"
-  > & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget">>;
+  > & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget" | "list">>;
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
   recordEvent: (
@@ -632,6 +638,9 @@ export async function recoverStaleTelegramTopicApiError<
     !isTelegramTopicTargetStaleError(error) ||
     deps.isCurrent?.() === false
   ) return false;
+  const syncStatus = isTelegramTopicTargetConfirmedAbsentError(error)
+    ? "deleted"
+    : "closed";
   const recover = async (): Promise<boolean> => {
     if (deps.isCurrent) {
       if (
@@ -640,19 +649,34 @@ export async function recoverStaleTelegramTopicApiError<
           target,
           deps.isCurrent,
           String(error),
+          syncStatus,
         )
       ) return false;
       if (deps.isAuthorityCurrent?.() === false) return false;
     } else {
       await deps.topicTargetStore.load();
-      if (
-        !deps.topicTargetStore.markStaleByTarget(
+      const expectedRecords = deps.topicTargetStore.list?.().filter((record) =>
+        getTelegramTargetKey(record.target) === getTelegramTargetKey(target),
+      );
+      if (expectedRecords && expectedRecords.length > 1) return false;
+      if (expectedRecords?.length === 1 && deps.topicTargetStore.invalidateTarget &&
+          deps.topicTargetStore.list) {
+        const isCurrent = () => isDeepStrictEqual(
+          deps.topicTargetStore.list!().filter((record) =>
+            getTelegramTargetKey(record.target) === getTelegramTargetKey(target),
+          ),
+          expectedRecords,
+        );
+        if (!await deps.topicTargetStore.invalidateTarget(
           target,
-          "deleted",
+          isCurrent,
           String(error),
-        )
-      ) return false;
-      await deps.topicTargetStore.persist();
+          syncStatus,
+        )) return false;
+      } else {
+        if (!deps.topicTargetStore.markStaleByTarget(target, syncStatus, String(error))) return false;
+        await deps.topicTargetStore.persist();
+      }
     }
     const nowMs = (deps.getNowMs ?? Date.now)();
     let state = markTelegramSyncSliceSuspect(
@@ -740,7 +764,8 @@ export async function ensureTelegramLeaderThreadBinding(
         normalizedLeaderCwd,
         deps.instanceId,
         legacyLeaderRecord?.instanceId,
-        { sessionId: deps.sessionId, onCapacityUnavailable() { capacityUnavailable = true; } },
+        { sessionId: deps.sessionId, allowHashSlots: deps.allowHashSlots,
+          onCapacityUnavailable() { capacityUnavailable = true; } },
       )
     : undefined;
   if (deps.cwd && !workspaceIdentity) {

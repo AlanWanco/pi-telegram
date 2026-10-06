@@ -492,6 +492,8 @@ export declare function getTelegramApiErrorRequestTarget(error: unknown): {
     threadId: number;
 } | undefined;
 export declare function isTelegramStaleTargetHttpError(error: unknown): boolean;
+/** A confirmed-absence result is stronger than a closed-topic result. */
+export declare function isTelegramTopicTargetConfirmedAbsentError(error: unknown): boolean;
 /** Only a parsed Telegram rejection of this method proves a request had no effect. */
 export declare function isTelegramApiRequestRejected(error: unknown, method: string): boolean;
 export declare function isTelegramMessageNotModifiedError(error: unknown): boolean;

@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- `Reconnect binding reuse`: Session-qualified reconnects cannot allocate a second `instanceSlot` when the original binding is blocked. Legacy duplicates resolve to the earliest retained binding; confirmed-dead owners are detached under leader/profile fencing before exact-target reuse. Live or unverifiable owners fail closed.
+- `Hash slot IDs`: Hash-capable peers assign new Workspace bindings a stable `H` + full SHA-256 ID from the exact binding key; display labels use the shortest unique digest prefix. Existing A–Z labels stay stable, and hash IDs are capability-gated.
+- `Deleted Thread detection`: The Bot API has no deleted-topic update. Confirmed absent-target responses mark bindings inactive; `forum_topic_closed` remains distinct. Live sessions retain their slot IDs until protected retirement can release them.
+- `Connection feedback`: Reports an active leader with failed follower registration accurately instead of implying the leader itself is unavailable.
+
 ## 0.52.2: Polling recovery, safe disconnect and Windows downloads
 
 - `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.

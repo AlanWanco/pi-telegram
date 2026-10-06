@@ -12,11 +12,11 @@ import * as ThreadReconciler from "./thread-reconciler.js";
 import { getTelegramApiErrorRequestTarget, isTelegramApiCommitUnknownError, } from "./telegram-api.js";
 import * as Threads from "./threads.js";
 import * as WorkspaceIdentity from "./workspace-identity.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, getTelegramBusEnvelopeTrafficClass, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, getTelegramBusFollowerSocketPath, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, getTelegramBusEnvelopeTrafficClass, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, getTelegramBusFollowerSocketPath, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, } from "./bus.js";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
 import { createTelegramWorkspaceOperationRuntime, createTelegramWorkspaceSlotRotation, } from "./workspace-retirement.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
-import { TELEGRAM_WORKSPACE_SLOTS, TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
+import { formatTelegramWorkspaceSlotDisplayLabel, isTelegramHashWorkspaceSlotId, isTelegramWorkspaceSlotId, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 export const TELEGRAM_BUS_FOLLOWER_STALE_AFTER_MS = 15_000;
 function escapeHtml(text) {
     return text
@@ -28,7 +28,9 @@ function formatTelegramBusInstanceLabel(input) {
     const threadName = input.threadName?.trim();
     if (threadName)
         return escapeHtml(threadName);
-    return input.slot && /^[A-Z]$/.test(input.slot) ? input.slot : "?";
+    return input.slot && isTelegramWorkspaceSlotId(input.slot)
+        ? escapeHtml(formatTelegramWorkspaceSlotDisplayLabel(input.slot))
+        : "?";
 }
 /**
  * Leader-owned durable session-replacement authority for registered followers.
@@ -142,6 +144,12 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
         topicTargetStore: deps.topicTargetStore,
         callApi: deps.callApi,
         getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
+        isFollowerProcessAlive: deps.runtime.isFollowerProcessAlive,
+        getFollowerByTarget: (target) => deps.runtime.followerRegistry.getByTarget(target),
+        getCanAssignHashSlots: () => hasTelegramBusCapability(deps.runtime.protocolIdentity, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS) &&
+            deps.runtime.followerRegistry.list().every((follower) => hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS)),
+        getAllowHashSlots: () => hasTelegramBusCapability(deps.runtime.protocolIdentity, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS) &&
+            deps.runtime.followerRegistry.list().every((follower) => hasTelegramBusCapability(follower.protocol, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS)),
         getSyncState: deps.getSyncState,
         setSyncState: deps.setSyncState,
         onProvisioningStart: deps.onProvisioningStart,
@@ -577,7 +585,24 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
                 ? binding.bindingKey : undefined;
             if (input.target.threadId !== undefined && input.registration.cwd && input.registration.sessionId && !bindingKey)
                 throw new Error("Telegram follower Workspace binding changed before registration publication.");
-            deps.topicTargetStore.commitWorkspaceRestoreRegistration({ target: input.target, slot: input.slot, bindingKey }, publish);
+            let published = false;
+            deps.topicTargetStore.commitWorkspaceRestoreRegistration({ target: input.target, slot: input.slot, bindingKey }, () => {
+                publish();
+                published = true;
+            });
+            if (published) {
+                try {
+                    await reconcilePersistedFollowerWorkspaceOwners(provisionerPorts, input.registration);
+                }
+                catch (error) {
+                    deps.recordRuntimeEvent("bus", error, {
+                        phase: "follower-registration-owner-reconciliation",
+                        instanceId: input.registration.instanceId,
+                        chatId: input.target.chatId,
+                        threadId: input.target.threadId,
+                    });
+                }
+            }
         }),
         getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
         getTelegramProfile: deps.getTelegramProfile,
@@ -634,6 +659,7 @@ export function createTelegramBusInstanceLifecycleAnnouncement(input) {
     };
 }
 const TELEGRAM_BUS_SLOW_FOLLOWER_REGISTRATION_MS = 1000;
+const TELEGRAM_BUS_MAX_PRESERVATION_OBSERVATIONS = 256;
 function scheduleTelegramBusLeaderBackgroundTask(task, onError) {
     const timer = setTimeout(() => {
         void task().catch((error) => {
@@ -659,6 +685,115 @@ function recordSlowTelegramBusFollowerRegistrationStep(deps, input) {
         threadId: input.target?.threadId,
     });
 }
+// Persisted follower records retain the runtime instance ID but not its process-birth token.
+// Therefore only the process-liveness port's positive absent-PID result authorizes detachment;
+// a live or unverifiable PID, including a reused PID, stays protected.
+function getTelegramBusRuntimeProcessId(instanceId) {
+    const match = /^([1-9]\d*):([1-9]\d*)$/u.exec(instanceId);
+    const pid = match ? Number(match[1]) : undefined;
+    const generation = match ? Number(match[2]) : undefined;
+    return pid && Number.isSafeInteger(pid) && pid > 0 &&
+        generation && Number.isSafeInteger(generation) && generation > 0
+        ? pid
+        : undefined;
+}
+function isTelegramBusFollowerProcessConfirmedDead(deps, pid, instanceId) {
+    if (!deps.isFollowerProcessAlive)
+        return false;
+    try {
+        return deps.isFollowerProcessAlive(pid) === false;
+    }
+    catch (error) {
+        deps.recordRuntimeEvent("bus", error, {
+            phase: "follower-workspace-owner-liveness",
+            instanceId,
+            pid,
+        });
+        return false;
+    }
+}
+async function reconcilePersistedFollowerWorkspaceOwners(deps, registration) {
+    const epoch = deps.getCurrentLeaderEpoch?.();
+    if (epoch === undefined || !deps.isFollowerProcessAlive || !deps.getFollowerByTarget)
+        return;
+    const isCurrentLeader = () => deps.getCurrentLeaderEpoch?.() === epoch;
+    const cwd = registration.cwd
+        ? WorkspaceIdentity.normalizeTelegramWorkspacePath(registration.cwd)
+        : undefined;
+    const sessionId = registration.sessionId
+        ? WorkspaceIdentity.normalizeTelegramSessionId(registration.sessionId)
+        : undefined;
+    const sessionBindings = cwd && sessionId
+        ? deps.topicTargetStore.listWorkspaceBindings()
+            .filter((binding) => binding.cwd === cwd && binding.sessionId === sessionId)
+            .sort((left, right) => left.updatedAtMs - right.updatedAtMs ||
+            left.instanceSlot.length - right.instanceSlot.length ||
+            left.instanceSlot.localeCompare(right.instanceSlot))
+        : [];
+    const canonicalBindingKey = sessionBindings[0]?.bindingKey;
+    for (const binding of sessionBindings) {
+        const registered = deps.getFollowerByTarget(binding.target);
+        if (!registered)
+            continue;
+        const registeredPid = registered.pid;
+        const registeredDead = registeredPid !== undefined &&
+            isTelegramBusFollowerProcessConfirmedDead(deps, registeredPid, registered.instanceId);
+        const isSameSessionRegistration = registered.instanceId === registration.instanceId ||
+            registered.instanceId === registration.previousInstanceId;
+        if (!registeredDead &&
+            (binding.bindingKey !== canonicalBindingKey || !isSameSessionRegistration)) {
+            throw new Error("This Pi session still has a live or unverifiable follower registration; stop it before restoring its original Thread.");
+        }
+    }
+    const canonicalBinding = sessionBindings[0];
+    for (const record of deps.topicTargetStore.list()) {
+        const isPreviousCanonicalOwner = record.instanceId === registration.previousInstanceId &&
+            (!canonicalBinding ||
+                (record.target.chatId === canonicalBinding.target.chatId &&
+                    record.target.threadId === canonicalBinding.target.threadId));
+        if (record.owner?.kind !== "manual-follower" ||
+            (record.status !== "active" && record.status !== "starting") ||
+            !record.instanceId || record.instanceId === registration.instanceId ||
+            isPreviousCanonicalOwner || record.target.threadId === undefined)
+            continue;
+        const recordInstanceId = record.instanceId;
+        const pid = getTelegramBusRuntimeProcessId(recordInstanceId);
+        if (!pid || !isTelegramBusFollowerProcessConfirmedDead(deps, pid, recordInstanceId))
+            continue;
+        const bindings = deps.topicTargetStore.listWorkspaceBindings().filter((binding) => binding.target.chatId === record.target.chatId &&
+            binding.target.threadId === record.target.threadId &&
+            binding.slot === record.slot);
+        if (bindings.length !== 1)
+            continue;
+        const registered = deps.getFollowerByTarget(record.target);
+        if (registered && (registered.pid === undefined ||
+            !isTelegramBusFollowerProcessConfirmedDead(deps, registered.pid, registered.instanceId))) {
+            continue;
+        }
+        const expectedBinding = bindings[0];
+        const isCurrent = () => isCurrentLeader() &&
+            isTelegramBusFollowerProcessConfirmedDead(deps, pid, recordInstanceId) &&
+            deps.topicTargetStore.list().filter((current) => current.target.chatId === record.target.chatId &&
+                current.target.threadId === record.target.threadId).length === 1 &&
+            isDeepStrictEqual(deps.topicTargetStore.list().find((current) => current.target.chatId === record.target.chatId &&
+                current.target.threadId === record.target.threadId), record) &&
+            isDeepStrictEqual(deps.topicTargetStore.listWorkspaceBindings().filter((current) => current.target.chatId === expectedBinding.target.chatId &&
+                current.target.threadId === expectedBinding.target.threadId), [expectedBinding]);
+        const detached = await deps.topicTargetStore.detachTargetOwner(record, isCurrent);
+        deps.recordRuntimeEvent("bus", detached
+            ? "Detached a confirmed-dead follower while preserving its Workspace Thread and slot."
+            : "Could not commit a confirmed-dead follower detachment; its Workspace binding remains protected.", {
+            phase: detached
+                ? "follower-workspace-owner-detached"
+                : "follower-workspace-owner-detach-refused",
+            instanceId: recordInstanceId,
+            pid,
+            chatId: record.target.chatId,
+            threadId: record.target.threadId,
+            slot: record.slot,
+        });
+    }
+}
 export function createTelegramBusFollowerTargetProvisioner(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;
     const pendingRegistrations = new Map();
@@ -671,23 +806,47 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
         if (typeof chatId !== "number")
             return registration.target;
         await deps.topicTargetStore.load();
+        await reconcilePersistedFollowerWorkspaceOwners(deps, registration);
+        const allowHashSlots = deps.getCanAssignHashSlots?.() === true &&
+            hasTelegramBusCapability(registration.protocol, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS);
         let capacityUnavailable = false;
+        let workspaceClaimFailure;
         const workspaceIdentity = registration.cwd
             ? deps.topicTargetStore.claimWorkspaceIdentity(registration.cwd, registration.instanceId, registration.previousInstanceId, {
                 existingBindingOnly: options?.existingWorkspaceBindingOnly === true,
                 sessionId: registration.sessionId,
+                allowHashSlots,
                 onCapacityUnavailable() {
                     capacityUnavailable = true;
+                },
+                onClaimUnavailable(reason, details) {
+                    workspaceClaimFailure = { reason, details };
                 },
             })
             : undefined;
         if (registration.cwd && !workspaceIdentity) {
+            deps.recordRuntimeEvent("bus", "Telegram Workspace identity claim was refused.", {
+                phase: "follower-register-workspace-claim-refused",
+                instanceId: registration.instanceId,
+                reason: workspaceClaimFailure?.reason ?? "unclassified",
+                instanceSlot: workspaceClaimFailure?.details?.instanceSlot,
+                slot: workspaceClaimFailure?.details?.slot,
+                ownerInstanceId: workspaceClaimFailure?.details?.ownerInstanceId,
+                capacityUnavailable,
+            });
             if (options?.existingWorkspaceBindingOnly)
                 return undefined;
             if (capacityUnavailable) {
                 throw new TelegramWorkspaceSlotUnavailableError();
             }
             throw new Error("Telegram Workspace identity is already claimed.");
+        }
+        if (workspaceIdentity?.slot && isTelegramHashWorkspaceSlotId(workspaceIdentity.slot) && !allowHashSlots) {
+            deps.topicTargetStore.releaseWorkspaceClaim(registration.instanceId);
+            const message = "Update all connected Telegram Pi instances before using hashed Workspace slots.";
+            if (options?.existingWorkspaceBindingOnly)
+                return undefined;
+            throw new Error(message);
         }
         const workspaceBinding = workspaceIdentity
             ? deps.topicTargetStore.getWorkspaceBinding(workspaceIdentity.cwd, workspaceIdentity.instanceSlot, workspaceIdentity.sessionId)
@@ -707,7 +866,7 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
         });
         const recordsBeforeProvision = deps.topicTargetStore.list();
         const followerProfileKey = registration.profileKey ?? `manual:${registration.instanceId}`;
-        const requestedTarget = registration.target ?? workspaceBinding?.target;
+        const requestedTarget = workspaceBinding?.target ?? registration.target;
         const reconnectRecord = recordsBeforeProvision.find((record) => {
             const matchesRequestedTarget = !requestedTarget ||
                 (record.target.chatId === requestedTarget.chatId &&
@@ -811,11 +970,18 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
             };
         };
         const runRegistration = async () => {
+            const workspaceRestoreRegistration = (target) => deps.topicTargetStore.assertWorkspaceRestoreRegistration({
+                target,
+                bindingKey: workspaceIdentity?.bindingKey,
+                slot: workspaceIdentity?.slot ?? workspaceBinding?.slot ?? registration.slot,
+            });
             if (requestedTarget)
-                deps.topicTargetStore.assertWorkspaceRestoreRegistration({
-                    target: requestedTarget, bindingKey: workspaceIdentity?.bindingKey,
-                    slot: workspaceIdentity?.slot ?? workspaceBinding?.slot ?? registration.slot,
-                });
+                workspaceRestoreRegistration(requestedTarget);
+            if (registration.target &&
+                (registration.target.chatId !== requestedTarget?.chatId ||
+                    registration.target.threadId !== requestedTarget?.threadId)) {
+                workspaceRestoreRegistration(registration.target);
+            }
             const recoveryTarget = reconnectRecord?.target ?? recoverableTarget;
             if (recoveryTarget) {
                 Threads.assertTelegramPendingTopicRecoveryAllowed(deps.topicTargetStore, recoveryTarget);
@@ -850,9 +1016,24 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                 };
             };
             alignResultWithWorkspaceSlot();
-            const assertRestoreRegistration = () => deps.topicTargetStore.assertWorkspaceRestoreRegistration({
-                target: result.target, slot: result.record.slot, bindingKey: workspaceIdentity?.bindingKey,
-            });
+            const assertRestoreRegistration = () => {
+                const candidate = {
+                    slot: result.record.slot,
+                    bindingKey: workspaceIdentity?.bindingKey,
+                };
+                deps.topicTargetStore.assertWorkspaceRestoreRegistration({
+                    target: result.target,
+                    ...candidate,
+                });
+                if (registration.target &&
+                    (registration.target.chatId !== result.target.chatId ||
+                        registration.target.threadId !== result.target.threadId)) {
+                    deps.topicTargetStore.assertWorkspaceRestoreRegistration({
+                        target: registration.target,
+                        ...candidate,
+                    });
+                }
+            };
             assertRestoreRegistration();
             const crossSessionReuse = !!reconnectRecord &&
                 reconnectRecord.instanceId !== registration.instanceId;
@@ -1263,6 +1444,7 @@ export function createTelegramBusLeaderTargetProvisioner(deps) {
                 instanceId: deps.instanceId,
                 cwd: normalizedCwd,
                 sessionId: deps.getSessionId?.(ctx),
+                allowHashSlots: deps.getAllowHashSlots?.() ?? deps.allowHashSlots,
                 telegramProfile: deps.getTelegramProfile?.(),
                 forceFreshUnnamed: deps.shouldForceFreshUnnamed?.(),
                 requestedThreadName: deps.getRequestedThreadName?.(),
@@ -1774,8 +1956,12 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                         const registeredSlot = target?.slot ?? envelope.registration.slot;
                         if (deps.provisionFollowerTarget &&
                             registeredTarget?.threadId !== undefined &&
-                            (!registeredSlot || !/^[A-Z]$/u.test(registeredSlot))) {
+                            (!registeredSlot || !isTelegramWorkspaceSlotId(registeredSlot))) {
                             throw new Error("Telegram Thread slot authority is unavailable.");
+                        }
+                        if (registeredSlot && isTelegramHashWorkspaceSlotId(registeredSlot) &&
+                            !hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS)) {
+                            throw new Error("Update this follower before registering its hashed Workspace slot.");
                         }
                         let publicationOpen = true;
                         let published;
@@ -2156,7 +2342,7 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                                 .filter((candidate) => !deps.protocolIdentity.capabilities.includes(TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION) ||
                                 candidate.protocol?.capabilities.includes(TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION))
                                 .map((candidate) => candidate.slot)
-                                .filter((slot) => typeof slot === "string" && /^[A-Z]$/.test(slot))
+                                .filter((slot) => isTelegramWorkspaceSlotId(slot))
                                 .sort(),
                         },
                     }
@@ -2433,7 +2619,7 @@ export function createTelegramBusLeaderRuntime(deps) {
             if (deps.onFollowerConfirmedDeadPreserved && epoch !== undefined &&
                 follower.registrationGeneration && Number.isSafeInteger(follower.pid) && follower.pid > 0 &&
                 Number.isSafeInteger(follower.target?.threadId) && follower.target.threadId > 0) {
-                if (pendingPreservations.size < TELEGRAM_WORKSPACE_SLOTS.length) {
+                if (pendingPreservations.size < TELEGRAM_BUS_MAX_PRESERVATION_OBSERVATIONS) {
                     const registration = deps.followerRegistry.observeUnregistered(follower);
                     let current = true;
                     observation = {

@@ -12,6 +12,7 @@ import { getTelegramProcessLiveness, } from "./bus.js";
 import { renameTelegramPathWithRetry, withTelegramFileTransaction, readTelegramRuntimeState, mutateTelegramRuntimeStateSection, TelegramRuntimeStateError, } from "./locks.js";
 import { areTelegramTargetsEqual as areTargetsEqual } from "./target.js";
 import { isWireRecord as isRecord, isNonNegativeWireInteger as isSafeTimestamp } from "./wire.js";
+import { isTelegramWorkspaceSlotId } from "./workspace-slots.js";
 const TELEGRAM_WORKSPACE_ADMISSION_VERSION = 1;
 const TELEGRAM_WORKSPACE_ADMISSION_MAX_LEASES = 4096;
 const TELEGRAM_WORKSPACE_ADMISSION_MAX_TEXT = 512;
@@ -157,8 +158,7 @@ function normalizeFence(value, profileKey) {
         !isBoundedText(value.retirementIntentId) ||
         value.profileKey !== profileKey ||
         !isBoundedText(value.bindingKey) ||
-        typeof value.slot !== "string" ||
-        !/^[A-Z]$/u.test(value.slot) ||
+        !isTelegramWorkspaceSlotId(value.slot) ||
         !target ||
         !isLeaderEpoch(value.leaderEpoch) ||
         !isSafeTimestamp(value.retirementRequestedAtMs) ||

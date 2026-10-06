@@ -17,7 +17,7 @@ export interface TelegramWorkspaceBindingIdentity {
   /** Immutable legacy binding-key component, not the displayed global letter. */
   instanceSlot: string;
   bindingKey: string;
-  /** Profile-wide letter reserved by the transient claim. */
+  /** Profile-wide legacy letter or negotiated hash slot ID reserved by the transient claim. */
   slot?: string;
 }
 

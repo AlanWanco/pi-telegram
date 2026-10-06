@@ -3,7 +3,8 @@
  * Zones: Telegram bot reality mirror, demand-driven reconciliation, status diagnostics
  * Owns pure contracts for deciding when local Telegram mirror state should be refreshed without querying Telegram on every action
  */
-import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.js";
+import { isDeepStrictEqual } from "node:util";
+import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError, isTelegramTopicTargetConfirmedAbsentError, } from "./telegram-api.js";
 import { getTelegramTargetKey } from "./target.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
@@ -351,19 +352,33 @@ export async function recoverStaleTelegramTopicApiError(apiBody, error, deps) {
         !isTelegramTopicTargetStaleError(error) ||
         deps.isCurrent?.() === false)
         return false;
+    const syncStatus = isTelegramTopicTargetConfirmedAbsentError(error)
+        ? "deleted"
+        : "closed";
     const recover = async () => {
         if (deps.isCurrent) {
             if (!deps.topicTargetStore.invalidateTarget ||
-                !await deps.topicTargetStore.invalidateTarget(target, deps.isCurrent, String(error)))
+                !await deps.topicTargetStore.invalidateTarget(target, deps.isCurrent, String(error), syncStatus))
                 return false;
             if (deps.isAuthorityCurrent?.() === false)
                 return false;
         }
         else {
             await deps.topicTargetStore.load();
-            if (!deps.topicTargetStore.markStaleByTarget(target, "deleted", String(error)))
+            const expectedRecords = deps.topicTargetStore.list?.().filter((record) => getTelegramTargetKey(record.target) === getTelegramTargetKey(target));
+            if (expectedRecords && expectedRecords.length > 1)
                 return false;
-            await deps.topicTargetStore.persist();
+            if (expectedRecords?.length === 1 && deps.topicTargetStore.invalidateTarget &&
+                deps.topicTargetStore.list) {
+                const isCurrent = () => isDeepStrictEqual(deps.topicTargetStore.list().filter((record) => getTelegramTargetKey(record.target) === getTelegramTargetKey(target)), expectedRecords);
+                if (!await deps.topicTargetStore.invalidateTarget(target, isCurrent, String(error), syncStatus))
+                    return false;
+            }
+            else {
+                if (!deps.topicTargetStore.markStaleByTarget(target, syncStatus, String(error)))
+                    return false;
+                await deps.topicTargetStore.persist();
+            }
         }
         const nowMs = (deps.getNowMs ?? Date.now)();
         let state = markTelegramSyncSliceSuspect(deps.getSyncState(), "topic-state", {
@@ -436,7 +451,8 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
     const legacyLeaderRecord = deps.topicTargetStore.getByProfileKey(leaderProfileKey);
     let capacityUnavailable = false;
     const workspaceIdentity = normalizedLeaderCwd
-        ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, { sessionId: deps.sessionId, onCapacityUnavailable() { capacityUnavailable = true; } })
+        ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, { sessionId: deps.sessionId, allowHashSlots: deps.allowHashSlots,
+            onCapacityUnavailable() { capacityUnavailable = true; } })
         : undefined;
     if (deps.cwd && !workspaceIdentity) {
         if (capacityUnavailable)

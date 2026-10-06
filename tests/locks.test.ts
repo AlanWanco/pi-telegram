@@ -2048,6 +2048,31 @@ test("Locked polling runtime diagnoses a live owner with unreachable bus endpoin
   }
 });
 
+test("Captured stop cannot stop a newer polling generation", async () => {
+  const temp = createTempLockPath();
+  try {
+    let stopCalls = 0;
+    const lock = createTelegramLockRuntime({ locksPath: temp.path, pid: 10 });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      startPolling: async () => undefined,
+      stopPolling: async () => { stopCalls += 1; },
+      updateStatus: () => undefined,
+    });
+    const captured = runtime.captureStop();
+    assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
+    assert.equal(captured.isCurrent(), false);
+    await assert.rejects(captured.stop(), /disconnect was superseded/u);
+    assert.equal(stopCalls, 0);
+    assert.equal(lock.owns({ cwd: "/repo" }), true);
+    await runtime.stop();
+    assert.equal(stopCalls, 1);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});
+
 test("Locked polling runtime stops follower heartbeat on stop", async () => {
   const temp = createTempLockPath();
   try {

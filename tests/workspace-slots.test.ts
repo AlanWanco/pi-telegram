@@ -3,8 +3,13 @@
  * Covers bounded global allocation and pressure reclamation.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  createTelegramWorkspaceHashSlotId,
+  getTelegramWorkspaceSlotDisplayLabel,
+  isTelegramHashWorkspaceSlotId,
+  isTelegramWorkspaceSlotId,
   TELEGRAM_WORKSPACE_SLOTS,
   planTelegramWorkspaceSlotAllocation,
   type TelegramWorkspaceSlotOccupancy,
@@ -18,6 +23,34 @@ function fullProfile(): TelegramWorkspaceSlotOccupancy[] {
     protection: "eligible",
   }));
 }
+
+test("Workspace hash IDs remain full and stable while display labels extend on prefix collision", () => {
+  const first = createTelegramWorkspaceHashSlotId("binding-a")!;
+  assert.equal(first, `H${createHash("sha256").update("binding-a").digest("hex").toUpperCase()}`);
+  assert.match(first, /^H[0-9A-F]{64}$/u);
+  assert.equal(createTelegramWorkspaceHashSlotId("binding-a"), first);
+  const second = createTelegramWorkspaceHashSlotId("binding-b", [first])!;
+  assert.match(second, /^H[0-9A-F]{64}$/u);
+  assert.notEqual(second, first);
+  assert.equal(createTelegramWorkspaceHashSlotId("binding-a", [first]), undefined,
+    "a full-hash collision fails closed rather than changing the stable identity");
+  assert.equal(isTelegramWorkspaceSlotId(first), true);
+  assert.equal(isTelegramHashWorkspaceSlotId(first), true);
+  assert.equal(isTelegramWorkspaceSlotId(first.toLowerCase()), false, "persisted/wire IDs are canonical uppercase");
+  assert.equal(isTelegramWorkspaceSlotId("M"), true, "legacy letter slots remain readable");
+  assert.equal(isTelegramWorkspaceSlotId("AA"), false);
+  const collisionA = `HABCDEF1${"0".repeat(57)}`;
+  const collisionB = `HABCDEF1${"2"}${"0".repeat(56)}`;
+  assert.notEqual(getTelegramWorkspaceSlotDisplayLabel(collisionA, [collisionA, collisionB]),
+    getTelegramWorkspaceSlotDisplayLabel(collisionB, [collisionA, collisionB]));
+  assert.equal(getTelegramWorkspaceSlotDisplayLabel(collisionA, [collisionA, collisionB]).length, 10,
+    "display labels start short and add digest characters only when prefixes collide");
+  assert.deepEqual(planTelegramWorkspaceSlotAllocation({
+    bindings: [{ bindingKey: "hashed", slot: first.toLowerCase(), protection: "protected" }],
+    reservedSlots: [],
+    nowMs: 1,
+  }), { kind: "free", slot: "a" }, "hash IDs coexist with legacy-letter retirement snapshots");
+});
 
 test("Global allocation uses the first free letter across directories and claims", () => {
   const bindings = fullProfile().slice(0, 2);
@@ -42,6 +75,19 @@ test("Pressure proposes the oldest eligible binding instead of alphabetic wrap",
   result.candidate.bindingKey = "changed";
   assert.equal(bindings[12].bindingKey, "/repo/12");
   assert.equal(bindings.length, 26);
+});
+
+test("Legacy pressure retirement never deletes a hash binding to free a letter", () => {
+  const bindings = fullProfile();
+  bindings.push({
+    bindingKey: "hash-binding",
+    slot: `h${"0".repeat(64)}`,
+    inactiveSinceMs: 0,
+    protection: "eligible",
+  });
+  const result = planTelegramWorkspaceSlotAllocation({ bindings, reservedSlots: [], nowMs: 1000 });
+  assert.equal(result.kind, "reclaim");
+  if (result.kind === "reclaim") assert.equal(result.candidate.slot, "a");
 });
 
 test("Elapsed time cannot retire a binding while free capacity remains", () => {

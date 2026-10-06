@@ -2178,6 +2178,36 @@ test("Workspace claims keep same-cwd sessions stable and independently slotted",
   assert.equal(store.getWorkspaceBinding("/repo"), undefined);
 });
 
+test("Blocked same-session Workspace binding cannot allocate a second instance slot", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const original = store.claimWorkspaceIdentity("/repo", "original", undefined,
+    { sessionId: "session-a" });
+  assert.ok(original);
+  const target = { chatId: 7, threadId: 41 };
+  assert.ok(store.upsertWorkspaceBinding({ ...original, target, updatedAtMs: 1 }, "original"));
+  store.releaseWorkspaceClaim("original");
+  store.upsert({
+    profileKey: "manual:original",
+    owner: { kind: "manual-follower", instanceId: "original-owner" },
+    target,
+    status: "active",
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    instanceId: "123:1000",
+    slot: original.slot,
+  });
+
+  let refusalReason: string | undefined;
+  assert.equal(store.claimWorkspaceIdentity("/repo", "reopened", undefined,
+    { sessionId: "session-a", onClaimUnavailable(reason) { refusalReason = reason; } }), undefined);
+  assert.equal(refusalReason, "live-owner");
+  assert.equal(store.listWorkspaceBindings().length, 1);
+  assert.equal(store.getWorkspaceBinding("/repo", "b", "session-a"), undefined);
+  const distinctSession = store.claimWorkspaceIdentity("/repo", "other-session", undefined,
+    { sessionId: "session-b" });
+  assert.equal(distinctSession?.slot, "B");
+});
+
 test("Session replacement intent persists exactly once and clears only by exact CAS", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-replacement-"));
   const path = join(dir, "state.json");
@@ -2453,7 +2483,79 @@ test("Legacy duplicate global slots migrate only the exact claimed binding", asy
   }
 });
 
-test("Workspace capacity protects all 26 live claims instead of extending or evicting", () => {
+test("Hash-enabled Workspace claims assign deterministic non-scarce IDs", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  const first = store.claimWorkspaceIdentity("/repo/hash-a", "first", undefined, {
+    sessionId: "session-a",
+    allowHashSlots: true,
+  });
+  const second = store.claimWorkspaceIdentity("/repo/hash-b", "second", undefined, {
+    sessionId: "session-b",
+    allowHashSlots: true,
+  });
+  assert.match(first?.slot ?? "", /^H[0-9A-F]{64}$/u);
+  assert.match(second?.slot ?? "", /^H[0-9A-F]{64}$/u);
+  assert.notEqual(first?.slot, second?.slot);
+  assert.deepEqual(store.claimWorkspaceIdentity("/repo/hash-a", "first", undefined, {
+    sessionId: "session-a",
+    allowHashSlots: true,
+  }), first);
+});
+
+test("Hash-enabled Workspace claims continue past the legacy A-Z letter pool", () => {
+  const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
+  for (let index = 0; index < 26; index++) {
+    const instanceId = `legacy-${index}`;
+    const identity = store.claimWorkspaceIdentity(`/repo/${index}`, instanceId, undefined,
+      { sessionId: `session-${index}` });
+    assert.equal(identity?.slot, String.fromCharCode(65 + index));
+    assert.ok(identity && store.upsertWorkspaceBinding({ ...identity,
+      target: { chatId: 7, threadId: 100 + index }, updatedAtMs: index + 1,
+    }, instanceId));
+    store.releaseWorkspaceClaim(instanceId);
+  }
+
+  let capacityUnavailable = false;
+  const hashed = store.claimWorkspaceIdentity("/repo/new", "new", undefined, {
+    sessionId: "session-new",
+    allowHashSlots: true,
+    onCapacityUnavailable() { capacityUnavailable = true; },
+  });
+  assert.match(hashed?.slot ?? "", /^H[0-9A-F]{64}$/u);
+  assert.equal(capacityUnavailable, false);
+  assert.equal(store.listWorkspaceBindings().length, 26);
+});
+
+test("Hash-enabled Workspace bindings persist beyond 26 sessions with stable unique full IDs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-many-workspace-slots-"));
+  const path = join(dir, "state.json");
+  try {
+    const store = createTelegramTopicTargetStore({ path });
+    for (let index = 0; index < 40; index += 1) {
+      const instanceId = `hash-${index}`;
+      const identity = store.claimWorkspaceIdentity(`/repo/session-${index}`, instanceId, undefined, {
+        sessionId: `session-${index}`,
+        allowHashSlots: true,
+      });
+      assert.match(identity?.slot ?? "", /^H[0-9A-F]{64}$/u);
+      assert.ok(identity && store.upsertWorkspaceBinding({ ...identity,
+        target: { chatId: 7, threadId: 500 + index }, updatedAtMs: index + 1,
+      }, instanceId));
+      store.releaseWorkspaceClaim(instanceId);
+    }
+    const expected = store.listWorkspaceBindings().map(({ bindingKey, slot }) => ({ bindingKey, slot }));
+    assert.equal(expected.length, 40);
+    assert.equal(new Set(expected.map(({ slot }) => slot)).size, 40);
+    await store.persist();
+    const restored = createTelegramTopicTargetStore({ path });
+    await restored.load();
+    assert.deepEqual(restored.listWorkspaceBindings().map(({ bindingKey, slot }) => ({ bindingKey, slot })), expected);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Workspace capacity protects all 26 live claims instead of extending or evicting for letter-only peers", () => {
   const store = createTelegramTopicTargetStore({ path: "/unused/state.json" });
   for (let index = 0; index < 26; index++) {
     assert.equal(store.claimWorkspaceIdentity(`/repo/${index}`, `instance-${index}`)?.slot,

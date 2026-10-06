@@ -54,6 +54,7 @@ export declare const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE: "input-cus
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME: "workspace-thread-rename-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE: "thread-display-mode-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT: "directory-display-format-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS: "hashed-workspace-slots-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT: "workspace-follower-auto-connect-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "session-replacement-intent-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";

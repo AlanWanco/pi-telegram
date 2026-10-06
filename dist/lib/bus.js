@@ -16,6 +16,7 @@ import { parseTelegramQueueHandoffPayload, TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BY
 import { isProcessAlive } from "./locks.js";
 import { isWireRecord as isRecord } from "./wire.js";
 import { resolveAgentDir } from "./paths.js";
+import { isTelegramWorkspaceSlotId } from "./workspace-slots.js";
 import { normalizeTelegramSessionReplacementIntent, } from "./threads.js";
 function readDarwinProcessStart(pid) {
     return execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
@@ -127,6 +128,7 @@ export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE = "input-custody-re
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME = "workspace-thread-rename-v1";
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1";
 export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT = "directory-display-format-v1";
+export const TELEGRAM_BUS_CAPABILITY_HASHED_WORKSPACE_SLOTS = "hashed-workspace-slots-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT = "workspace-follower-auto-connect-v1";
 export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT = "session-replacement-intent-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE = "workspace-restore-v1";
@@ -1882,7 +1884,7 @@ function parseRegistration(value) {
         registration.profileKey = value.profileKey;
     if (typeof value.threadName === "string")
         registration.threadName = value.threadName;
-    if (typeof value.slot === "string" && /^[A-Z]$/.test(value.slot)) {
+    if (isTelegramWorkspaceSlotId(value.slot)) {
         registration.slot = value.slot;
     }
     if (typeof value.cwd === "string")
